@@ -17,3 +17,5 @@ artifacts/
 /tmp
 
 tmp/
+
+.idea
