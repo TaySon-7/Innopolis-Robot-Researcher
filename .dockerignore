@@ -1,0 +1,12 @@
+.git
+.gitignore
+.DS_Store
+.env
+tmp/
+artifacts/
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+**/__pycache__/
+**/*.py[cod]
+

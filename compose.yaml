@@ -1,0 +1,25 @@
+services:
+  sim:
+    build:
+      context: .
+    image: did/robot-researcher:jazzy
+    init: true
+    stdin_open: true
+    tty: true
+    environment:
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-30}"
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+      TURTLEBOT3_MODEL: burger
+    command:
+      - ros2
+      - launch
+      - did_judge
+      - level0.launch.py
+    volumes:
+      - gz-cache:/root/.gz
+    stop_grace_period: 15s
+
+volumes:
+  gz-cache:
+

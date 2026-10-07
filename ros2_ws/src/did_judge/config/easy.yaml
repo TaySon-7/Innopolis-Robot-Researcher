@@ -1,0 +1,14 @@
+judge:
+  ros__parameters:
+    use_sim_time: true
+    scenario: easy
+    base_x: -2.0
+    base_y: -0.5
+    initial_battery: 60.0
+    battery_cost_per_meter: 1.0
+    collection_radius: 0.30
+    sensor_range: 1.50
+    sensor_noise_stddev: 0.01
+    random_seed: 2026
+    sample_positions: [-1.50, -0.50, -0.75, 0.25, 0.25, -0.50]
+

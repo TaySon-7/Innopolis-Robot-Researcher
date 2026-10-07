@@ -1,0 +1,19 @@
+.DS_Store
+.env
+
+# ROS / colcon
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local runtime data
+artifacts/
+
+/tmp
+
+tmp/
