@@ -1,0 +1,15 @@
+{"ts": 1791407991.6219523, "stage": "degraded", "where": "validation", "reason": "subgoal[0]: unknown type \"teleport\" (allowed: approach, collect, gather, replan, return_base, search)", "extra": {}}
+{"ts": 1791407991.624503, "stage": "degraded", "where": "validation", "reason": "subgoal[0]: unknown type \"teleport\" (allowed: approach, collect, gather, replan, return_base, search)", "extra": {}}
+{"ts": 1791407991.6248453, "stage": "degraded", "where": "rules", "reason": "subgoal[0]: unknown type \"teleport\" (allowed: approach, collect, gather, replan, return_base, search)", "extra": {}}
+{"ts": 1791407991.6269023, "stage": "degraded", "where": "validation", "reason": "plan contains no subgoals", "extra": {}}
+{"ts": 1791407991.6272423, "stage": "degraded", "where": "rules", "reason": "plan contains no subgoals", "extra": {}}
+{"ts": 1791407991.6293032, "stage": "degraded", "where": "plan", "reason": "network down", "extra": {}}
+{"ts": 1791407991.6296153, "stage": "degraded", "where": "rules", "reason": "network down", "extra": {}}
+{"ts": 1791407991.6313066, "stage": "degraded", "where": "rules", "reason": "no candidates", "extra": {}}
+{"ts": 1791407991.632971, "stage": "degraded", "where": "rules", "reason": "rules only", "extra": {}}
+{"ts": 1791407991.6349463, "stage": "degraded", "where": "progress", "reason": "plan does not make progress", "extra": {}}
+{"ts": 1791407991.635238, "stage": "degraded", "where": "rules", "reason": "plan does not make progress", "extra": {}}
+{"ts": 1791408733.441136, "id": "h-001", "stage": "proposed", "claim": "Сектор B является зоной с повышенным расходом энергии относительно среднего расхода по всем секторам.", "testable": "sector_B > 1.5 * mean_sector_costs", "measurement": "расход заряда батареи в процентах на прохождение сектора", "predicted_ratio": 1.5, "state": {"battery_pct": 41.3, "collected": 2, "samples_total": 5, "subgoal_in_progress": null}}
+{"ts": 1791408766.0702846, "id": "h-002", "stage": "proposed", "claim": "расход заряда в секторе B превышает половину оставшегося заряда батареи", "testable": "sector_B > 0.5 * battery_pct", "measurement": "процент батареи", "predicted_ratio": 1.35, "state": {"battery_pct": 8.0, "collected": 4, "samples_total": 5, "subgoal_in_progress": null}}
+{"ts": 1791413145.6788046, "stage": "degraded", "where": "rules", "reason": "rules only", "extra": {}}
+{"ts": 1791413276.2397432, "stage": "degraded", "where": "rules", "reason": "rules only", "extra": {}}
