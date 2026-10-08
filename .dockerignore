@@ -2,6 +2,8 @@
 .gitignore
 .DS_Store
 .env
+.venv/
+logs/
 tmp/
 artifacts/
 ros2_ws/build/

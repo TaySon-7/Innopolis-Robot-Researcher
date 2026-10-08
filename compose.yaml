@@ -11,6 +11,10 @@ services:
       ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-30}"
       RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
       TURTLEBOT3_MODEL: burger
+      # Compose reads .env from the project directory on its own, so the key
+      # can be handed over as a variable. No bind mount: a missing .env would
+      # be created as a directory and break the planner's read.
+      DID_LLM_API_KEY: "${llm_api_key:-}"
     command:
       - ros2
       - launch
@@ -18,6 +22,9 @@ services:
       - demo.launch.py
       - scenario:=${SCENARIO:-easy}
       - scenario_file:=${SCENARIO_FILE:-none}
+      # LLM planner off by default: the plain demo is the autonomous agent and
+      # needs no API key. LLM=true demo starts the planner instead.
+      - llm:=${LLM:-false}
     ports:
       - "127.0.0.1:9090:9090"
       - "127.0.0.1:${AGENT_API_PORT:-8082}:8080"

@@ -72,6 +72,19 @@ export interface AgentScore {
   finished?: boolean
 }
 
+export interface AgentPlanSubgoal {
+  type?: string
+  x?: number
+  y?: number
+  radius?: number
+}
+
+export interface AgentPlan {
+  plan_id?: string
+  explanation?: string
+  subgoals?: AgentPlanSubgoal[]
+}
+
 export interface AgentSnapshot {
   pose: { x: number; y: number; yaw: number } | null
   state: AgentRuntimeState
@@ -84,6 +97,30 @@ export interface AgentSnapshot {
   plan: string
   collected_at: Array<[number, number]>
   scenario: string | null
+}
+
+/** The plan the LLM published, or null when nothing valid has been sent. */
+export function parsePlan(raw: string): AgentPlan | null {
+  if (!raw) return null
+  try {
+    const data = JSON.parse(raw) as AgentPlan
+    return data && Array.isArray(data.subgoals) ? data : null
+  } catch {
+    return null
+  }
+}
+
+/** `search_around(-0.55; 0.55, r=0.8)` — how the executor names a subgoal. */
+export function describeSubgoal(subgoal: AgentPlanSubgoal): string {
+  const round = (value: number) => Number(value.toFixed(2))
+  switch (subgoal.type) {
+    case 'goto':
+      return `goto(${round(subgoal.x ?? 0)}; ${round(subgoal.y ?? 0)})`
+    case 'search_around':
+      return `search(${round(subgoal.x ?? 0)}; ${round(subgoal.y ?? 0)}, r=${round(subgoal.radius ?? 0)})`
+    default:
+      return subgoal.type ?? '?'
+  }
 }
 
 export interface ScenarioZone {

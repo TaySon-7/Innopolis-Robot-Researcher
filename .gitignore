@@ -9,10 +9,12 @@ ros2_ws/log/
 # Python
 __pycache__/
 *.py[cod]
+.venv/
 .pytest_cache/
 
 # Local runtime data
 artifacts/
+logs/
 
 /tmp
 

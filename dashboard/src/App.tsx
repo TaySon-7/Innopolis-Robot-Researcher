@@ -15,7 +15,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AgentJournal, AgentPanel } from './AgentPanels'
+import { AgentJournal, AgentPanel, AgentPlanPanel } from './AgentPanels'
 import { ArenaCanvas } from './ArenaCanvas'
 import type { MapMode, PlannerLayer } from './ArenaCanvas'
 import { useAgentApi } from './agentApi'
@@ -540,6 +540,11 @@ function App() {
 
         <aside className="side-rail">
           <AgentJournal journal={agentSnapshot.journal} events={agentSnapshot.events} />
+
+          <AgentPlanPanel
+            raw={agentSnapshot.plan}
+            runningPlanId={agentSnapshot.state?.current?.plan_id ?? ''}
+          />
 
           <AgentPanel
             snapshot={agentSnapshot}

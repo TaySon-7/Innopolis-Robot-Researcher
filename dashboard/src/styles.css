@@ -639,3 +639,70 @@ footer i { display: block; width: 2px; height: 2px; border-radius: 50%; backgrou
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }
+
+/* Панель плана LLM: план виден наравне с картой и журналом, потому что это
+   единственное, что планировщик рассказывает о себе наружу. */
+.plan-panel .panel-header { align-items: flex-start; }
+.plan-panel { min-width: 0; }
+.panel-toggle {
+  background: transparent;
+  border: 1px solid var(--line, rgba(148, 163, 184, .25));
+  border-radius: 6px;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  font-size: .72rem;
+  opacity: .7;
+  padding: 2px 8px;
+}
+.panel-toggle:hover { opacity: 1; }
+
+.plan-empty { margin: 12px; color: var(--muted); font-size: .72rem; line-height: 1.5; }
+
+.plan-subgoals {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  list-style: none;
+  margin: 0;
+  padding: 11px 12px 8px;
+}
+.plan-subgoals li {
+  align-items: baseline;
+  display: flex;
+  gap: 8px;
+  font-size: .76rem;
+}
+.plan-subgoal-type {
+  flex: 0 0 108px;
+  opacity: .6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plan-subgoal-body { font-variant-numeric: tabular-nums; }
+
+.plan-why {
+  border-left: 2px solid currentColor;
+  font-size: .78rem;
+  line-height: 1.35;
+  margin: 0 12px 12px;
+  opacity: .85;
+  padding-left: 8px;
+}
+
+/* План, который сейчас не исполняется. Показывать его молча нельзя: во время
+   демо экран не должен утверждать, что роботом командует LLM, когда им
+   командует автономный режим. */
+.plan-stale {
+  background: rgba(245, 158, 11, .12);
+  border-left: 2px solid rgba(245, 158, 11, .8);
+  font-size: .76rem;
+  line-height: 1.35;
+  margin: 10px 12px 0;
+  padding: 4px 8px;
+}
+.plan-stale.is-live {
+  background: rgba(239, 68, 68, .12);
+  border-left-color: rgba(239, 68, 68, .8);
+}
