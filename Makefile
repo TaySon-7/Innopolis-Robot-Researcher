@@ -1,10 +1,15 @@
-.PHONY: build up down restart logs shell teleop topics pose scan battery sensor score events goto collect finish auto stop demo dashboard scenario scenario-check plan bench check test test-fast
+.PHONY: build up ui down restart logs ui-logs shell teleop topics pose scan battery sensor score events goto collect finish auto stop demo dashboard scenario scenario-check plan bench check test test-fast
 
 build:
 	docker compose build
 
 up:
 	docker compose up --detach --wait
+
+ui:
+	docker compose up --detach --wait --build
+	@echo "React dashboard: http://localhost:$${DASHBOARD_PORT:-8080}"
+	-@open "http://localhost:$${DASHBOARD_PORT:-8080}" 2>/dev/null || xdg-open "http://localhost:$${DASHBOARD_PORT:-8080}" 2>/dev/null || true
 
 down:
 	docker compose down
@@ -13,6 +18,9 @@ restart: down up
 
 logs:
 	docker compose logs --follow sim
+
+ui-logs:
+	docker compose logs --follow dashboard
 
 shell:
 	docker compose exec sim /did-entrypoint.sh bash
@@ -58,22 +66,27 @@ auto:
 stop:
 	docker compose exec sim /did-entrypoint.sh ros2 run did_agent command stop
 
-# Start everything and open the dashboard: make demo SCENARIO=hard
-demo: up dashboard
+# Start the complete stack and open the React dashboard.
+demo: ui
 
 dashboard:
-	@echo "Dashboard: http://localhost:8080"
-	-@open http://localhost:8080 2>/dev/null || xdg-open http://localhost:8080 2>/dev/null || true
+	@echo "React dashboard: http://localhost:$${DASHBOARD_PORT:-8080}"
+	-@open "http://localhost:$${DASHBOARD_PORT:-8080}" 2>/dev/null || xdg-open "http://localhost:$${DASHBOARD_PORT:-8080}" 2>/dev/null || true
 
-# Generate a scenario file: make scenario DIFF=hard SEED=7  ->  scenarios_custom/hard-7.yaml
-# Run it:   SCENARIO_FILE=/scenarios_custom/hard-7.yaml make demo      (or just: SCENARIO=hard@7 make demo)
+# Generate a scenario on the host: make scenario DIFF=hard SEED=7
 scenario:
-	docker compose run --rm --no-deps sim ros2 run did_agent generate_scenario \
-		--difficulty $(or $(DIFF),medium) --seed $(or $(SEED),1) --out /scenarios_custom/$(or $(DIFF),medium)-$(or $(SEED),1).yaml
+	@mkdir -p scenarios_custom
+	@docker compose run --rm --no-deps sim ros2 run did_agent generate_scenario \
+		--difficulty $(or $(DIFF),medium) --seed $(or $(SEED),1) \
+		> scenarios_custom/$(or $(DIFF),medium)-$(or $(SEED),1).yaml
+	@echo "Wrote scenarios_custom/$(or $(DIFF),medium)-$(or $(SEED),1).yaml"
 
-# make scenario-check FILE=/scenarios_custom/mine.yaml
+# Usage: make scenario-check FILE=scenarios_custom/hard-7.yaml
 scenario-check:
-	docker compose run --rm --no-deps sim ros2 run did_agent generate_scenario --check $(FILE)
+	@test -n "$(FILE)" || (echo "Usage: make scenario-check FILE=scenarios_custom/example.yaml"; exit 2)
+	docker compose up --detach --wait sim
+	docker compose cp "$(FILE)" sim:/tmp/did-scenario-check.yaml
+	docker compose exec -T sim /did-entrypoint.sh ros2 run did_agent generate_scenario --check /tmp/did-scenario-check.yaml
 
 # Usage: make plan P='{"plan_id":"p1","subgoals":[{"type":"goto","x":0.5,"y":0.5}]}'
 plan:
@@ -86,11 +99,10 @@ bench:
 check:
 	docker compose exec sim /did-entrypoint.sh ros2 run did_judge level0_check
 
-# Unit tests inside the image (no simulator needed).
 test:
 	docker compose run --rm --no-deps sim bash -lc \
 		"cd /opt/did_ws/src && python3 -m pytest -q did_judge/test did_agent/test"
 
-# The same tests on the host, if it has python3, numpy, pyyaml and pytest.
+# The same tests on a host with Python, numpy, pyyaml and pytest.
 test-fast:
 	cd ros2_ws/src && python3 -m pytest -q did_judge/test did_agent/test

@@ -1,0 +1,497 @@
+import {
+  BatteryMedium,
+  Bot,
+  Box,
+  CircleStop,
+  Gauge,
+  LocateFixed,
+  Radio,
+  RotateCcw,
+  Ruler,
+  SatelliteDish,
+  Search,
+  Waypoints,
+  Zap,
+} from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { AgentJournal, AgentPanel } from './AgentPanels'
+import { ArenaCanvas } from './ArenaCanvas'
+import { useAgentApi } from './agentApi'
+import type { NavigationMode } from './agentApi'
+import { useRosbridge } from './rosbridge'
+
+type Motion = 'forward' | 'reverse' | 'left' | 'right' | null
+
+const MOTION_KEYS: Record<string, Exclude<Motion, null>> = {
+  w: 'forward',
+  arrowup: 'forward',
+  x: 'reverse',
+  arrowdown: 'reverse',
+  a: 'left',
+  arrowleft: 'left',
+  d: 'right',
+  arrowright: 'right',
+}
+
+function fixed(value: number | null, digits: number, suffix = ''): string {
+  return value === null ? '—' : `${value.toFixed(digits)}${suffix}`
+}
+
+function formatSimTime(seconds: number | null): string {
+  if (seconds === null) return 'SIM --:--:--.---'
+  const hours = Math.floor(seconds / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  const remaining = seconds % 60
+  return `SIM ${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${remaining.toFixed(3).padStart(6, '0')}`
+}
+
+function App() {
+  const { snapshot, publishVelocity, callTrigger } = useRosbridge()
+  const {
+    snapshot: agentSnapshot,
+    truth: agentTruth,
+    geometry: agentGeometry,
+    connection: agentConnection,
+    lastError: agentError,
+    sendGoto,
+    sendCommand,
+    sendPlan,
+  } = useAgentApi()
+  const [linearSpeed, setLinearSpeed] = useState(0.12)
+  const [angularSpeed, setAngularSpeed] = useState(0.6)
+  const [motion, setMotion] = useState<Motion>(null)
+  const [serviceBusy, setServiceBusy] = useState(false)
+  const [agentBusy, setAgentBusy] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [showTrail, setShowTrail] = useState(true)
+  const [showPath, setShowPath] = useState(true)
+  const [showCostmap, setShowCostmap] = useState(true)
+  const [showTruth, setShowTruth] = useState(false)
+  const [mapHover, setMapHover] = useState<{ x: number; y: number } | null>(null)
+  const connected = snapshot.status === 'connected'
+
+  const command = useMemo(() => {
+    switch (motion) {
+      case 'forward':
+        return { linear: linearSpeed, angular: 0 }
+      case 'reverse':
+        return { linear: -linearSpeed, angular: 0 }
+      case 'left':
+        return { linear: 0, angular: angularSpeed }
+      case 'right':
+        return { linear: 0, angular: -angularSpeed }
+      default:
+        return { linear: 0, angular: 0 }
+    }
+  }, [angularSpeed, linearSpeed, motion])
+
+  const stop = useCallback(() => {
+    setMotion(null)
+    publishVelocity(0, 0)
+  }, [publishVelocity])
+
+  const startMotion = useCallback((next: Motion) => {
+    if (motion === next) return
+    void sendCommand('stop').catch(() => undefined)
+    setMotion(next)
+  }, [motion, sendCommand])
+
+  const emergencyStop = useCallback(() => {
+    stop()
+    void sendCommand('stop')
+      .then(() => setNotice('Робот и агент остановлены'))
+      .catch(() => setNotice('Ручное движение остановлено, Agent API недоступен'))
+  }, [sendCommand, stop])
+
+  useEffect(() => {
+    if (!connected || !motion) return
+    publishVelocity(command.linear, command.angular)
+    const timer = window.setInterval(
+      () => publishVelocity(command.linear, command.angular),
+      100,
+    )
+    return () => {
+      window.clearInterval(timer)
+      publishVelocity(0, 0)
+    }
+  }, [command, connected, motion, publishVelocity])
+
+  useEffect(() => {
+    const keyDown = (event: KeyboardEvent) => {
+      if (event.target instanceof HTMLInputElement || event.metaKey || event.ctrlKey) return
+      const key = event.key.toLowerCase()
+      if (key === 's' || key === ' ') {
+        event.preventDefault()
+        emergencyStop()
+        return
+      }
+      const next = MOTION_KEYS[key]
+      if (next && connected) {
+        event.preventDefault()
+        startMotion(next)
+      }
+    }
+    const keyUp = (event: KeyboardEvent) => {
+      const released = MOTION_KEYS[event.key.toLowerCase()]
+      if (released) setMotion((current) => (current === released ? null : current))
+    }
+    const safetyStop = () => stop()
+    window.addEventListener('keydown', keyDown)
+    window.addEventListener('keyup', keyUp)
+    window.addEventListener('blur', safetyStop)
+    window.addEventListener('pointerup', safetyStop)
+    document.addEventListener('visibilitychange', safetyStop)
+    return () => {
+      window.removeEventListener('keydown', keyDown)
+      window.removeEventListener('keyup', keyUp)
+      window.removeEventListener('blur', safetyStop)
+      window.removeEventListener('pointerup', safetyStop)
+      document.removeEventListener('visibilitychange', safetyStop)
+    }
+  }, [connected, emergencyStop, startMotion, stop])
+
+  useEffect(() => {
+    if (!connected) setMotion(null)
+  }, [connected])
+
+  const runService = async (service: '/did/collect' | '/did/finish') => {
+    stop()
+    setServiceBusy(true)
+    try {
+      const result = await callTrigger(service)
+      const prefix = result.success ? 'Готово' : 'Не выполнено'
+      setNotice(`${prefix}: ${result.message || 'судья ответил без сообщения'}`)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Ошибка обращения к судье')
+    } finally {
+      setServiceBusy(false)
+    }
+  }
+
+  const runAgentAction = async (
+    action: () => Promise<unknown>,
+    successMessage: string,
+  ) => {
+    stop()
+    setAgentBusy(true)
+    try {
+      await action()
+      setNotice(successMessage)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Команда агента не отправлена')
+    } finally {
+      setAgentBusy(false)
+    }
+  }
+
+  const navigateFromMap = useCallback((x: number, y: number, mode: NavigationMode) => {
+    stop()
+    setAgentBusy(true)
+    void sendGoto(Number(x.toFixed(3)), Number(y.toFixed(3)), mode)
+      .then(() => setNotice(
+        mode === 'search'
+          ? `Агент исследует область ${x.toFixed(2)} · ${y.toFixed(2)}`
+          : `Маршрут построен к ${x.toFixed(2)} · ${y.toFixed(2)}`,
+      ))
+      .catch((error) => setNotice(
+        error instanceof Error ? error.message : 'Не удалось построить маршрут',
+      ))
+      .finally(() => setAgentBusy(false))
+  }, [sendGoto, stop])
+
+  const connectionLabel = {
+    connected: 'ROS подключён',
+    connecting: 'Подключение к ROS',
+    disconnected: 'ROS недоступен',
+  }[snapshot.status]
+  const battery = snapshot.battery
+  const batteryPercent = battery === null ? 0 : Math.max(0, Math.min(100, (battery / 60) * 100))
+  const samplePercent = Math.max(0, Math.min(100, (snapshot.sampleSignal ?? 0) * 100))
+  const normalizedHeading = ((snapshot.pose.yaw * 180) / Math.PI + 360) % 360
+  const heading = normalizedHeading > 359.95 ? 0 : normalizedHeading
+  const mapTrail = agentSnapshot.trail.length
+    ? agentSnapshot.trail.map(([x, y]) => ({ x, y }))
+    : snapshot.trail
+  const visibleSamples = useMemo(() => {
+    if (!showTruth) return snapshot.samples.filter((sample) => sample.collected)
+    if (!agentTruth?.samples?.length) return snapshot.samples
+    return agentTruth.samples.map((sample) => ({
+      ...sample,
+      collected: agentSnapshot.collected_at.some(
+        ([x, y]) => Math.hypot(x - sample.x, y - sample.y) < 0.45,
+      ),
+    }))
+  }, [agentSnapshot.collected_at, agentTruth, showTruth, snapshot.samples])
+  const scanReturns = snapshot.scan
+    ? snapshot.scan.ranges.reduce(
+        (count, range) =>
+          Number.isFinite(range) &&
+          range >= snapshot.scan!.rangeMin &&
+          range <= snapshot.scan!.rangeMax
+            ? count + 1
+            : count,
+        0,
+      )
+    : 0
+  const missionMessage = snapshot.score.finished
+    ? 'Миссия завершена на базе'
+    : snapshot.score.collected >= snapshot.score.samplesTotal
+      ? 'Все образцы собраны — возвращайтесь на базу'
+      : (snapshot.sampleSignal ?? 0) > 0.8
+        ? 'Сильный сигнал: образец совсем рядом'
+        : 'Исследуйте арену и следите за сигналом датчика'
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="brand">
+          <div className="brand-mark" aria-hidden="true">
+            <Bot size={23} strokeWidth={1.8} />
+          </div>
+          <div>
+            <h1>Robot Researcher</h1>
+            <p>TB3 BURGER <span>·</span> {agentSnapshot.scenario?.toUpperCase() ?? 'LEVEL 0'}</p>
+          </div>
+        </div>
+        <div className="connection-group">
+          <div className={`connection connection--${agentConnection}`} role="status">
+            <span className="connection-dot" />
+            <span>{agentConnection === 'connected' ? 'Агент готов' : 'Agent API недоступен'}</span>
+            <span className="connection-address">/api</span>
+          </div>
+          <div className={`connection connection--${snapshot.status}`} role="status">
+            <span className="connection-dot" />
+            <span>{connectionLabel}</span>
+            <span className="connection-address">/ros</span>
+          </div>
+        </div>
+      </header>
+
+      <main className="dashboard-grid">
+        <section className="panel map-panel">
+          <div className="panel-header map-header">
+            <div>
+              <span className="eyebrow">LIVE MAP</span>
+              <h2>Арена, лидар и маршрут</h2>
+            </div>
+            <div className="map-meta">
+              <span>{formatSimTime(snapshot.simTimeSeconds)}</span>
+              <span>
+                {mapHover
+                  ? `КУРСОР ${mapHover.x.toFixed(2)} · ${mapHover.y.toFixed(2)}`
+                  : `X ${snapshot.pose.x.toFixed(2)} · Y ${snapshot.pose.y.toFixed(2)}`}
+              </span>
+              <span>LIDAR {scanReturns}/{snapshot.scan?.ranges.length ?? 0}</span>
+            </div>
+          </div>
+          <div className="map-stage">
+            <ArenaCanvas
+              pose={snapshot.pose}
+              scan={snapshot.scan}
+              samples={visibleSamples}
+              trail={mapTrail}
+              waypoints={agentSnapshot.state.navigation?.waypoints ?? []}
+              costmapRuns={agentSnapshot.costmap.runs}
+              geometry={agentGeometry}
+              truth={agentTruth}
+              showTrail={showTrail}
+              showPath={showPath}
+              showCostmap={showCostmap}
+              showTruth={showTruth}
+              onNavigate={navigateFromMap}
+              onHover={setMapHover}
+            />
+            <div className="map-layers" aria-label="Слои карты">
+              <label><input type="checkbox" checked={showTrail} onChange={(event) => setShowTrail(event.target.checked)} />След</label>
+              <label><input type="checkbox" checked={showPath} onChange={(event) => setShowPath(event.target.checked)} />Маршрут</label>
+              <label><input type="checkbox" checked={showCostmap} onChange={(event) => setShowCostmap(event.target.checked)} />Знания агента</label>
+              <label><input type="checkbox" checked={showTruth} onChange={(event) => setShowTruth(event.target.checked)} />Показать истину</label>
+            </div>
+            <div className="map-status">
+              <span><i className="legend-dot robot" />Burger</span>
+              <span><i className="legend-dot lidar" />Лидар /scan</span>
+              <span><i className="legend-dot pillar" />Столбы ×9</span>
+              {showTruth && <span><i className="legend-dot sample" />Образец</span>}
+              <span><i className="legend-dot route" />Маршрут</span>
+            </div>
+            <div className="map-scale"><span />1 м</div>
+            <div className="map-click-hint">Клик — ехать · Shift+клик — искать образец</div>
+          </div>
+        </section>
+
+        <aside className="side-rail">
+        <section className="panel telemetry-panel">
+          <div className="panel-header">
+            <div>
+              <span className="eyebrow">TELEMETRY</span>
+              <h2>Состояние робота</h2>
+            </div>
+            <Radio className={connected ? 'live-icon' : ''} size={19} />
+          </div>
+
+          <div className="telemetry-body">
+            <div className="meter-card">
+              <div className="meter-heading">
+                <span><BatteryMedium size={16} />Батарея</span>
+                <strong>{battery === null ? '—' : `${battery.toFixed(1)} / 60`}</strong>
+              </div>
+              <div className="meter-track" role="progressbar" aria-valuenow={battery ?? 0} aria-valuemax={60}>
+                <span className="meter-fill battery-fill" style={{ width: `${batteryPercent}%` }} />
+              </div>
+            </div>
+
+            <div className="meter-card">
+              <div className="meter-heading">
+                <span><SatelliteDish size={16} />Сигнал образца</span>
+                <strong>{fixed(snapshot.sampleSignal, 3)}</strong>
+              </div>
+              <div className="meter-track" role="progressbar" aria-valuenow={snapshot.sampleSignal ?? 0} aria-valuemax={1}>
+                <span className="meter-fill sample-fill" style={{ width: `${samplePercent}%` }} />
+              </div>
+            </div>
+
+            <div className="telemetry-cards">
+              <article><LocateFixed size={16} /><span>Позиция</span><strong>{snapshot.pose.x.toFixed(2)} · {snapshot.pose.y.toFixed(2)}</strong><small>метры, world</small></article>
+              <article><RotateCcw size={16} /><span>Курс</span><strong>{heading.toFixed(1)}°</strong><small>от оси X</small></article>
+              <article><Gauge size={16} /><span>Скорость</span><strong>{snapshot.linearVelocity.toFixed(3)}</strong><small>м/с</small></article>
+              <article><Waypoints size={16} /><span>Вращение</span><strong>{snapshot.angularVelocity.toFixed(3)}</strong><small>рад/с</small></article>
+              <article><Ruler size={16} /><span>Путь</span><strong>{snapshot.score.distanceTravelled.toFixed(2)}</strong><small>метра</small></article>
+              <article><Box size={16} /><span>Собрано</span><strong>{snapshot.score.collected} / {snapshot.score.samplesTotal}</strong><small>образца</small></article>
+              <article><Gauge size={16} /><span>Счёт</span><strong>{agentSnapshot.score.score?.toFixed(0) ?? '—'}</strong><small>баллов</small></article>
+              <article><Bot size={16} /><span>Столкновения</span><strong>{agentSnapshot.score.collisions ?? 0}</strong><small>штрафных</small></article>
+              <article><Search size={16} /><span>Ложные сборы</span><strong>{agentSnapshot.score.false_collects ?? 0}</strong><small>попыток</small></article>
+              <article><Zap size={16} /><span>Опасные зоны</span><strong>{agentSnapshot.score.hazard_hits ?? 0}</strong><small>попаданий</small></article>
+            </div>
+
+            <div className="mission-card">
+              <div className="mission-label"><span className="pulse" />ТЕКУЩАЯ ЗАДАЧА</div>
+              <p>{notice ?? snapshot.lastEvent ?? missionMessage}</p>
+            </div>
+
+            <div className="service-actions">
+              <button disabled={!connected || serviceBusy} onClick={() => void runService('/did/collect')}>
+                <Box size={16} />Собрать образец
+              </button>
+              <button disabled={!connected || serviceBusy} onClick={() => void runService('/did/finish')}>
+                <LocateFixed size={16} />Финиш на базе
+              </button>
+            </div>
+          </div>
+        </section>
+
+          <AgentPanel
+            snapshot={agentSnapshot}
+            connection={agentConnection}
+            error={agentError}
+            busy={agentBusy}
+            onAuto={() => void runAgentAction(() => sendCommand('auto'), 'Автономный режим запущен')}
+            onStop={() => void runAgentAction(() => sendCommand('stop'), 'Агент остановлен')}
+            onCollect={() => void runAgentAction(
+              () => sendPlan([{ type: 'collect' }]),
+              'Команда сбора передана агенту',
+            )}
+            onHome={() => void runAgentAction(
+              () => sendPlan([{ type: 'return_to_base' }]),
+              'Агент возвращается на базу',
+            )}
+          />
+
+          <AgentJournal journal={agentSnapshot.journal} events={agentSnapshot.events} />
+        </aside>
+
+        <section className="panel control-panel">
+          <div className="panel-header control-heading">
+            <div>
+              <span className="eyebrow">MANUAL CONTROL</span>
+              <h2>Безопасное управление</h2>
+            </div>
+            <p><Zap size={14} />Команда идёт, пока удерживается клавиша</p>
+          </div>
+
+          <div className="control-body">
+            <div className="drive-column">
+              <div className="drive-pad" aria-label="Управление движением">
+                <DriveButton label="W" motion="forward" current={motion} disabled={!connected} onStart={startMotion} onStop={stop} />
+                <DriveButton label="A" motion="left" current={motion} disabled={!connected} onStart={startMotion} onStop={stop} />
+                <button className="drive-key stop-key" type="button" disabled={!connected} onClick={emergencyStop} aria-label="Остановить робота и агента">S</button>
+                <DriveButton label="D" motion="right" current={motion} disabled={!connected} onStart={startMotion} onStop={stop} />
+                <DriveButton label="X" motion="reverse" current={motion} disabled={!connected} onStart={startMotion} onStop={stop} />
+              </div>
+              <span className="keyboard-note">Также работают стрелки</span>
+            </div>
+
+            <div className="speed-controls">
+              <label>
+                <span><b>Линейная скорость</b><output>{linearSpeed.toFixed(2)} м/с</output></span>
+                <input
+                  type="range"
+                  min="0.02"
+                  max="0.22"
+                  step="0.01"
+                  value={linearSpeed}
+                  onChange={(event) => setLinearSpeed(Number(event.target.value))}
+                />
+                <small><i>0.02</i><i>0.22</i></small>
+              </label>
+              <label>
+                <span><b>Угловая скорость</b><output>{angularSpeed.toFixed(1)} рад/с</output></span>
+                <input
+                  type="range"
+                  min="0.1"
+                  max="1.5"
+                  step="0.1"
+                  value={angularSpeed}
+                  onChange={(event) => setAngularSpeed(Number(event.target.value))}
+                />
+                <small><i>0.1</i><i>1.5</i></small>
+              </label>
+            </div>
+
+            <button className="emergency-stop" type="button" disabled={!connected} onClick={emergencyStop}>
+              <span><CircleStop size={25} />СТОП</span>
+              <small>мгновенный ноль</small>
+            </button>
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        <span>ROS 2 Jazzy</span><i />
+        <span>Gazebo Harmonic</span><i />
+        <span>rosbridge :9090</span>
+        <span className="footer-right">Схема арены · координаты в метрах</span>
+      </footer>
+    </div>
+  )
+}
+
+interface DriveButtonProps {
+  label: string
+  motion: Exclude<Motion, null>
+  current: Motion
+  disabled: boolean
+  onStart: (motion: Motion) => void
+  onStop: () => void
+}
+
+function DriveButton({ label, motion, current, disabled, onStart, onStop }: DriveButtonProps) {
+  return (
+    <button
+      className={`drive-key drive-${motion}${current === motion ? ' is-active' : ''}`}
+      type="button"
+      disabled={disabled}
+      onPointerDown={(event) => {
+        event.currentTarget.setPointerCapture(event.pointerId)
+        onStart(motion)
+      }}
+      onPointerUp={onStop}
+      onPointerCancel={onStop}
+      onLostPointerCapture={onStop}
+      aria-label={`Движение: ${motion}`}
+    >
+      {label}
+    </button>
+  )
+}
+
+export default App

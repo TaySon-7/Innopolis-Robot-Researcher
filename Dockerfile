@@ -9,6 +9,7 @@ RUN apt-get update \
         mesa-utils \
         python3-colcon-common-extensions \
         ros-jazzy-rmw-cyclonedds-cpp \
+        ros-jazzy-rosbridge-suite \
         ros-jazzy-turtlebot3-gazebo \
         ros-jazzy-turtlebot3-teleop \
     && rm -rf /var/lib/apt/lists/*

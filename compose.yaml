@@ -11,8 +11,6 @@ services:
       ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-30}"
       RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
       TURTLEBOT3_MODEL: burger
-    ports:
-      - "127.0.0.1:8080:8080"
     command:
       - ros2
       - launch
@@ -20,11 +18,39 @@ services:
       - demo.launch.py
       - scenario:=${SCENARIO:-easy}
       - scenario_file:=${SCENARIO_FILE:-none}
+    ports:
+      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:${AGENT_API_PORT:-8082}:8080"
     volumes:
       - gz-cache:/root/.gz
-      - ./scenarios_custom:/scenarios_custom
     stop_grace_period: 15s
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/9090 && exec 4<>/dev/tcp/127.0.0.1/8080'
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 25s
+
+  dashboard:
+    build:
+      context: ./dashboard
+    image: did/robot-researcher-dashboard:latest
+    depends_on:
+      sim:
+        condition: service_healthy
+    ports:
+      - "${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-8080}:80"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O /dev/null http://127.0.0.1/healthz
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
 volumes:
   gz-cache:
-

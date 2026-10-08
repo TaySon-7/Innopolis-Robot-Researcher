@@ -126,10 +126,22 @@ class JudgeNode(Node):
                 'hazard_hits': model.hazard_hits,
                 'score': round(model.score, 2),
                 'finished': model.finished,
+                'base_pose': {
+                    'x': model.base_x,
+                    'y': model.base_y,
+                },
                 'world_pose': {
                     'x': round(model.world_x, 3),
                     'y': round(model.world_y, 3),
                 },
+                'samples': [
+                    {
+                        'x': item.sample.x,
+                        'y': item.sample.y,
+                        'collected': item.collected,
+                    }
+                    for item in model.samples
+                ],
             },
             sort_keys=True,
         )

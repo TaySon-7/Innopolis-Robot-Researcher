@@ -10,4 +10,5 @@ ros2_ws/log/
 **/__pycache__/
 **/*.py[cod]
 
+dashboard/
 scenarios_custom/
