@@ -53,6 +53,7 @@ export interface TriggerResult {
 }
 
 const BASE = { x: -2, y: -0.5 }
+const LIDAR_X_OFFSET = -0.032
 const DEFAULT_SAMPLES: SampleState[] = [
   { x: -1.5, y: -0.5, collected: false },
   { x: -0.75, y: 0.25, collected: false },
@@ -355,7 +356,11 @@ class RosbridgeClient {
       scan: {
         // Freeze the transform at scan receipt. Reusing the newest odometry for
         // an older scan makes the entire point cloud appear to follow the robot.
-        origin: { ...this.snapshot.pose },
+        origin: {
+          x: this.snapshot.pose.x + LIDAR_X_OFFSET * Math.cos(this.snapshot.pose.yaw),
+          y: this.snapshot.pose.y + LIDAR_X_OFFSET * Math.sin(this.snapshot.pose.yaw),
+          yaw: this.snapshot.pose.yaw,
+        },
         angleMin: number(message.angle_min),
         angleIncrement: number(message.angle_increment),
         rangeMin: number(message.range_min),

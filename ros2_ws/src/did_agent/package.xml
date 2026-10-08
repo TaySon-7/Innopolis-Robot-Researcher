@@ -11,6 +11,8 @@
 
   <exec_depend>did_judge</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>gz_msgs_vendor</exec_depend>
+  <exec_depend>gz_transport_vendor</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>nav_msgs</exec_depend>

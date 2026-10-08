@@ -15,6 +15,7 @@ from did_agent.dashboard_core import DashboardData
 from did_agent.dashboard_core import DashboardServer
 from did_agent.dashboard_core import render_geometry
 from did_agent.dashboard_core import truth_from_scenario
+from did_agent.gazebo_geometry import request_gazebo_geometry
 from did_agent.grid import load_map
 
 try:
@@ -36,8 +37,14 @@ class DashboardNode(Node):
                 float(self.get_parameter('base_y').value))
         self.data = DashboardData(base)
         self._truth_for: str | None = None
+        self._truth_scenario = None
 
-        geometry = render_geometry(load_map())
+        self._fallback_geometry = render_geometry(load_map())
+        geometry = request_gazebo_geometry(
+            self._fallback_geometry,
+            timeout=800,
+            log=self.get_logger().warning,
+        )
         self._plan_pub = self.create_publisher(String, '/agent/plan', 10)
         self._command_pub = self.create_publisher(String, '/agent/command', 10)
         self.server = DashboardServer(
@@ -46,6 +53,9 @@ class DashboardNode(Node):
             log=self.get_logger().info,
         )
         self.server.start()
+        self._geometry_timer = None
+        if geometry.get('source') != 'gazebo_scene':
+            self._geometry_timer = self.create_timer(2.0, self._refresh_geometry)
 
         self.create_subscription(Odometry, '/odom', self._on_odom, 10)
         self._json_topic('/agent/state', self.data.on_state)
@@ -56,6 +66,16 @@ class DashboardNode(Node):
         self._json_topic('/did/score', self._on_score)
         self.create_subscription(String, '/agent/plan', self._on_plan, 10)
         self.get_logger().info(f'dashboard on http://localhost:{self.server.port}')
+
+    def _refresh_geometry(self) -> None:
+        """Retry until Gazebo's scene broadcaster is ready during startup."""
+        geometry = request_gazebo_geometry(self._fallback_geometry, timeout=800)
+        if geometry.get('source') != 'gazebo_scene':
+            return
+        self.server.geometry = geometry
+        if self._geometry_timer is not None:
+            self._geometry_timer.cancel()
+        self.get_logger().info('dashboard geometry loaded from Gazebo scene/info')
 
     def _json_topic(self, topic: str, handler, depth: int = 10) -> None:
         def callback(message: String) -> None:
@@ -80,9 +100,16 @@ class DashboardNode(Node):
                 path = score.get('scenario_file')
                 if not path or not Path(path).exists():
                     path = scenario_path(name)
-                self.data.truth = truth_from_scenario(load_scenario(path))
+                self._truth_scenario = load_scenario(path)
             except (OSError, ValueError, KeyError) as error:
+                self._truth_scenario = None
                 self.get_logger().warning(f'no ground truth for {name!r}: {error}')
+        if self._truth_scenario is not None:
+            try:
+                at = float(score.get('t', 0.0))
+            except (TypeError, ValueError):
+                at = 0.0
+            self.data.on_truth(truth_from_scenario(self._truth_scenario, at))
 
     def _on_plan(self, message: String) -> None:
         self.data.on_plan(message.data)

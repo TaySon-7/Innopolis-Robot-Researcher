@@ -8,10 +8,12 @@ import pytest
 from did_agent.costmap import CostMap
 from did_agent.dashboard_core import DashboardData
 from did_agent.dashboard_core import DashboardServer
+from did_agent.dashboard_core import costmap_layers
 from did_agent.dashboard_core import render_geometry
 from did_agent.dashboard_core import terrain_runs
 from did_agent.dashboard_core import truth_from_scenario
 from did_agent.grid import load_map
+from did_agent.gazebo_geometry import _planar_axes
 from did_agent.plan import parse_plan
 from did_judge.scenario import load_scenario
 from did_judge.scenario import scenario_path
@@ -65,6 +67,12 @@ def test_geometry_is_plain_json(geometry):
     json.dumps(geometry)
 
 
+def test_gazebo_mesh_axes_keep_xy_order_when_y_span_is_wider():
+    vertices = [(-2.0, 0.0, 0.0), (2.0, 0.0, 0.0), (0.0, -3.0, 0.0),
+                (0.0, 3.0, 0.0)]
+    assert _planar_axes(vertices) == (0, 1)
+
+
 def test_terrain_runs_encode_only_priced_cells():
     costmap = CostMap()
     assert terrain_runs(costmap.terrain) == []
@@ -73,6 +81,21 @@ def test_terrain_runs_encode_only_priced_cells():
     assert runs and all(v == 2.5 for _, _, _, v in runs)
     cells = sum(b - a + 1 for _, a, b, _ in runs)
     assert cells == int(np.count_nonzero(costmap.terrain != 1.0))
+
+
+def test_costmap_display_has_separate_knowledge_planner_and_blocked_layers():
+    costmap = CostMap()
+    row, col = costmap.world_to_cell(-2.0, -0.5)
+    costmap.last_seen[row, col:col + 3] = 12.0
+    costmap.terrain[row, col] = 0.75
+    layers = costmap_layers(costmap)
+    assert layers['knowledge']
+    assert any(run[3] == 0.75 for run in layers['knowledge'])
+    assert layers['wall_cost'] and layers['total'] and layers['blocked']
+    assert set(layers) == {
+        'version', 'knowledge', 'terrain', 'wall_cost', 'total', 'blocked',
+    }
+    json.dumps(layers)
 
 
 def test_data_store_keeps_a_thin_trail_and_marks_collections():
@@ -99,6 +122,17 @@ def test_truth_overlay_describes_the_scenario():
     truth = truth_from_scenario(load_scenario(scenario_path('hard')))
     assert len(truth['samples']) == 7 and len(truth['soil_zones']) == 4
     assert truth['base'] == {'x': -2.0, 'y': -0.5}
+
+
+def test_truth_overlay_applies_silent_environment_events_at_their_time():
+    scenario = load_scenario(scenario_path('hard'))
+    before = truth_from_scenario(scenario, 89.9)
+    changed = truth_from_scenario(scenario, 90.0)
+    hazard = truth_from_scenario(scenario, 150.0)
+    assert before['soil_zones'][0]['cost_multiplier'] == 2.0
+    assert changed['soil_zones'][0]['cost_multiplier'] == 4.5
+    assert changed['hazard_zones'] == []
+    assert hazard['hazard_zones'][0]['id'] == 'h1'
 
 
 @pytest.fixture()

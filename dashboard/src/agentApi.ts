@@ -2,6 +2,18 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 export type AgentConnection = 'connecting' | 'connected' | 'disconnected'
 export type NavigationMode = 'goto' | 'search'
+export type CostRun = [number, number, number, number]
+export type MaskRun = [number, number, number]
+
+export interface AgentCostmap {
+  version: number
+  knowledge_version?: number
+  knowledge: CostRun[]
+  terrain: CostRun[]
+  wall_cost: CostRun[]
+  total: CostRun[]
+  blocked: MaskRun[]
+}
 
 export interface AgentJournalEntry {
   t?: number
@@ -67,7 +79,7 @@ export interface AgentSnapshot {
   trail: Array<[number, number]>
   events: JudgeEvent[]
   journal: AgentJournalEntry[]
-  costmap: { version: number; runs: Array<[number, number, number, number]> }
+  costmap: AgentCostmap
   plan: string
   collected_at: Array<[number, number]>
   scenario: string | null
@@ -89,6 +101,7 @@ export interface ScenarioZone {
 
 export interface AgentTruth {
   name?: string
+  at?: number
   base?: { x: number; y: number }
   samples?: Array<{ x: number; y: number }>
   soil_zones?: ScenarioZone[]
@@ -96,6 +109,8 @@ export interface AgentTruth {
 }
 
 export interface AgentGeometry {
+  source?: 'gazebo_scene' | 'navigation_map' | string
+  scene_service?: string
   floor: Array<[number, number]>
   pillars: Array<{ x: number; y: number; r: number }>
   wall: number
@@ -122,7 +137,14 @@ const EMPTY_SNAPSHOT: AgentSnapshot = {
   trail: [],
   events: [],
   journal: [],
-  costmap: { version: -1, runs: [] },
+  costmap: {
+    version: -1,
+    knowledge: [],
+    terrain: [],
+    wall_cost: [],
+    total: [],
+    blocked: [],
+  },
   plan: '',
   collected_at: [],
   scenario: null,
@@ -157,6 +179,7 @@ export function useAgentApi() {
   const [connection, setConnection] = useState<AgentConnection>('connecting')
   const [lastError, setLastError] = useState<string | null>(null)
   const scenarioRef = useRef<string | null>(null)
+  const truthFetchedAtRef = useRef(0)
 
   useEffect(() => {
     let stopped = false
@@ -170,8 +193,11 @@ export function useAgentApi() {
         setSnapshot(next)
         setConnection('connected')
         setLastError(null)
-        if (next.scenario && scenarioRef.current !== next.scenario) {
+        const now = Date.now()
+        const scenarioChanged = next.scenario !== scenarioRef.current
+        if (next.scenario && (scenarioChanged || now - truthFetchedAtRef.current >= 1000)) {
           scenarioRef.current = next.scenario
+          truthFetchedAtRef.current = now
           const nextTruth = await getJson<AgentTruth>('/api/truth', controller.signal)
           if (!stopped) setTruth(nextTruth)
         }

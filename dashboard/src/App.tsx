@@ -16,6 +16,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AgentJournal, AgentPanel } from './AgentPanels'
 import { ArenaCanvas } from './ArenaCanvas'
+import type { MapMode, PlannerLayer } from './ArenaCanvas'
 import { useAgentApi } from './agentApi'
 import type { NavigationMode } from './agentApi'
 import { useRosbridge } from './rosbridge'
@@ -65,8 +66,8 @@ function App() {
   const [notice, setNotice] = useState<string | null>(null)
   const [showTrail, setShowTrail] = useState(true)
   const [showPath, setShowPath] = useState(true)
-  const [showCostmap, setShowCostmap] = useState(true)
-  const [showTruth, setShowTruth] = useState(false)
+  const [mapMode, setMapMode] = useState<MapMode>('knowledge')
+  const [plannerLayer, setPlannerLayer] = useState<PlannerLayer>('total')
   const [mapHover, setMapHover] = useState<{ x: number; y: number } | null>(null)
   const connected = snapshot.status === 'connected'
 
@@ -213,7 +214,7 @@ function App() {
     ? agentSnapshot.trail.map(([x, y]) => ({ x, y }))
     : snapshot.trail
   const visibleSamples = useMemo(() => {
-    if (!showTruth) return snapshot.samples.filter((sample) => sample.collected)
+    if (mapMode !== 'truth') return snapshot.samples.filter((sample) => sample.collected)
     if (!agentTruth?.samples?.length) return snapshot.samples
     return agentTruth.samples.map((sample) => ({
       ...sample,
@@ -221,7 +222,7 @@ function App() {
         ([x, y]) => Math.hypot(x - sample.x, y - sample.y) < 0.45,
       ),
     }))
-  }, [agentSnapshot.collected_at, agentTruth, showTruth, snapshot.samples])
+  }, [agentSnapshot.collected_at, agentTruth, mapMode, snapshot.samples])
   const scanReturns = snapshot.scan
     ? snapshot.scan.ranges.reduce(
         (count, range) =>
@@ -291,33 +292,53 @@ function App() {
               samples={visibleSamples}
               trail={mapTrail}
               waypoints={agentSnapshot.state.navigation?.waypoints ?? []}
-              costmapRuns={agentSnapshot.costmap.runs}
+              costmap={agentSnapshot.costmap}
               geometry={agentGeometry}
               truth={agentTruth}
               showTrail={showTrail}
               showPath={showPath}
-              showCostmap={showCostmap}
-              showTruth={showTruth}
+              mapMode={mapMode}
+              plannerLayer={plannerLayer}
               onNavigate={navigateFromMap}
               onHover={setMapHover}
             />
             <div className="map-layers" aria-label="Слои карты">
-              <label><input type="checkbox" checked={showTrail} onChange={(event) => setShowTrail(event.target.checked)} />След</label>
-              <label><input type="checkbox" checked={showPath} onChange={(event) => setShowPath(event.target.checked)} />Маршрут</label>
-              <label><input type="checkbox" checked={showCostmap} onChange={(event) => setShowCostmap(event.target.checked)} />Знания агента</label>
-              <label><input type="checkbox" checked={showTruth} onChange={(event) => setShowTruth(event.target.checked)} />Показать истину</label>
+              <div className="map-mode-group" role="radiogroup" aria-label="Режим карты">
+                <button type="button" aria-pressed={mapMode === 'truth'} onClick={() => setMapMode('truth')}>Истина</button>
+                <button type="button" aria-pressed={mapMode === 'knowledge'} onClick={() => setMapMode('knowledge')}>Знания</button>
+                <button type="button" aria-pressed={mapMode === 'planner'} onClick={() => setMapMode('planner')}>Планировщик</button>
+              </div>
+              {mapMode === 'planner' && (
+                <div className="planner-layer-group" role="radiogroup" aria-label="Слой стоимости">
+                  <button type="button" aria-pressed={plannerLayer === 'terrain'} onClick={() => setPlannerLayer('terrain')}>terrain</button>
+                  <button type="button" aria-pressed={plannerLayer === 'wall_cost'} onClick={() => setPlannerLayer('wall_cost')}>wall_cost</button>
+                  <button type="button" aria-pressed={plannerLayer === 'total'} onClick={() => setPlannerLayer('total')}>сумма</button>
+                </div>
+              )}
+              <div className="map-overlay-toggles">
+                <label><input type="checkbox" checked={showTrail} onChange={(event) => setShowTrail(event.target.checked)} />След</label>
+                <label><input type="checkbox" checked={showPath} onChange={(event) => setShowPath(event.target.checked)} />Маршрут</label>
+              </div>
+            </div>
+            <div className={`map-cost-legend map-cost-legend--${mapMode}`}>
+              {mapMode === 'truth' && <><span>×1</span><i className="cost-gradient" /><span>×5</span><b>актуально @ {Math.floor(agentTruth?.at ?? 0)} с</b></>}
+              {mapMode === 'knowledge' && <><span>неизвестно</span><i className="unknown-swatch" /><span>&lt;1</span><i className="cost-gradient" /><span>&gt;1</span></>}
+              {mapMode === 'planner' && <><span>{plannerLayer}</span><i className={plannerLayer === 'wall_cost' ? 'wall-gradient' : 'cost-gradient'} /><span>дороже</span><i className="blocked-swatch" /><span>блок</span></>}
             </div>
             <div className="map-status">
               <span><i className="legend-dot robot" />Burger</span>
               <span><i className="legend-dot lidar" />Лидар /scan</span>
               <span><i className="legend-dot pillar" />Столбы ×9</span>
-              {showTruth && <span><i className="legend-dot sample" />Образец</span>}
+              {mapMode === 'truth' && <span><i className="legend-dot sample" />Образец</span>}
               <span><i className="legend-dot route" />Маршрут</span>
+              <span>{agentGeometry?.source === 'gazebo_scene' ? 'Геометрия Gazebo' : 'Геометрия карты'}</span>
             </div>
             <div className="map-scale"><span />1 м</div>
             <div className="map-click-hint">Клик — ехать · Shift+клик — искать образец</div>
           </div>
         </section>
+
+        <AgentJournal journal={agentSnapshot.journal} events={agentSnapshot.events} />
 
         <aside className="side-rail">
         <section className="panel telemetry-panel">
@@ -350,6 +371,11 @@ function App() {
               </div>
             </div>
 
+            <div className="mission-card">
+              <div className="mission-label"><span className="pulse" />ТЕКУЩАЯ ЗАДАЧА</div>
+              <p>{notice ?? snapshot.lastEvent ?? missionMessage}</p>
+            </div>
+
             <div className="telemetry-cards">
               <article><LocateFixed size={16} /><span>Позиция</span><strong>{snapshot.pose.x.toFixed(2)} · {snapshot.pose.y.toFixed(2)}</strong><small>метры, world</small></article>
               <article><RotateCcw size={16} /><span>Курс</span><strong>{heading.toFixed(1)}°</strong><small>от оси X</small></article>
@@ -361,11 +387,6 @@ function App() {
               <article><Bot size={16} /><span>Столкновения</span><strong>{agentSnapshot.score.collisions ?? 0}</strong><small>штрафных</small></article>
               <article><Search size={16} /><span>Ложные сборы</span><strong>{agentSnapshot.score.false_collects ?? 0}</strong><small>попыток</small></article>
               <article><Zap size={16} /><span>Опасные зоны</span><strong>{agentSnapshot.score.hazard_hits ?? 0}</strong><small>попаданий</small></article>
-            </div>
-
-            <div className="mission-card">
-              <div className="mission-label"><span className="pulse" />ТЕКУЩАЯ ЗАДАЧА</div>
-              <p>{notice ?? snapshot.lastEvent ?? missionMessage}</p>
             </div>
 
             <div className="service-actions">
@@ -395,8 +416,6 @@ function App() {
               'Агент возвращается на базу',
             )}
           />
-
-          <AgentJournal journal={agentSnapshot.journal} events={agentSnapshot.events} />
         </aside>
 
         <section className="panel control-panel">
