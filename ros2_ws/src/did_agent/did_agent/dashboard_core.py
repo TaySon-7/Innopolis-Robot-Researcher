@@ -200,22 +200,83 @@ def render_geometry(grid: GridMap) -> dict[str, Any]:
 # --- data store ---------------------------------------------------------------------
 
 
-def terrain_runs(terrain: np.ndarray) -> list[list[float]]:
-    """Run-length encode the cells whose floor price is not 1: [row, c0, c1, value]."""
+def value_runs(
+    values: np.ndarray,
+    mask: np.ndarray,
+    *,
+    step: float = 0.05,
+) -> list[list[float]]:
+    """Run-length encode selected grid values as ``[row, c0, c1, value]``.
+
+    Values are bucketed before encoding.  The learner changes neighbouring cells
+    by tiny floating-point amounts; sending every such cell separately made the
+    dashboard payload both noisy and unnecessarily large.
+    """
+    if values.shape != mask.shape:
+        raise ValueError('values and mask must have the same shape')
+    quantized = np.rint(values / step) * step
     runs: list[list[float]] = []
-    for row in np.where((terrain != 1.0).any(axis=1))[0]:
-        line = terrain[row]
+    for row in np.where(mask.any(axis=1))[0]:
+        line = quantized[row]
+        selected = mask[row]
         col, count = 0, len(line)
         while col < count:
-            if line[col] == 1.0:
+            if not selected[col]:
                 col += 1
                 continue
             end = col
-            while end + 1 < count and line[end + 1] == line[col]:
+            while end + 1 < count and selected[end + 1] and line[end + 1] == line[col]:
                 end += 1
-            runs.append([int(row), col, end, round(float(line[col]), 3)])
+            runs.append([int(row), col, end, round(float(line[col]), 2)])
             col = end + 1
     return runs
+
+
+def mask_runs(mask: np.ndarray) -> list[list[int]]:
+    """Run-length encode a boolean grid as ``[row, c0, c1]``."""
+    runs: list[list[int]] = []
+    for row in np.where(mask.any(axis=1))[0]:
+        line = mask[row]
+        col, count = 0, len(line)
+        while col < count:
+            if not line[col]:
+                col += 1
+                continue
+            end = col
+            while end + 1 < count and line[end + 1]:
+                end += 1
+            runs.append([int(row), col, end])
+            col = end + 1
+    return runs
+
+
+def terrain_runs(terrain: np.ndarray) -> list[list[float]]:
+    """Compatibility encoder for non-neutral floor prices."""
+    return value_runs(terrain, ~np.isclose(terrain, 1.0), step=0.001)
+
+
+def costmap_layers(costmap) -> dict[str, Any]:
+    """Build the compact display layers for the agent and planner maps.
+
+    ``knowledge`` includes neutral cells because the UI must distinguish a
+    measured ordinary floor from an unvisited cell.  Planner layers use their
+    natural neutral background and therefore only carry non-zero deviations.
+    """
+    arena = ~_outside(costmap.grid)
+    static_free = arena & ~costmap.static_blocked
+    traversable = arena & ~costmap.blocked
+    known = static_free & (costmap.last_seen > -1e8)
+    terrain = costmap.terrain
+    wall_cost = costmap.wall_cost
+    total = terrain + wall_cost
+    return {
+        'version': int(costmap.version),
+        'knowledge': value_runs(terrain, known),
+        'terrain': value_runs(terrain, traversable & ~np.isclose(terrain, 1.0)),
+        'wall_cost': value_runs(wall_cost, traversable & (wall_cost > 0.025)),
+        'total': value_runs(total, traversable & ~np.isclose(total, 1.0)),
+        'blocked': mask_runs(arena & costmap.blocked),
+    }
 
 
 class DashboardData:
@@ -228,7 +289,14 @@ class DashboardData:
         self.state: dict[str, Any] = {}
         self.status: dict[str, Any] = {}
         self.score: dict[str, Any] = {}
-        self.costmap: dict[str, Any] = {'version': -1, 'runs': []}
+        self.costmap: dict[str, Any] = {
+            'version': -1,
+            'knowledge': [],
+            'terrain': [],
+            'wall_cost': [],
+            'total': [],
+            'blocked': [],
+        }
         self.truth: dict[str, Any] | None = None
         self.plan_text = ''
         self.events: deque[dict[str, Any]] = deque(maxlen=60)
@@ -257,6 +325,10 @@ class DashboardData:
     def on_costmap(self, costmap: dict[str, Any]) -> None:
         with self.lock:
             self.costmap = costmap
+
+    def on_truth(self, truth: dict[str, Any]) -> None:
+        with self.lock:
+            self.truth = truth
 
     def on_event(self, event: dict[str, Any]) -> None:
         with self.lock:
@@ -301,14 +373,24 @@ class DashboardData:
             }
 
 
-def truth_from_scenario(scenario) -> dict[str, Any]:
-    """Hidden ground truth of a scenario, for the optional overlay."""
+def truth_from_scenario(scenario, at: float = 0.0) -> dict[str, Any]:
+    """Hidden ground truth at simulation time ``at`` for the debug overlay."""
+    soil_zones = {zone.id: asdict(zone) for zone in scenario.soil_zones}
+    hazard_zones = [asdict(zone) for zone in scenario.hazard_zones]
+    for event in scenario.events:
+        if event.at > at:
+            break
+        if event.type == 'soil_change' and event.zone in soil_zones:
+            soil_zones[event.zone]['cost_multiplier'] = event.cost_multiplier
+        elif event.type == 'hazard_appear':
+            hazard_zones.append(asdict(event.zone))
     return {
         'name': scenario.name,
+        'at': float(at),
         'base': {'x': scenario.base_x, 'y': scenario.base_y},
         'samples': [asdict(s) for s in scenario.samples],
-        'soil_zones': [asdict(z) for z in scenario.soil_zones],
-        'hazard_zones': [asdict(z) for z in scenario.hazard_zones],
+        'soil_zones': list(soil_zones.values()),
+        'hazard_zones': hazard_zones,
         'events': [
             {'at': e.at, 'type': e.type} for e in scenario.events
         ],

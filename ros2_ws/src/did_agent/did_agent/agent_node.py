@@ -17,7 +17,7 @@ import rclpy
 from rclpy.utilities import remove_ros_args
 
 from did_agent.autonomous import AutonomousAgent
-from did_agent.dashboard_core import terrain_runs
+from did_agent.dashboard_core import costmap_layers
 from did_agent.executor import PlanExecutor
 from did_agent.adaptation import Adaptation
 from did_agent.nav_node import Navigator
@@ -45,7 +45,7 @@ class AgentNode(Navigator):
         self._current: dict[str, Any] = {}
         self.cost_log: list[dict[str, Any]] = []
         self._command: str | None = None
-        self._published_cost_version = -2
+        self._published_cost_signature: tuple[int, int] | None = None
 
         self.adaptation = Adaptation(
             self.costmap,
@@ -230,10 +230,12 @@ class AgentNode(Navigator):
         self._journal_pub.publish(String(data=json.dumps(entry, ensure_ascii=False)))
 
     def _publish_costmap(self) -> None:
-        if self.costmap.version == self._published_cost_version:
+        signature = (self.costmap.version, self.adaptation.learner.observations)
+        if signature == self._published_cost_signature:
             return
-        self._published_cost_version = self.costmap.version
-        payload = {'version': self.costmap.version, 'runs': terrain_runs(self.costmap.terrain)}
+        self._published_cost_signature = signature
+        payload = costmap_layers(self.costmap)
+        payload['knowledge_version'] = signature[1]
         self._costmap_pub.publish(String(data=json.dumps(payload)))
 
     def _publish_status(self, status: dict[str, Any]) -> None:

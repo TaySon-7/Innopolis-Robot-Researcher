@@ -1,6 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
-import type { AgentGeometry, AgentTruth, NavigationMode, ScenarioZone } from './agentApi'
+import type {
+  AgentCostmap,
+  AgentGeometry,
+  CostRun,
+  MaskRun,
+  AgentTruth,
+  NavigationMode,
+  ScenarioZone,
+} from './agentApi'
 import type { LaserScan, Pose2D, SampleState } from './rosbridge'
+
+export type MapMode = 'truth' | 'knowledge' | 'planner'
+export type PlannerLayer = 'terrain' | 'wall_cost' | 'total'
 
 interface ArenaCanvasProps {
   pose: Pose2D
@@ -8,13 +19,13 @@ interface ArenaCanvasProps {
   samples: SampleState[]
   trail: Array<{ x: number; y: number }>
   waypoints: Array<[number, number]>
-  costmapRuns: Array<[number, number, number, number]>
+  costmap: AgentCostmap
   geometry: AgentGeometry | null
   truth: AgentTruth | null
   showTrail: boolean
   showPath: boolean
-  showCostmap: boolean
-  showTruth: boolean
+  mapMode: MapMode
+  plannerLayer: PlannerLayer
   onNavigate?: (x: number, y: number, mode: NavigationMode) => void
   onHover?: (point: { x: number; y: number } | null) => void
 }
@@ -135,19 +146,94 @@ function traceZone(
   }
 }
 
+function zoneCentre(zone: ScenarioZone): [number, number] | null {
+  if (typeof zone.x === 'number' && typeof zone.y === 'number') return [zone.x, zone.y]
+  if (
+    typeof zone.x_min === 'number' &&
+    typeof zone.x_max === 'number' &&
+    typeof zone.y_min === 'number' &&
+    typeof zone.y_max === 'number'
+  ) {
+    return [(zone.x_min + zone.x_max) / 2, (zone.y_min + zone.y_max) / 2]
+  }
+  return null
+}
+
+function terrainColour(value: number, alpha = 0.58): string {
+  if (value < 0.98) {
+    const blend = Math.max(0, Math.min(1, (value - 0.5) / 0.5))
+    const hue = 202 - blend * 42
+    return `hsla(${hue}, 72%, 49%, ${alpha})`
+  }
+  if (value <= 1.08) return `rgba(116, 137, 139, ${alpha * 0.62})`
+  const heat = Math.max(0, Math.min(1, (value - 1) / 4))
+  const hue = 52 - heat * 49
+  return `hsla(${hue}, 88%, 57%, ${alpha})`
+}
+
+function runRectangle(
+  run: CostRun | MaskRun,
+  geometry: AgentGeometry,
+  screen: ScreenProjector,
+) {
+  const [row, start, end] = run
+  const resolution = geometry.resolution
+  const worldX = geometry.origin[0] + start * resolution
+  const worldY = geometry.origin[1] + row * resolution
+  const [left, top] = screen(worldX, worldY + resolution)
+  const [right, bottom] = screen(
+    geometry.origin[0] + (end + 1) * resolution,
+    worldY,
+  )
+  return { left, top, width: right - left, height: bottom - top }
+}
+
+function drawValueRuns(
+  context: CanvasRenderingContext2D,
+  runs: CostRun[],
+  geometry: AgentGeometry,
+  screen: ScreenProjector,
+  colour: (value: number) => string,
+) {
+  for (const run of runs) {
+    const box = runRectangle(run, geometry, screen)
+    context.fillStyle = colour(run[3])
+    context.fillRect(box.left, box.top, box.width + 0.4, box.height + 0.4)
+  }
+}
+
+function blockedPattern(context: CanvasRenderingContext2D): CanvasPattern | null {
+  const tile = document.createElement('canvas')
+  tile.width = 10
+  tile.height = 10
+  const ink = tile.getContext('2d')
+  if (!ink) return null
+  ink.fillStyle = 'rgba(255, 96, 108, 0.13)'
+  ink.fillRect(0, 0, 10, 10)
+  ink.strokeStyle = 'rgba(255, 135, 143, 0.52)'
+  ink.lineWidth = 1.2
+  ink.beginPath()
+  ink.moveTo(-2, 10)
+  ink.lineTo(10, -2)
+  ink.moveTo(4, 12)
+  ink.lineTo(12, 4)
+  ink.stroke()
+  return context.createPattern(tile, 'repeat')
+}
+
 export function ArenaCanvas({
   pose,
   scan,
   samples,
   trail,
   waypoints,
-  costmapRuns,
+  costmap,
   geometry,
   truth,
   showTrail,
   showPath,
-  showCostmap,
-  showTruth,
+  mapMode,
+  plannerLayer,
   onNavigate,
   onHover,
 }: ArenaCanvasProps) {
@@ -231,44 +317,86 @@ export function ArenaCanvas({
       }
       context.restore()
 
-      if (showCostmap && geometry && costmapRuns.length) {
+      if (mapMode === 'knowledge' && geometry) {
         context.save()
         tracePolygon(context, floor, screen)
         context.clip()
-        const resolution = geometry.resolution
-        for (const [row, start, end, value] of costmapRuns) {
-          if (value < 1.15) continue
-          const worldX = geometry.origin[0] + start * resolution
-          const worldY = geometry.origin[1] + row * resolution
-          const [left, top] = screen(worldX, worldY + resolution)
-          const [right, bottom] = screen(
-            geometry.origin[0] + (end + 1) * resolution,
-            worldY,
-          )
-          const alpha = Math.min(0.42, 0.08 + (value - 1) * 0.09)
-          context.fillStyle = `rgba(242, 163, 58, ${alpha})`
-          context.fillRect(left, top, right - left, bottom - top)
+        context.fillStyle = 'rgba(103, 112, 118, 0.38)'
+        context.fillRect(0, 0, rect.width, rect.height)
+        drawValueRuns(context, costmap.knowledge ?? [], geometry, screen, (value) =>
+          terrainColour(value, 0.7),
+        )
+        context.restore()
+      }
+
+      if (mapMode === 'planner' && geometry) {
+        const runs = costmap[plannerLayer] ?? []
+        context.save()
+        tracePolygon(context, floor, screen)
+        context.clip()
+        context.fillStyle = plannerLayer === 'wall_cost'
+          ? 'rgba(52, 92, 112, 0.18)'
+          : 'rgba(116, 137, 139, 0.18)'
+        context.fillRect(0, 0, rect.width, rect.height)
+        drawValueRuns(context, runs, geometry, screen, (value) => {
+          if (plannerLayer === 'wall_cost') {
+            const strength = Math.max(0, Math.min(1, value / 4))
+            return `hsla(${205 + strength * 65}, 76%, 60%, ${0.18 + strength * 0.56})`
+          }
+          return terrainColour(value, 0.68)
+        })
+        const pattern = blockedPattern(context)
+        if (pattern) {
+          context.fillStyle = pattern
+          for (const run of costmap.blocked ?? []) {
+            const box = runRectangle(run, geometry, screen)
+            context.fillRect(box.left, box.top, box.width + 0.4, box.height + 0.4)
+          }
         }
         context.restore()
       }
 
-      if (showTruth && truth) {
+      if (mapMode === 'truth' && truth) {
         context.save()
         context.lineWidth = 1.3
-        context.setLineDash([6, 5])
         for (const zone of truth.soil_zones ?? []) {
           traceZone(context, zone, screen, scale)
-          context.fillStyle = 'rgba(242, 163, 58, 0.1)'
-          context.strokeStyle = 'rgba(242, 163, 58, 0.8)'
+          const multiplier = zone.cost_multiplier ?? 1
+          context.fillStyle = terrainColour(multiplier, 0.42)
+          context.strokeStyle = terrainColour(multiplier, 0.92)
           context.fill()
           context.stroke()
+          const centre = zoneCentre(zone)
+          if (centre) {
+            const [labelX, labelY] = screen(...centre)
+            const label = `×${multiplier.toFixed(1)}`
+            context.font = '700 11px ui-monospace, SFMono-Regular, Menlo, monospace'
+            context.textAlign = 'center'
+            context.textBaseline = 'middle'
+            context.lineWidth = 3.5
+            context.strokeStyle = 'rgba(5, 14, 20, 0.84)'
+            context.strokeText(label, labelX, labelY)
+            context.fillStyle = '#fff1cf'
+            context.fillText(label, labelX, labelY)
+          }
         }
         for (const zone of truth.hazard_zones ?? []) {
           traceZone(context, zone, screen, scale)
-          context.fillStyle = 'rgba(255, 96, 108, 0.12)'
+          context.setLineDash([5, 4])
+          context.fillStyle = 'rgba(255, 96, 108, 0.22)'
           context.strokeStyle = 'rgba(255, 96, 108, 0.9)'
           context.fill()
           context.stroke()
+          const centre = zoneCentre(zone)
+          if (centre) {
+            const [labelX, labelY] = screen(...centre)
+            context.setLineDash([])
+            context.font = '700 9px ui-monospace, SFMono-Regular, Menlo, monospace'
+            context.textAlign = 'center'
+            context.textBaseline = 'middle'
+            context.fillStyle = '#ffadb4'
+            context.fillText('ОПАСНО', labelX, labelY)
+          }
         }
         context.setLineDash([])
         context.restore()
@@ -513,7 +641,7 @@ export function ArenaCanvas({
     observer.observe(canvas)
     draw()
     return () => observer.disconnect()
-  }, [costmapRuns, geometry, hover, pose, samples, scan, showCostmap, showPath, showTrail, showTruth, trail, truth, waypoints])
+  }, [costmap, geometry, hover, mapMode, plannerLayer, pose, samples, scan, showPath, showTrail, trail, truth, waypoints])
 
   const pointFromPointer = (clientX: number, clientY: number) => {
     const canvas = canvasRef.current
