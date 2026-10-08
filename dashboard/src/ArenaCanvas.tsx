@@ -70,8 +70,39 @@ function arenaFloor(geometry: AgentGeometry | null): ArenaPoint[] {
   return geometry.floor.map(([x, y]) => ({ x, y }))
 }
 
+/**
+ * The box the view is fitted to.
+ *
+ * `bounds` is the extent of the *walls*, not of the drivable floor: with the
+ * Gazebo scene it spans 7.3 m while the robot can only reach the middle 5.4 m.
+ * Fitting the view to that box shrinks the arena and makes every passage look
+ * narrower than it is. So the floor wins when it is a real outline, and
+ * otherwise the walls are inset by their own thickness.
+ */
 function arenaBounds(geometry: AgentGeometry | null): ArenaBounds {
-  return geometry?.bounds ?? FALLBACK_BOUNDS
+  if (!geometry) return FALLBACK_BOUNDS
+  const floor = geometry.floor
+  // A real arena outline has at least eight vertices. The Gazebo scene's floor
+  // extraction currently yields six and covers only part of the arena, so a
+  // short polygon is ignored rather than fitted to.
+  if (floor && floor.length >= 8) {
+    const xs = floor.map(([x]) => x)
+    const ys = floor.map(([, y]) => y)
+    return {
+      xmin: Math.min(...xs),
+      xmax: Math.max(...xs),
+      ymin: Math.min(...ys),
+      ymax: Math.max(...ys),
+    }
+  }
+  const bounds = geometry.bounds ?? FALLBACK_BOUNDS
+  const inset = Math.max(0.1, geometry.wall ?? 0.2)
+  return {
+    xmin: bounds.xmin + inset,
+    xmax: bounds.xmax - inset,
+    ymin: bounds.ymin + inset,
+    ymax: bounds.ymax - inset,
+  }
 }
 
 function arenaView(width: number, height: number, bounds: ArenaBounds) {

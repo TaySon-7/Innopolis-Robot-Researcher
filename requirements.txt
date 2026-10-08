@@ -1,0 +1,11 @@
+# Python dependencies installed with pip inside the container.
+#
+# Everything else comes from apt: numpy and pyyaml are declared as
+# python3-numpy and python3-yaml in did_agent/package.xml, and pulling a wheel
+# for them would shadow the system packages the ROS tools already use.
+
+# Validates everything the model returns before it reaches /agent/plan.
+# Ubuntu 24.04 marks the system Python externally-managed (PEP 668), so the
+# install needs --break-system-packages; a venv would not be visible to the
+# ROS entrypoint scripts.
+pydantic>=2

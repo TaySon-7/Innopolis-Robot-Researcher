@@ -14,7 +14,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AgentJournal, AgentPanel } from './AgentPanels'
+import { AgentJournal, AgentPanel, AgentPlanPanel } from './AgentPanels'
 import { ArenaCanvas } from './ArenaCanvas'
 import type { MapMode, PlannerLayer } from './ArenaCanvas'
 import { useAgentApi } from './agentApi'
@@ -337,6 +337,11 @@ function App() {
             <div className="map-click-hint">Клик — ехать · Shift+клик — искать образец</div>
           </div>
         </section>
+
+        <AgentPlanPanel
+          raw={agentSnapshot.plan}
+          runningPlanId={agentSnapshot.state?.current?.plan_id ?? ''}
+        />
 
         <AgentJournal journal={agentSnapshot.journal} events={agentSnapshot.events} />
 

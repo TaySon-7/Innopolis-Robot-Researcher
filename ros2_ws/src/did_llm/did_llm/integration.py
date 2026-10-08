@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 import time
 from typing import Any, Callable
 
@@ -28,9 +30,15 @@ from did_agent.executor import PlanExecutor
 from did_agent.plan import PlanError, parse_plan
 from did_agent.scenario_generator import load_named
 from did_agent.sim_robot import SimRobot
+from did_agent.skills import Skills
 
 from did_llm.agent_plan import PlanRejected, parse_model_plan
-from did_llm.llm_client import LLMClient, LLMConfig, LLMUnavailable
+from did_llm.llm_client import (
+    LLMClient,
+    LLMConfig,
+    LLMUnavailable,
+    load_api_key,
+)
 from did_llm.planner_node import Planner, PlannerConfig
 from did_llm.prompts import PLANNER_SYSTEM, build_planner_prompt
 
@@ -44,14 +52,17 @@ class RobotLink:
     simulator or to a live agent, which is what makes the comparison fair.
     """
 
-    def __init__(self, robot: SimRobot, log: Callable[[str], None]) -> None:
+    def __init__(self, robot: SimRobot, skills: Skills,
+                 log: Callable[[str], None]) -> None:
         self.robot = robot
+        self.skills = skills
         self.log = _Log(log)
         self.state: dict[str, Any] | None = None
         self.status: dict[str, Any] | None = None
         self.episode_finished = False
         self.state_at: float = 0.0
         self.clock = 0.0
+        self.autonomous = False
 
         self.published: list[dict[str, Any]] = []
         self.commands: list[str] = []
@@ -63,9 +74,8 @@ class RobotLink:
     def refresh(self) -> None:
         """Rebuild /agent/state from the robot, in the executor's format."""
         pose = self.robot.pose()
-        skills = self.robot.skills
         try:
-            return_cost = skills.return_cost_estimate()
+            return_cost = self.skills.return_cost_estimate()
         except Exception:  # noqa: BLE001 - mirrors the agent's own guard
             return_cost = float('nan')
         reading = self.robot.read_sensor()
@@ -93,6 +103,10 @@ class RobotLink:
         }
         self.state_at = self.now()
         self.episode_finished = bool(self.robot.judge.finished)
+        # The planner measures time to decide when the next plan is due, so
+        # the clock has to move with the simulation. A frozen clock would make
+        # every plan look fresh and the planner would stop after the first one.
+        self.clock = self.robot.now()
 
     # ----------------------------------------------------------------- output
     def now(self) -> float:
@@ -119,6 +133,14 @@ class RobotLink:
     def finished(self) -> bool:
         return self.episode_finished
 
+    def in_autonomous_mode(self) -> bool:
+        """True once the harness has handed the episode to the agent's policy.
+
+        The live agent reports this as ``plan_id: "auto"``; here the harness
+        knows because it is the one that started it.
+        """
+        return self.autonomous
+
     def publish_plan(self, payload: dict[str, Any]) -> None:
         self.published.append(payload)
 
@@ -129,6 +151,11 @@ class RobotLink:
                 status: str = 'open', **extra: Any) -> None:
         self.journal_entries.append({'kind': kind, 'title': title,
                                      'text': text, 'status': status, **extra})
+        # The live dashboard renders these; the harness has no dashboard, so
+        # without this a plan's refusal reason would only ever appear in a
+        # container log and never in the comparison output.
+        self.log.info(f'[{kind}/{status}] {title}'
+                    + (f' — {text}' if text else ''))
 
     def last_status_for(self, plan_id: str) -> dict[str, Any] | None:
         status = self.status
@@ -162,6 +189,9 @@ def run_llm(scenario: str, client: LLMClient, *, max_plans: int = 12,
             verbose: bool = True) -> dict[str, Any]:
     """One episode with the LLM in charge of the plan."""
     robot = SimRobot(load_named(scenario))
+    # The executor needs Skills, which the ROS node builds around its Robot;
+    # SimRobot is the Robot itself, so the same wrapper goes around it.
+    skills = Skills(robot)
     lines: list[str] = []
 
     def say(message: str) -> None:
@@ -169,10 +199,13 @@ def run_llm(scenario: str, client: LLMClient, *, max_plans: int = 12,
         if verbose:
             print(f'    {message}', flush=True)
 
-    link = RobotLink(robot, say)
+    link = RobotLink(robot, skills, say)
     planner = Planner(link, client, PlannerConfig())
 
-    executor = PlanExecutor(skills=robot.skills, publish_status=link.status.__setitem__)
+    executor = PlanExecutor(
+        skills=skills,
+        publish_status=lambda status: setattr(link, 'status', status),
+    )
 
     started = time.time()
     plans = 0
@@ -230,16 +263,17 @@ def run_llm(scenario: str, client: LLMClient, *, max_plans: int = 12,
         'false_collects': judge.false_collects,
         'plans': plans,
         'wall_seconds': round(time.time() - started, 1),
-        'hypotheses': len(robot.adaptation.hypotheses),
+        'hypotheses': robot.adaptation.hypotheses,
     }
 
 
 def _drive_autonomous(robot: SimRobot, executor: PlanExecutor,
-                      link: RobotLink, say: Callable[[str], None]) -> None:
+                      link: 'RobotLink', say: Callable[[str], None]) -> None:
     """Finish the episode with the agent's own policy."""
     from did_agent.autonomous import AutonomousAgent
 
     say('автономный режим')
+    link.autonomous = True
     AutonomousAgent(robot, log=say).run()
 
 
@@ -265,7 +299,7 @@ def run_autonomous(scenario: str) -> dict[str, Any]:
         'false_collects': judge.false_collects,
         'plans': 0,
         'wall_seconds': round(time.time() - started, 1),
-        'hypotheses': len(robot.adaptation.hypotheses),
+        'hypotheses': robot.adaptation.hypotheses,
     }
 
 
@@ -292,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     client = LLMClient(LLMConfig(base_url=args.base_url,
-                                 api_key=_api_key(),
+                                 api_key=load_api_key(),
                                  model=args.model))
     if not client.cfg.configured:
         print('НЕТ КЛЮЧА API — сравнение с LLM невозможно.', file=sys.stderr)
@@ -347,15 +381,5 @@ def _print_verdict(rows: list[dict[str, Any]]) -> None:
           f'штрафов {mean(auto, "collisions") + mean(auto, "hazard_hits"):.2f}')
 
 
-def _api_key() -> str:
-    import os
-    for name in ('DID_LLM_API_KEY', 'LLM_API_KEY', 'OPENAI_API_KEY'):
-        value = os.environ.get(name)
-        if value:
-            return value
-    return ''
-
-
 if __name__ == '__main__':
-    import sys
     raise SystemExit(main())

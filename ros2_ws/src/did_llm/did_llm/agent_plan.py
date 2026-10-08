@@ -11,7 +11,8 @@ plans for cannot be tested against a stub.
 
 from __future__ import annotations
 
-from math import isfinite
+from dataclasses import dataclass
+from math import hypot, isfinite
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -56,6 +57,129 @@ BASE_Y = -0.5
 ARENA_X_MIN, ARENA_X_MAX = -2.8, 2.5
 ARENA_Y_MIN, ARENA_Y_MAX = -2.5, 2.5
 
+#: The nine pillars sit on a 3x3 grid with a step of about 1.1 m, radius
+#: 0.15 m. The keep-out below is wider than the pillar on purpose: a plan that
+#: grazes one is a plan that fails to find a path, and a rejection costs one
+#: model call while a failed subgoal costs the robot the trip.
+PILLAR_RADIUS = 0.15
+PILLAR_KEEPOUT = 0.35
+PILLAR_GRID = (-1.1, 0.0, 1.1)
+
+#: Distance a plan keeps from the wall line, in metres.
+#:
+#: The task statement requires that walls "and a margin around them" be
+#: forbidden, but that is the navigation layer's job and did_agent does it: its
+#: cost map inflates walls by 0.20 m, which is more than the burger's radius and
+#: what actually keeps the robot off them. Inflating them a second time here
+#: only removed options from the plan — the passages in this arena are already
+#: narrow, and a second 0.25 m made them unnarrowable. One map cell is enough to
+#: keep a goal off the wall line itself and let the navigator handle clearance.
+WALL_MARGIN = 0.05
+
+
+@dataclass
+class Arena:
+    """Where the robot can actually go, as opposed to where numbers may be.
+
+    Defaults to the values in ARCHITECTURE section 3, but the agent publishes
+    the geometry it read out of the Gazebo scene, and a hardcoded grid is a
+    guess that silently rots the first time a pillar moves. ``update`` takes
+    the payload from ``/api/geometry``.
+    """
+
+    x_min: float = ARENA_X_MIN
+    x_max: float = ARENA_X_MAX
+    y_min: float = ARENA_Y_MIN
+    y_max: float = ARENA_Y_MAX
+    pillars: tuple[tuple[float, float, float], ...] = tuple(
+        (px, py, PILLAR_RADIUS)
+        for px in PILLAR_GRID for py in PILLAR_GRID
+    )
+    #: True once real geometry has replaced the documented constants.
+    from_scene: bool = False
+
+    def update(self, payload: dict[str, Any]) -> bool:
+        """Adopt the pillars the agent measured. Returns True if it changed.
+
+        Only the pillars. ``bounds`` in ``/api/geometry`` is the extent of the
+        outer wall, not of the walkable floor: the Gazebo scene reports
+        x in [-3.65, 3.65] with wall thickness 0.3175, and the map-derived
+        fallback reports x in [-3.25, 3.0], while the floor the robot can drive
+        on is about x in [-2.85, 2.55]. Adopting those numbers as bounds would
+        silently accept points that are inside the wall, which is the exact
+        failure the bounds check exists to prevent.
+
+        The pillar positions are trustworthy and are worth taking: the scene
+        gives them exactly at (-1.1, 0, 1.1), while the map-derived version is
+        offset by about 2.5 cm.
+        """
+        pillars = payload.get('pillars')
+        if not isinstance(pillars, list) or not pillars:
+            return False
+        try:
+            self.pillars = tuple(
+                (float(item['x']), float(item['y']),
+                 float(item.get('r', PILLAR_RADIUS)))
+                for item in pillars
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        self.from_scene = True
+        return True
+
+
+#: The arena every check reads. Mutated in place by :func:`load_geometry` so
+#: that the plan validator stays a plain function with no plumbing.
+ARENA = Arena()
+
+
+def load_geometry(base_url: str = 'http://127.0.0.1:8080',
+                  timeout: float = 5.0) -> bool:
+    """Adopt the agent's measured arena geometry, if it is reachable.
+
+    The agent already extracts pillars and wall bounds from the Gazebo scene
+    for the dashboard. Reading them from the same place keeps the planner from
+    validating against a grid that has drifted from the one in the scene.
+    Failure is not an error: the documented constants stay in place.
+    """
+    import json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f'{base_url}/api/geometry',
+                                    timeout=timeout) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+    except Exception:  # noqa: BLE001 - geometry is an improvement, not a need
+        return False
+    return ARENA.update(payload if isinstance(payload, dict) else {})
+
+
+def arena_problem(x: float, y: float) -> str | None:
+    """Why a point is unusable, or None when it is free floor.
+
+    This is the check that turns a well-formed plan into a workable one. The
+    executor's parser only rejects shapes — a wrong type, a string where a
+    number belongs, a coordinate outside the world. It cannot reject a point
+    two centimetres from a pillar, because that is a perfectly good number.
+    Such a plan parses, then fails at run time as "no path to goal", and the
+    robot loses the trip. Catching it here costs nothing: the plan is rejected
+    with a reason the model can act on next time.
+    """
+    arena = ARENA
+    lo_x, hi_x = arena.x_min + WALL_MARGIN, arena.x_max - WALL_MARGIN
+    lo_y, hi_y = arena.y_min + WALL_MARGIN, arena.y_max - WALL_MARGIN
+    if not lo_x <= x <= hi_x:
+        return (f'точка ({x:g}; {y:g}) вне арены: x должен быть между '
+                f'{lo_x:.2f} и {hi_x:.2f}')
+    if not lo_y <= y <= hi_y:
+        return (f'точка ({x:g}; {y:g}) вне арены: y должен быть между '
+                f'{lo_y:.2f} и {hi_y:.2f}')
+    for px, py, radius in arena.pillars:
+        if hypot(x - px, y - py) < max(PILLAR_KEEPOUT, radius + 0.2):
+            return (f'точка ({x:g}; {y:g}) попадает на столб у ({px:g}; {py:g}); '
+                    f'держись не ближе {PILLAR_KEEPOUT:g} м от столбов')
+    return None
+
 
 def budget_floor(return_cost: float | None) -> float | None:
     """Battery below which going home is the only sensible plan.
@@ -74,6 +198,83 @@ def must_return(battery: float, return_cost: float | None) -> bool:
     if floor is None:
         return False
     return battery < floor
+
+
+#: Battery kept aside regardless of what the return costs: the robot's own
+#: radius of ignorance, the final approach and one failed attempt. Without a
+#: floor of its own the estimate goes to zero whenever the robot stands on the
+#: base, and the planner concludes it has an unlimited budget.
+SAFETY_RESERVE = 12.0
+
+#: Fraction of the battery still available that may be spent on going out.
+SPENDABLE_FRACTION = 0.5
+
+#: Below this much spendable battery one more sweep is not worth starting, so
+#: going home becomes the right answer again.
+SEARCH_WORTH_IT = 5.0
+
+#: Sensor reading above which a sample is treated as within reach. Same number
+#: the agent's autonomous policy uses, so both agree on what "near" means.
+SIGNAL_NEAR = 0.08
+
+#: Noise level above which the sensor reading stops being trustworthy. In the
+#: hard scenario the judge injects a fault that pushes it to 0.15, and a single
+#: reading then means nothing.
+NOISE_UNTRUSTWORTHY = 0.06
+
+#: A leg longer than this is treated as a journey rather than a repositioning,
+#: and is judged on what the floor along it costs.
+LEG_WORTH_M = 2.0
+
+#: A goto this close to where the robot already stands is a no-op. Models write
+#: it to mean "right here", so refusing it would force a repair round over every
+#: strong-signal plan — one wasted model call each.
+GOTO_NOOP_M = 0.7
+
+#: Battery a single long leg may cost before the plan is refused outright.
+#: A search point is a maybe: it may find nothing. Nine units is already more
+#: than any single discovery is worth, so a leg that costs more is a bad bet
+#: whatever the battery happens to hold.
+LEG_WORTH_COST = 8.0
+
+#: …or, whatever the ground, a single leg may not eat more than this share of
+#: what is left.
+LEG_SHARE = 0.25
+
+
+def _leg_crosses(start: tuple[float, float], end: tuple[float, float],
+                 patch: dict[str, float]) -> bool:
+    """Whether the straight leg from start to end passes through a patch.
+
+    A circle test on the leg's midpoint plus both ends. Exact segment geometry
+    would be nicer, but this only has to be conservative: the planner is
+    discouraged from far targets when expensive ground is in play, and being
+    slightly over-eager about that is far cheaper than the alternative.
+    """
+    cx, cy = float(patch['x']), float(patch['y'])
+    reach = float(patch.get('reach', 0.0))
+    for point in (start, end,
+                  ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2),
+                  (start[0] * 0.75 + end[0] * 0.25,
+                   start[1] * 0.75 + end[1] * 0.25),
+                  (start[0] * 0.25 + end[0] * 0.75,
+                   start[1] * 0.25 + end[1] * 0.75)):
+        if hypot(point[0] - cx, point[1] - cy) <= reach:
+            return True
+    return False
+
+
+def spendable_budget(battery: float, return_cost: float | None) -> float:
+    """How much battery may be spent away from the base, and no more.
+
+    Two terms. The agent's own estimate of the way home, which is the honest
+    one while the robot is out in the arena. Plus a reserve that does not
+    shrink to nothing at the base, which is where the estimate alone fails:
+    standing on the base it reads as zero, and a planner that trusts it will
+    plan a sweep of the whole arena on a battery that cannot pay for it.
+    """
+    spent = max(0.0, return_cost or 0.0)
+    return max(0.0, battery - spent - SAFETY_RESERVE) * SPENDABLE_FRACTION
 
 
 class Subgoal(BaseModel):
@@ -206,7 +407,173 @@ def parse_model_plan(raw: str | dict[str, Any],
     if not isinstance(explanation, str):
         explanation = ''
 
-    return Plan(plan_id=plan_id, subgoals=subgoals, explanation=explanation)
+    return Plan(plan_id=plan_id, subgoals=subgoals,
+                explanation=explanation)
+
+
+def check_plan(plan: Plan,
+               expensive: list[dict[str, float]] | None = None,
+               *,
+               min_battery: float | None = None,
+               samples_remaining: int | None = None,
+               signal_high: float | None = None,
+               sensor_noise: float | None = None,
+               pose: tuple[float, float] | None = None,
+               battery: float | None = None,
+               cost_per_search: float = 1.2) -> list[str]:
+    """Everything wrong with an otherwise well-formed plan.
+
+    Returns a list of messages rather than the first one: telling the model
+    about all the bad points at once costs one call instead of one per point.
+    Empty means the plan is worth publishing.
+    """
+    problems: list[str] = []
+    visited: list[tuple[str, float, float]] = []
+
+    for index, subgoal in enumerate(plan.subgoals):
+        if subgoal.type in ('goto', 'search_around'):
+            issue = arena_problem(subgoal.x, subgoal.y)
+            if issue:
+                problems.append(f'подцель {index}: {issue}')
+            # Only travelling to somewhere already visited is wasted motion.
+            # A search in the spot you have just arrived at is the intended
+            # pattern, and rejecting it would refuse most good plans.
+            if subgoal.type == 'goto':
+                for name, x, y in visited:
+                    if hypot(x - subgoal.x, y - subgoal.y) < 0.15:
+                        problems.append(
+                            f'подцель {index}: повторяет {name} '
+                            f'({subgoal.x:g}; {subgoal.y:g}) — туда уже ехали')
+                        break
+            visited.append((subgoal.type, subgoal.x, subgoal.y))
+
+    # Expensive ground is refused outright. The mission says to avoid it, and
+    # a plan that crosses it burns the battery the next sector needs.
+    for index, subgoal in enumerate(plan.subgoals):
+        if subgoal.type not in ('goto', 'search_around'):
+            continue
+        for patch in expensive or ():
+            reach = float(patch.get('reach', 0.0))
+            if hypot(subgoal.x - float(patch['x']),
+                     subgoal.y - float(patch['y'])) <= reach:
+                problems.append(
+                    f'подцель {index}: ({subgoal.x:g}; {subgoal.y:g}) лежит на '
+                    f'дорогом грунте цены ×{patch.get("cost", 1):.1f} — '
+                    'объедь его стороной')
+                break
+
+    # Value against price. A long leg to a guessed search point is only worth
+    # making when the floor between here and there is ordinary. Without this
+    # the model crosses the whole arena to reach a point it invented and pays
+    # several times the normal price for the privilege, which is exactly the
+    # behaviour of burning the battery while other samples go unpicked.
+    if expensive and pose is not None and battery is not None:
+        for index, subgoal in enumerate(plan.subgoals):
+            if subgoal.type not in ('goto', 'search_around'):
+                continue
+            distance = hypot(subgoal.x - pose[0], subgoal.y - pose[1])
+            if distance < LEG_WORTH_M:
+                continue
+            dearest = max((float(patch['cost']) for patch in expensive
+                           if _leg_crosses(pose, (subgoal.x, subgoal.y),
+                                           patch)),
+                          default=1.0)
+            price = distance * dearest
+            if price > LEG_WORTH_COST or price > battery * LEG_SHARE:
+                problems.append(
+                    f'подцель {index}: {distance:.1f} м по грунту цены '
+                    f'×{dearest:.1f} — это {price:.0f} ед. батареи за одну '
+                    'точку. Возьми ближнюю или возвращайся')
+                break
+
+    searches = [i for i, s in enumerate(plan.subgoals) if s.type == 'search_around']
+    collects = [i for i, s in enumerate(plan.subgoals) if s.type == 'collect']
+
+    # A collect with no search before it is a false collect: the judge charges
+    # a penalty for collecting where nothing is.
+    for index in collects:
+        before = plan.subgoals[:index]
+        if not any(item.type in ('search_around',) for item in before):
+            problems.append(
+                f'подцель {index}: collect без предшествующего поиска — '
+                'сначала search_around, потом collect')
+
+    for index in searches:
+        if index + 1 not in collects:
+            problems.append(
+                f'подцель {index}: после search_around нужен collect сразу, '
+                f'иначе образец будет найден и оставлен')
+
+    # A live sensor means a sample is within reach. Travelling away from it is
+    # the most expensive mistake available here: the model cannot know where
+    # another one is, so a distant search point burns battery crossing the
+    # arena while a collectible sample goes unpicked.
+    #
+    # The reading is only trusted when it clears the noise. Under the judge's
+    # sensor fault the reading is pure jitter, and obeying it would pin the
+    # robot to one spot while a real sample goes unpicked elsewhere.
+    near = (signal_high is not None and signal_high >= SIGNAL_NEAR
+            and (sensor_noise is None or sensor_noise < NOISE_UNTRUSTWORTHY))
+    if near:
+        first_move = next((i for i, s in enumerate(plan.subgoals)
+                           if s.type in ('goto', 'search_around')), None)
+        if first_move is not None:
+            for index in range(first_move + 1):
+                subgoal = plan.subgoals[index]
+                if subgoal.type != 'goto':
+                    continue
+                # A goto to where the robot already stands is a no-op, and
+                # models write it constantly to mean "here, right now". Refusing
+                # it makes every strong-signal plan need a repair round, which
+                # costs a full model call each time.
+                if pose is not None and hypot(subgoal.x - pose[0],
+                                              subgoal.y - pose[1]) < GOTO_NOOP_M:
+                    continue
+                problems.append(
+                    f'подцель {index}: сигнал {signal_high:.2f} — образец '
+                    f'в пределах досягаемости, сначала search_around и collect '
+                    f'на месте, а не поездка в ({subgoal.x:g}; {subgoal.y:g})')
+                break
+
+        # Local search must be local: a wide circle around a sample that is
+        # already close is the "spinning without collecting" failure, and the
+        # radius should shrink as the reading grows.
+        for index, subgoal in enumerate(plan.subgoals):
+            if subgoal.type != 'search_around' or index > first_move:
+                continue
+            allowed = max(0.4, 1.6 * max(0.0, 1.0 - signal_high))
+            if subgoal.radius > allowed + 0.05:
+                problems.append(
+                    f'подцель {index}: сигнал {signal_high:.2f} — образец '
+                    f'рядом, радиус {subgoal.radius:g} велик, бери '
+                    f'не больше {allowed:.1f} м')
+                break
+
+    # Does the plan fit in the battery? Rough, on the assumption that a search
+    # circle costs roughly as much driving as its own radius.
+    if min_battery is not None:
+        cost = sum(cost_per_search if s.type == 'search_around' else 0.6
+                   for s in plan.subgoals)
+        if cost > min_battery:
+            problems.append(
+                f'план примерно на {cost:.0f} ед. батареи, а доступно '
+                f'{min_battery:.0f} — сократи число поисков или возвращайся')
+
+    # Ending the episode is not the model's call. ``return_to_base`` makes the
+    # agent call /did/finish, and the judge closes the run: a plan that ends
+    # there with samples still on the floor finishes the episode at whatever it
+    # has collected so far, and no later plan can be issued. The mission says
+    # collect as many as possible and only then come back, so this is refused
+    # while samples remain and the battery can pay for another sweep.
+    if (plan.subgoals and plan.subgoals[-1].type == 'return_to_base'
+            and samples_remaining and samples_remaining > 0
+            and (min_battery is None or min_battery > SEARCH_WORTH_IT)):
+        problems.append(
+            f'нельзя заканчивать эпизод: осталось образцов '
+            f'{samples_remaining}, батареи хватает ещё на '
+            f'{min_battery:.0f} ед. Добавь поиск; return_to_base оставь '
+            'только когда батареи реально не хватает')
+    return problems
 
 
 def home_plan(plan_id: str, explanation: str = '') -> Plan:
@@ -224,6 +591,31 @@ def home_plan(plan_id: str, explanation: str = '') -> Plan:
 
 
 def _brief(error: Exception) -> str:
-    """First line of a pydantic error, without the noisy model dump."""
+    """The part of a pydantic error a model can act on.
+
+    Pydantic's default text starts with "1 validation error for Subgoal",
+    which says nothing about which field is wrong or how. Since this string
+    goes straight back into the next prompt, it has to name the field and the
+    problem, or the model will guess.
+    """
+    errors = getattr(error, 'errors', None)
+    if callable(errors):
+        try:
+            details = errors()
+        except Exception:  # noqa: BLE001 - fall through to the text
+            details = []
+        parts = []
+        for item in details:
+            field = '.'.join(str(part) for part in item.get('loc', ()))
+            message = str(item.get('msg', ''))
+            # "Value error, radius must be between..." reads as noise once the
+            # field is already named.
+            message = message.removeprefix('Value error, ')
+            if not field or field in message:
+                parts.append(message)
+            else:
+                parts.append(f'{field}: {message}')
+        if parts:
+            return '; '.join(parts)
     text = str(error).strip().splitlines()
     return text[0] if text else error.__class__.__name__

@@ -21,10 +21,24 @@ STATUS_TOPIC = '/agent/status'
 COMMAND_TOPIC = '/agent/command'
 JOURNAL_TOPIC = '/agent/journal'
 
+#: The agent's own cost map. It is the only place the expensive ground the
+#: learner has measured actually appears: ``/agent/state`` carries an empty
+#: ``cost_map_updates`` until an analyst pushes something, so a planner that
+#: reads only state has no idea where the floor is dear.
+COSTMAP_TOPIC = '/agent/costmap'
+
+#: Grid the cost map is expressed in, from /api/geometry.
+GRID_ORIGIN = (-10.0, -10.0)
+GRID_STEP = 0.05
+
+#: Floor cost above which the agent itself treats ground as expensive.
+EXPENSIVE_COST = 1.4
+
 #: The judge publishes the episode flag here and nowhere else: inside
 #: /agent/state the "score" field is a plain number. Reading this one public
 #: judge topic is the whole of the planner's contact with the judge.
 SCORE_TOPIC = '/did/score'
+EVENTS_TOPIC = '/did/events'
 
 
 class AgentLink:
@@ -50,10 +64,19 @@ class AgentLink:
         self.seen_plans: set[str] = set()
         #: From the judge: whether the episode is over.
         self.episode_finished = False
+        #: Expensive ground from the agent's cost map: (x, y, reach, cost).
+        self.expensive: list[tuple[float, float, float, float]] = []
+        #: Penalty events waiting to be acted on.
+        self.pending_events: list[dict[str, Any]] = []
+        #: Latest collection count seen on the event stream, which arrives
+        #: before the next /agent/state does.
+        self.collected_hint: int | None = None
 
         node.create_subscription(String, STATE_TOPIC, self._on_state, 10)
         node.create_subscription(String, STATUS_TOPIC, self._on_status, 10)
         node.create_subscription(String, SCORE_TOPIC, self._on_score, 10)
+        node.create_subscription(String, EVENTS_TOPIC, self._on_event, 50)
+        node.create_subscription(String, COSTMAP_TOPIC, self._on_costmap, 10)
 
     # ------------------------------------------------------------------ input
     def _on_state(self, message: String) -> None:
@@ -75,6 +98,35 @@ class AgentLink:
             return
         self.status = payload
 
+    def _on_event(self, message: String) -> None:
+        """Penalty events, drained on the next tick rather than acted on here.
+
+        The callback must stay cheap and must not publish: a stop and a fresh
+        model call belong to the planning loop, which is the only place that
+        knows what is already running.
+        """
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        name = payload.get('event')
+        if isinstance(name, str) and name:
+            self.pending_events.append(payload)
+            if name == 'sample_collected':
+                collected = payload.get('collected')
+                if isinstance(collected, (int, float)):
+                    self.collected_hint = int(collected)
+
+    def take_event(self) -> dict[str, Any] | None:
+        """The oldest unhandled event, if any."""
+        return self.pending_events.pop(0) if self.pending_events else None
+
+    def note_collected(self, value: int) -> None:
+        """A collection reported by an event, ahead of the next state."""
+        self.collected_hint = value
+
     def _on_score(self, message: String) -> None:
         """The only thing taken from the judge: whether the episode is over."""
         try:
@@ -83,6 +135,57 @@ class AgentLink:
             return
         if isinstance(payload, dict):
             self.episode_finished = bool(payload.get('finished', False))
+
+    def _on_costmap(self, message: String) -> None:
+        """Read the expensive ground the agent has measured.
+
+        The agent encodes it as ``[row, col_from, col_to, cost]`` runs on a
+        0.05 m grid with row 0 at the bottom. Each run becomes a world-space
+        point with a reach, which is the granularity a plan needs: a plan names
+        coordinates, so it needs coordinates back.
+
+        Without this the planner is blind. ``/agent/state`` carries an empty
+        ``cost_map_updates`` until an analyst pushes something, so a planner
+        that reads only state cannot route around expensive ground and will
+        happily drive the robot across it.
+        """
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError):
+            return
+        runs = payload.get('terrain') if isinstance(payload, dict) else None
+        if not isinstance(runs, list):
+            return
+
+        regions: list[tuple[float, float, float, float]] = []
+        for run in runs:
+            try:
+                row, col0, col1, cost = (float(value) for value in run[:4])
+            except (TypeError, ValueError):
+                continue
+            if cost < EXPENSIVE_COST:
+                continue
+            x = GRID_ORIGIN[0] + (col0 + col1) / 2 * GRID_STEP
+            y = GRID_ORIGIN[1] + row * GRID_STEP
+            # Half the run's width, so a long strip is not reported as a point
+            # the plan can simply walk around.
+            reach = max(GRID_STEP, (col1 - col0 + 1) * GRID_STEP / 2)
+            regions.append((x, y, reach, cost))
+        self.expensive = regions
+
+    def expensive_ground(self) -> list[dict[str, float]]:
+        """Expensive patches, for the prompt."""
+        return [{'x': round(x, 2), 'y': round(y, 2),
+                 'reach': round(reach, 2), 'cost': round(cost, 2)}
+                for x, y, reach, cost in self.expensive]
+
+    def cost_at(self, x: float, y: float) -> float:
+        """Measured floor cost at a point; 1.0 where nothing is known."""
+        worst = 1.0
+        for px, py, reach, cost in self.expensive:
+            if (x - px) ** 2 + (y - py) ** 2 <= reach ** 2 and cost > worst:
+                worst = cost
+        return worst
 
     def now(self) -> float:
         """Clock reading shared by the node, so timings stay comparable."""
@@ -134,14 +237,56 @@ class AgentLink:
     def battery(self) -> float:
         return float((self.state or {}).get('battery', 0.0))
 
+    def pose(self) -> tuple[float, float] | None:
+        pose = (self.state or {}).get('pose')
+        if isinstance(pose, dict) and isinstance(pose.get('x'), (int, float)) \
+                and isinstance(pose.get('y'), (int, float)):
+            return float(pose['x']), float(pose['y'])
+        return None
+
+    def signal(self) -> float | None:
+        """Sensor reading: 0..1, how close the nearest sample is.
+
+        The judge publishes no direction, only magnitude. That is why a plan
+        must search where it stands when this is high rather than set off for
+        a guessed point.
+        """
+        sensor = (self.state or {}).get('sensor')
+        if isinstance(sensor, dict) and isinstance(sensor.get('value'),
+                                                   (int, float)):
+            return float(sensor['value'])
+        return None
+
+    def noise(self) -> float | None:
+        sensor = (self.state or {}).get('sensor')
+        if isinstance(sensor, dict) and isinstance(
+                sensor.get('noise_estimate'), (int, float)):
+            return float(sensor['noise_estimate'])
+        return None
+
     def return_cost(self) -> float | None:
         value = (self.state or {}).get('return_cost_estimate')
         return float(value) if isinstance(value, (int, float)) else None
 
+    def in_autonomous_mode(self) -> bool:
+        """Whether the agent is driving itself, by operator or by fallback.
+
+        The agent reports ``plan_id: "auto"`` for its own behaviour. While
+        that holds, any plan we publish would preempt it — and during a demo
+        the operator may press the Autonomous button at any moment, so the
+        planner has to notice rather than keep fighting for control.
+        """
+        return str((self.state or {}).get('current', {}).get('plan_id', '')) == 'auto'
+
     def remaining_samples(self) -> int:
         state = self.state or {}
-        return max(0, int(state.get('samples_total', 0))
-                   - int(state.get('collected', 0)))
+        collected = state.get('collected', 0)
+        # The event stream reports a collection the instant it happens, the
+        # state snapshot only once a second. Taking the larger count keeps a
+        # plan from being written for a sample that is already in the bag.
+        if self.collected_hint is not None:
+            collected = max(int(collected), self.collected_hint)
+        return max(0, int(state.get('samples_total', 0)) - int(collected))
 
     def last_status_for(self, plan_id: str) -> dict[str, Any] | None:
         """The outcome of a plan we published, once it is known."""

@@ -36,7 +36,9 @@ def generate_launch_description():
             executable='llm_planner',
             name='llm_planner',
             output='screen',
-            parameters=[config],
-            additional_params={'use_sim_time': use_sim_time},
+            # use_sim_time goes inside the parameters list: a YAML file cannot
+            # be mixed with a dict that way, and Jazzy's Node has no
+            # additional_params argument.
+            parameters=[config, {'use_sim_time': use_sim_time}],
         ),
     ])

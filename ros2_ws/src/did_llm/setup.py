@@ -17,17 +17,15 @@ setup(
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
-    install_requires=['setuptools', 'pyyaml'],
+    install_requires=['setuptools', 'pyyaml', 'pydantic>=2'],
     zip_safe=True,
     maintainer='DID Hack Team',
     maintainer_email='team@innopolis.local',
     description='LLM planner for the DID Hack agent',
     license='Apache-2.0',
-    install_requires=['setuptools', 'pyyaml', 'pydantic>=2'],
     entry_points={
         'console_scripts': [
             'llm_planner = did_llm.llm_planner_node:main',
-            'harness = did_llm.harness_node:main',
         ],
     },
 )

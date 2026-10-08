@@ -6,7 +6,8 @@ import {
   Search,
   Square,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
+import { describeSubgoal, parsePlan } from './agentApi'
 import type {
   AgentConnection,
   AgentJournalEntry,
@@ -147,6 +148,86 @@ function eventDetails(event: JudgeEvent) {
 interface AgentJournalProps {
   journal: AgentJournalEntry[]
   events: JudgeEvent[]
+}
+
+interface AgentPlanProps {
+  raw: string
+  /** The plan the executor says it is actually running right now. */
+  runningPlanId: string
+}
+
+/**
+ * The plan the LLM last published, as it is on the wire.
+ *
+ * Shown verbatim on purpose. During a demo the interesting part is not that a
+ * plan exists but which subgoals it names and why, and that reasoning is the
+ * planner's only outward-facing account of itself.
+ *
+ * The stale check matters more than it looks. The dashboard keeps the last
+ * plan string for ever, so when the planner hands the episode to the agent's
+ * own behaviour the panel would still show a plan while the robot drives
+ * something else entirely. Without the check the screen claims the model is
+ * driving when it is not.
+ */
+export function AgentPlanPanel({ raw, runningPlanId }: AgentPlanProps) {
+  const plan = useMemo(() => parsePlan(raw), [raw])
+  const [open, setOpen] = useState(true)
+
+  const autonomous = runningPlanId === 'auto'
+  const stale = !autonomous && !!plan && !!runningPlanId
+    && runningPlanId !== plan.plan_id
+
+  return (
+    <section className="panel plan-panel">
+      <div className="panel-header">
+        <div>
+          <span className="eyebrow">ПЛАН LLM</span>
+          <h2>{plan?.plan_id ?? 'плана нет'}</h2>
+        </div>
+        <button
+          type="button"
+          className="panel-toggle"
+          aria-expanded={open}
+          onClick={() => setOpen((value) => !value)}
+        >
+          {open ? 'свернуть' : 'развернуть'}
+        </button>
+      </div>
+
+      {autonomous && (
+        <p className="plan-stale is-live">
+          Исполняет автономный режим — LLM сейчас не управляет. План ниже
+          последний, что он опубликовал.
+        </p>
+      )}
+      {stale && (
+        <p className="plan-stale">
+          Устарело: исполнитель выполняет {runningPlanId}.
+        </p>
+      )}
+
+      {!plan && (
+        <p className="plan-empty">
+          Исполнитель работает по своей политике. Планировщик либо не запущен,
+          либо ещё не опубликовал план.
+        </p>
+      )}
+
+      {plan && open && (
+        <>
+          <ol className="plan-subgoals">
+            {plan.subgoals?.map((subgoal, index) => (
+              <li key={index}>
+                <span className="plan-subgoal-type">{subgoal.type}</span>
+                <span className="plan-subgoal-body">{describeSubgoal(subgoal)}</span>
+              </li>
+            ))}
+          </ol>
+          {plan.explanation && <p className="plan-why">{plan.explanation}</p>}
+        </>
+      )}
+    </section>
+  )
 }
 
 export function AgentJournal({ journal, events }: AgentJournalProps) {

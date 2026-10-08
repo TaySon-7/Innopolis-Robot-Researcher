@@ -18,9 +18,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import os
 import time
 from typing import Any, Dict, List, Optional
 import urllib.error
+import urllib.parse
 import urllib.request
 
 #: Status codes worth retrying: transient server and rate-limit conditions.
@@ -28,7 +30,21 @@ _RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 
 class LLMUnavailable(Exception):
-    """The endpoint is unreachable, over budget, or answered with garbage."""
+    """The model cannot be called right now.
+
+    ``reason`` distinguishes the cases, because they call for opposite
+    reactions:
+
+    * ``rate_limited`` — the call came too early. Nothing is wrong; the caller
+      should try again later. Treating this as an outage makes a planner that
+      polls eagerly hand the episode over for good.
+    * ``exhausted`` — the call budget for the run is spent.
+    * ``unavailable`` — the endpoint did not answer, or answered nonsense.
+    """
+
+    def __init__(self, message: str, reason: str = 'unavailable') -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass
@@ -38,9 +54,14 @@ class LLMConfig:
     base_url: str = ''
     api_key: str = ''
     model: str = ''
-    timeout_sec: float = 20.0
+    timeout_sec: float = 180.0
     max_retries: int = 2
     temperature: float = 0.2
+    #: Reasoning effort. The endpoint's DeepSeek is a reasoning model: left
+    #: alone it spends two to eight thousand characters thinking and answers in
+    #: 35-42 seconds. Measured on unique prompts, ``'none'`` cuts that to under a
+    #: second with no loss on a task that is a short JSON object.
+    reasoning_effort: str = 'none'
 
     # --- call budget ---
     min_interval_sec: float = 4.0
@@ -63,7 +84,7 @@ class LLMConfig:
             base_url=os.environ.get(f'{prefix}BASE_URL', ''),
             api_key=os.environ.get(f'{prefix}API_KEY', ''),
             model=os.environ.get(f'{prefix}MODEL', ''),
-            timeout_sec=float(os.environ.get(f'{prefix}TIMEOUT', '20')),
+            timeout_sec=float(os.environ.get(f'{prefix}TIMEOUT', '180')),
             min_interval_sec=float(os.environ.get(f'{prefix}MIN_INTERVAL', '4')),
             max_calls_per_minute=int(os.environ.get(f'{prefix}RPM', '12')),
         )
@@ -104,6 +125,41 @@ class _Budget:
         self.window.append(self.last_call_ts)
 
 
+#: Environment variables and .env keys the key is read from, in order. The
+#: lowercase spelling is the one the team's .env uses, so it has to be here or
+#: the planner silently runs on its own policy with no explanation.
+API_KEY_NAMES = ('DID_LLM_API_KEY', 'llm_api_key', 'LLM_API_KEY',
+                 'OPENAI_API_KEY')
+
+
+def load_api_key() -> str:
+    """Find the API key without ever logging or publishing it.
+
+    Looks in the environment first, then in a ``.env`` beside the working
+    directory and in the home directory. A missing key is not an error: the
+    planner is expected to hand the episode to the agent's own behaviour.
+    """
+    for name in API_KEY_NAMES:
+        value = os.environ.get(name)
+        if value:
+            return value
+
+    for path in (os.path.join(os.getcwd(), '.env'),
+                 os.path.join(os.path.expanduser('~'), '.env')):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding='utf-8') as handle:
+                for line in handle:
+                    line = line.strip()
+                    for name in API_KEY_NAMES:
+                        if line.startswith(f'{name}='):
+                            return line.split('=', 1)[1].strip().strip('"\'')
+        except OSError:
+            continue
+    return ''
+
+
 class LLMClient:
     """Minimal OpenAI-compatible chat client."""
 
@@ -140,11 +196,16 @@ class LLMClient:
         for attempt in range(retries + 1):
             if not self._budget.allows(self.cfg):
                 self._budget.blocked_by_budget += 1
-                raise LLMUnavailable(
-                    'call budget exhausted '
-                    f'(rpm={self.cfg.max_calls_per_minute}, '
-                    f'total={self.cfg.max_calls_total})'
-                )
+                # Which limit bit matters: a too-early call is not an outage.
+                if self._budget.calls_made >= self.cfg.max_calls_total > 0:
+                    reason = 'exhausted'
+                    detail = f'бюджет вызовов исчерпан ({self.cfg.max_calls_total})'
+                else:
+                    reason = 'rate_limited'
+                    detail = (f'рано: минимум {self.cfg.min_interval_sec:g} с '
+                              f'между вызовами, не чаще '
+                              f'{self.cfg.max_calls_per_minute}/мин')
+                raise LLMUnavailable(detail, reason=reason)
             try:
                 self._budget.record()
                 raw = self._post(system, user)
@@ -155,6 +216,9 @@ class LLMClient:
                     break
             except (urllib.error.URLError, TimeoutError, OSError) as error:
                 last_error = f'network: {error}'
+                # Network failures here are bursts, not permanent. Worth more
+                # attempts than a malformed answer, which cannot improve.
+                retries = max(retries, 3)
             except (ValueError, KeyError, IndexError, TypeError) as error:
                 # Malformed content will not improve by asking again.
                 last_error = f'bad response: {error}'
@@ -194,7 +258,32 @@ class LLMClient:
         if self.log is not None:
             getattr(self.log, level)(message)
 
+    @staticmethod
+    def _resolve(host: str, attempts: int = 4, pause: float = 0.6) -> str:
+        """Resolve a host up front, retrying briefly.
+
+        Name resolution on this network fails in bursts — a run of twenty
+        lookups in a tight loop misses nothing, but a single lookup inside a
+        request occasionally gets "temporary failure in name resolution". Doing
+        it here, with retries, turns that burst into a short wait instead of a
+        lost plan, and costs nothing when resolution is healthy.
+        """
+        import socket
+
+        last: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return socket.getaddrinfo(host, 443, socket.AF_INET,
+                                          socket.SOCK_STREAM)[0][4][0]
+            except socket.gaierror as error:
+                last = error
+                time.sleep(pause * (attempt + 1))
+        raise OSError(f'DNS не ответил для {host}: {last}')
+
     def _post(self, system: str, user: str) -> str:
+        url_host = urllib.parse.urlsplit(self.cfg.base_url).hostname or ''
+        if url_host:
+            self._resolve(url_host)
         url = f'{self.cfg.base_url.rstrip("/")}/chat/completions'
         payload = {
             'model': self.cfg.model,
@@ -204,6 +293,8 @@ class LLMClient:
             ],
             'temperature': self.cfg.temperature,
         }
+        if self.cfg.reasoning_effort:
+            payload['reasoning_effort'] = self.cfg.reasoning_effort
         request = urllib.request.Request(
             url,
             data=json.dumps(payload).encode('utf-8'),
@@ -215,7 +306,18 @@ class LLMClient:
         )
         with urllib.request.urlopen(request, timeout=self.cfg.timeout_sec) as response:
             body = json.loads(response.read().decode('utf-8'))
-        return body['choices'][0]['message']['content']
+        message = body['choices'][0]['message']
+        content = message.get('content')
+        if content is None:
+            # A reasoning model spends its budget on thinking and can return
+            # null content when the cap arrives first. Set max_tokens and this
+            # is exactly what happens, which is why the cap is not set.
+            raise ValueError(
+                'endpoint returned no content '
+                f'(finish_reason={body["choices"][0].get("finish_reason")}, '
+                f'reasoning_tokens={len(message.get("reasoning_content") or "")} chars)'
+            )
+        return content
 
 
 def _cache_key(system: str, user: str, tag: str) -> str:

@@ -11,6 +11,10 @@ services:
       ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-30}"
       RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
       TURTLEBOT3_MODEL: burger
+      # Compose reads .env from the project directory on its own, so the key
+      # can be handed over as a variable. No bind mount: a missing .env would
+      # be created as a directory and break the planner's read.
+      DID_LLM_API_KEY: "${llm_api_key:-}"
     command:
       - ros2
       - launch
@@ -26,10 +30,6 @@ services:
       - "127.0.0.1:${AGENT_API_PORT:-8082}:8080"
     volumes:
       - gz-cache:/root/.gz
-      # The planner reads the API key from a .env in its working directory.
-      # Missing file is fine: without a key the planner hands the episode to
-      # the agent's own behaviour instead of failing.
-      - ./.env:/opt/did_ws/.env:ro
     stop_grace_period: 15s
     restart: unless-stopped
     healthcheck:

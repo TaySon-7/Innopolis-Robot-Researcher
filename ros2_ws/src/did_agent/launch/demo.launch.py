@@ -78,8 +78,12 @@ def generate_launch_description():
             name='llm_planner',
             output='screen',
             condition=IfCondition(LaunchConfiguration('llm')),
+            # Sim time, like every other node here: Gazebo drives /clock, and a
+            # planner measuring wall time would think the episode is paused
+            # whenever the simulation lags.
             parameters=[os.path.join(
                 get_package_share_directory('did_llm'),
-                'config', 'planner.yaml')],
+                'config', 'planner.yaml'),
+                {'use_sim_time': True}],
         ),
     ])
