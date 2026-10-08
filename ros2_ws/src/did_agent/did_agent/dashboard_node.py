@@ -13,10 +13,13 @@ from std_msgs.msg import String
 
 from did_agent.dashboard_core import DashboardData
 from did_agent.dashboard_core import DashboardServer
+from did_agent.dashboard_core import preview_from_scenario
 from did_agent.dashboard_core import render_geometry
 from did_agent.dashboard_core import truth_from_scenario
 from did_agent.gazebo_geometry import request_gazebo_geometry
 from did_agent.grid import load_map
+from did_agent.scenario_generator import load_named
+from did_agent.scenario_generator import to_yaml
 
 try:
     from did_judge.scenario import load_scenario
@@ -38,6 +41,7 @@ class DashboardNode(Node):
         self.data = DashboardData(base)
         self._truth_for: str | None = None
         self._truth_scenario = None
+        self._scenario_cache: dict[str, object] = {}
 
         self._fallback_geometry = render_geometry(load_map())
         geometry = request_gazebo_geometry(
@@ -47,8 +51,10 @@ class DashboardNode(Node):
         )
         self._plan_pub = self.create_publisher(String, '/agent/plan', 10)
         self._command_pub = self.create_publisher(String, '/agent/command', 10)
+        self._scenario_pub = self.create_publisher(String, '/did/scenario/select', 10)
         self.server = DashboardServer(
             self.data, geometry, self._send_plan, self._send_command,
+            self._send_scenario, self._preview_scenario,
             port=int(self.get_parameter('port').value),
             log=self.get_logger().info,
         )
@@ -119,6 +125,41 @@ class DashboardNode(Node):
 
     def _send_command(self, command: str) -> None:
         self._command_pub.publish(String(data=json.dumps({'cmd': command})))
+
+    def _load_named_scenario(self, name: str):
+        """Load once so the preview and launched episode share the exact object."""
+        scenario = self._scenario_cache.get(name)
+        if scenario is None:
+            scenario = load_named(name)
+            if len(self._scenario_cache) >= 24:
+                self._scenario_cache.pop(next(iter(self._scenario_cache)))
+            self._scenario_cache[name] = scenario
+        return scenario
+
+    def _preview_scenario(self, name: str) -> dict:
+        return preview_from_scenario(self._load_named_scenario(name))
+
+    def _send_scenario(self, scenario: str) -> None:
+        """Stop the current run and ask the judge and agent to load a clean scenario."""
+        selected = self._load_named_scenario(scenario)
+        if '@' in scenario:
+            generated_dir = Path('/tmp/scenarios')
+            generated_dir.mkdir(parents=True, exist_ok=True)
+            path = generated_dir / f"ui-{scenario.replace('@', '-')}.yaml"
+            path.write_text(to_yaml(selected), encoding='utf-8')
+        else:
+            path = scenario_path(scenario)
+        self._send_command('stop')
+        self.data.reset_run()
+        self._truth_for = selected.name
+        self._truth_scenario = selected
+        self.data.on_truth(truth_from_scenario(selected, 0.0))
+        request = json.dumps({
+            'name': selected.name,
+            'scenario_file': str(path),
+        }, sort_keys=True)
+        self._scenario_pub.publish(String(data=request))
+        self.get_logger().info(f'scenario selection requested: {scenario}')
 
 
 def main(args=None) -> None:

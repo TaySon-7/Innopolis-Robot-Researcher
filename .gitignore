@@ -9,6 +9,7 @@ ros2_ws/log/
 # Python
 __pycache__/
 *.py[cod]
+.venv/
 .pytest_cache/
 
 # Local virtualenv (26 MB of pip vendored in tree once)
@@ -17,6 +18,7 @@ venv/
 
 # Local runtime data
 artifacts/
+logs/
 
 /tmp
 

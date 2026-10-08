@@ -8,13 +8,16 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         mesa-utils \
         python3-colcon-common-extensions \
-        python3-numpy \
-        python3-pip \
-        python3-yaml \
         ros-jazzy-rmw-cyclonedds-cpp \
         ros-jazzy-rosbridge-suite \
         ros-jazzy-turtlebot3-gazebo \
         ros-jazzy-turtlebot3-teleop \
+    && rm -rf /var/lib/apt/lists/*
+
+# Keep the large ROS/Gazebo layer above stable. NumPy and PyYAML already come
+# in with the ROS packages; only pip is needed for the small LLM dependency.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # Python packages that are not in apt. Copied before the workspace so a change
