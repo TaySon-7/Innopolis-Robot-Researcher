@@ -12,6 +12,10 @@ __pycache__/
 .venv/
 .pytest_cache/
 
+# Local virtualenv (26 MB of pip vendored in tree once)
+.venv/
+venv/
+
 # Local runtime data
 artifacts/
 logs/

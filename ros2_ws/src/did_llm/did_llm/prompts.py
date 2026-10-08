@@ -26,7 +26,7 @@ from did_llm.agent_plan import (
     WALL_MARGIN,
 )
 
-PLANNER_PROMPT_VERSION = 'agent-plan@6'
+PLANNER_PROMPT_VERSION = 'agent-plan@7'
 
 # This is the LLM planning horizon, not the executor's wire-format safety
 # ceiling (50).  The live Planner rebuilds the system prompt from its
@@ -91,10 +91,11 @@ return_to_base заканчивает эпизод. Он разрешён тол
 не пройдёт проверку и будет отклонён.
 
 ЖЁСТКИЕ ПРАВИЛА, НАРУШЕНИЕ ОТКЛОНЯЕТСЯ
-1. После каждого search_around сразу ставь collect. Не начинай план с collect.
-2. Если sensor.value >= {SIGNAL_NEAR:g} и sensor.noise_estimate < {NOISE_UNTRUSTWORTHY:g}, образец рядом:
+1. После каждого search_around сразу ставь collect. Начинай с collect только если
+sensor.value - sensor.noise_estimate >= {SIGNAL_COLLECTABLE:g}: тогда образец уже в зоне 0.30 м.
+2. Если sensor.value - sensor.noise_estimate >= {SIGNAL_NEAR:g}, образец рядом:
 начинай с search_around в текущей pose, затем collect. Не ставь перед ними goto в другую точку.
-3. Если сигнала нет или он ненадёжен из-за шума, выбери новую свободную точку:
+3. Если запас сигнала над шумом меньше {SIGNAL_NEAR:g}, выбери новую свободную точку:
 goto к этой точке, search_around с центром в ней, затем collect.
 4. Не ставь return_to_base, если образцы ещё остались и «бюджет на новые поиски» больше 5.
 5. Не ставь goto или search_around вне арены, на столбе или в известной дорогой зоне.
@@ -118,12 +119,14 @@ radius от {RADIUS_MIN} до {RADIUS_MAX} м.
 просто сильный сигнал в выдуманное направление.
 - Исполнитель реагирует на датчик внутри навыка значительно чаще, чем приходит
 следующий ответ модели, поэтому не нужен новый LLM-план для каждого измерения.
-- При надёжном sensor.value >= {SIGNAL_COLLECTABLE:g} планировщик сам запускает
-короткий search_around + collect на месте, не ожидая нового ответа модели.
+- При sensor.value - sensor.noise_estimate >= {SIGNAL_COLLECTABLE:g} планировщик
+сам запускает collect на месте, не ожидая нового ответа модели.
 
 КАК ЧИТАТЬ СОСТОЯНИЕ
 - sensor.value — близость к ближайшему несобранному образцу, 0..1, но не направление.
-- sensor.noise_estimate >= {NOISE_UNTRUSTWORTHY:g} — мгновенному sensor.value нельзя доверять.
+- sensor.noise_estimate показывает неопределённость: используй надёжный запас
+sensor.value - sensor.noise_estimate. Значение шума от {NOISE_UNTRUSTWORTHY:g}
+и выше требует осторожности, но не отменяет очень сильный сигнал.
 - return_cost_estimate — сколько батареи стоит дорога домой по текущей карте
 - anomaly — флаги: battery_deviation (расход выше ожидаемого), penalties_burst
 (серия штрафов), sensor_noise_up (датчик шумит). Флаг требует перепланирования, но сам по себе
@@ -190,6 +193,8 @@ def build_planner_prompt(mission: str, state: dict[str, Any],
                          feedback: str,
                          expensive: list[dict[str, float]] | None = None,
                          budget: dict[str, Any] | None = None,
+                         searched: list[tuple[float, float, float]] | None = None,
+                         uncovered: list[tuple[float, float]] | None = None,
                          round_number: int = 0) -> str:
     """Assemble the planner prompt from one state snapshot.
 
@@ -207,6 +212,8 @@ def build_planner_prompt(mission: str, state: dict[str, Any],
         _geometry_block(),
         '',
         _ground_block(expensive),
+        '',
+        _coverage_block(searched, uncovered),
         '',
         _budget_block(state, budget),
         '',
@@ -302,6 +309,49 @@ def _ground_block(expensive: list[dict[str, float]] | None) -> str:
     lines.append('Через эти точки не ездить и не искать: план с такой точкой '
                  'будет отклонён.')
     return '\n'.join(lines)
+
+
+def _coverage_block(searched: list[tuple[float, float, float]] | None,
+                    uncovered: list[tuple[float, float]] | None = None) -> str:
+    """Where the robot has already looked, and what is left worth looking at.
+
+    The sample sensor reports how close the nearest sample is and nothing about
+    which way it lies, and the samples themselves are not on any map the model
+    can read. So every fresh target it picks is a guess. Left without a record of
+    the guesses that already failed, it walks the same corners repeatedly: an
+    easy run spent nineteen metres of battery on one sample by visiting the north
+    -west and south-east corners three times each, while the agent's own policy
+    covered the same ground in eighteen metres and took all three.
+
+    Naming the swept circles stops the repeats but leaves the model to invent a
+    replacement from nothing, which is the same blind guess with a fresh label.
+    So the remaining candidates go with them: a lattice of arena cells no search
+    has covered, nearest first. The model still chooses — it knows things the
+    lattice cannot, such as where it last heard something — but it chooses from
+    places that are actually still worth searching.
+    """
+    parts = []
+    if searched:
+        circles = ', '.join(f'({x:.1f}; {y:.1f}) r={r:.1f}' for x, y, r in searched)
+        parts.append(
+            'ГДЕ УЖЕ ИСКАЛИ (там поиск прошёл, образцов не оказалось):\n'
+            f'  {circles}\n'
+            '  Не ставь goto или search_around внутрь этих кругов: там уже пусто, '
+            'а батарея расходуется на пути.'
+        )
+    else:
+        parts.append('ГДЕ УЖЕ ИСКАЛИ: пока ничего — это первая точка плана.')
+
+    if uncovered:
+        cells = ', '.join(f'({x:.1f}; {y:.1f})' for x, y in uncovered)
+        parts.append(
+            'КУДА СТОИТ ПОЙТИ (свободные точки арены, которых поиск ещё не '
+            f'касался, ближайшие к роботу):\n'
+            f'  {cells}\n'
+            '  Выбирай цель отсюда. Если датчик молчит, точка отсюда — лучше, '
+            'чем выдуманный угол: она ещё не проверена, и до неё ближе.'
+        )
+    return '\n'.join(parts)
 
 
 def _budget_block(state: dict[str, Any],

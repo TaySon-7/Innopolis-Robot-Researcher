@@ -62,8 +62,23 @@ class AgentLink:
         self.state_at: float | None = None
         self.status: dict[str, Any] | None = None
         self.seen_plans: set[str] = set()
+        #: The operator's last command, and whether the planner has seen it
+        #: yet. ``stop`` has to be obeyed, and nothing else in the status
+        #: stream says the operator asked for it.
+        self.command: str | None = None
+        self.command_pending = False
+        #: Subgoal reports already logged, so the log shows progress rather
+        #: than the same line repeated at the topic's publish rate.
+        self._logged_status: set[tuple[str, Any, str]] = set()
         #: From the judge: whether the episode is over.
         self.episode_finished = False
+        #: Monotonic local counter incremented whenever the public judge time
+        #: moves back to zero or the scenario name changes. Unlike ROS /clock,
+        #: judge time resets for a dashboard restart that safely respawns only
+        #: Burger and leaves the Gazebo world clock running.
+        self.episode_generation = 0
+        self._score_t: float | None = None
+        self._score_scenario: str | None = None
         #: Expensive ground from the agent's cost map: (x, y, reach, cost).
         self.expensive: list[tuple[float, float, float, float]] = []
         #: Penalty events waiting to be acted on.
@@ -77,8 +92,27 @@ class AgentLink:
         node.create_subscription(String, SCORE_TOPIC, self._on_score, 10)
         node.create_subscription(String, EVENTS_TOPIC, self._on_event, 50)
         node.create_subscription(String, COSTMAP_TOPIC, self._on_costmap, 10)
+        node.create_subscription(String, COMMAND_TOPIC, self._on_command, 10)
 
     # ------------------------------------------------------------------ input
+    def _on_command(self, message: String) -> None:
+        """An operator command from the dashboard's Стоп / Автономно buttons.
+
+        Watched because it cannot be inferred from ``/agent/status``: a stop
+        cancels the goal without starting a plan, so the status still carries
+        this planner's own plan id and there is nothing there to notice.
+        """
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(payload, dict):
+            return
+        command = payload.get('cmd')
+        if isinstance(command, str) and command:
+            self.command = command
+            self.command_pending = True
+
     def _on_state(self, message: String) -> None:
         try:
             payload = json.loads(message.data)
@@ -90,6 +124,14 @@ class AgentLink:
         self.state_at = self.now()
 
     def _on_status(self, message: String) -> None:
+        """Every subgoal report arrives here: the agent's side of the wire.
+
+        Logged, because "what did the robot actually do with the plan" was
+        invisible: the planner only saw the final outcome, so a plan that
+        stalled on one subgoal looked the same as one that sailed through all
+        of them. Only a change of (plan, subgoal, state) is logged, so the
+        running/running/running updates do not repeat.
+        """
         try:
             payload = json.loads(message.data)
         except (TypeError, ValueError):
@@ -97,6 +139,28 @@ class AgentLink:
         if not isinstance(payload, dict):
             return
         self.status = payload
+
+        marker = (str(payload.get('plan_id') or ''),
+                  payload.get('index'),
+                  str(payload.get('state') or ''))
+        if marker in self._logged_status:
+            return
+        # The set only grows with distinct (plan, subgoal, state) triples, so
+        # it is trimmed rather than reset: a reset would re-log whatever the
+        # agent is still repeating.
+        if len(self._logged_status) > 512:
+            self._logged_status.clear()
+        self._logged_status.add(marker)
+
+        reason = str(payload.get('reason') or '')
+        detail = payload.get('data')
+        extra = f'   {detail}' if isinstance(detail, dict) and detail else ''
+        self.log.info(
+            f'АГЕНТ → БУРГЕР   {marker[0]}  подцель {marker[1]}: '
+            f'{payload.get("type", "?")}({payload.get("subgoal", "?")})'
+            f'  →  {marker[2]}'
+            + (f'  причина: {reason}' if reason else '')
+            + extra)
 
     def _on_event(self, message: String) -> None:
         """Penalty events, drained on the next tick rather than acted on here.
@@ -128,13 +192,44 @@ class AgentLink:
         self.collected_hint = value
 
     def _on_score(self, message: String) -> None:
-        """The only thing taken from the judge: whether the episode is over."""
+        """Track public episode status and detect a fresh judge run."""
         try:
             payload = json.loads(message.data)
         except (TypeError, ValueError):
             return
-        if isinstance(payload, dict):
-            self.episode_finished = bool(payload.get('finished', False))
+        if not isinstance(payload, dict):
+            return
+
+        raw_t = payload.get('t')
+        score_t = float(raw_t) if isinstance(raw_t, (int, float)) else None
+        raw_scenario = payload.get('scenario')
+        scenario = raw_scenario if isinstance(raw_scenario, str) else None
+        restarted = (
+            self._score_t is not None
+            and score_t is not None
+            and score_t < self._score_t - 1.0
+        ) or (
+            self._score_scenario is not None
+            and scenario is not None
+            and scenario != self._score_scenario
+        )
+        if restarted:
+            self.episode_generation += 1
+            # Do not let the planner act on the previous episode while the
+            # agent is still publishing its newly reset state.
+            self.state = None
+            self.state_at = None
+            self.status = None
+            self.seen_plans.clear()
+            self._logged_status.clear()
+            self.pending_events.clear()
+            self.collected_hint = None
+
+        if score_t is not None:
+            self._score_t = score_t
+        if scenario is not None:
+            self._score_scenario = scenario
+        self.episode_finished = bool(payload.get('finished', False))
 
     def _on_costmap(self, message: String) -> None:
         """Read the expensive ground the agent has measured.
@@ -198,6 +293,9 @@ class AgentLink:
         return self.now() - self.state_at
 
     def publish_plan(self, payload: dict[str, Any]) -> None:
+        plan_id = str(payload.get('plan_id') or '')
+        if plan_id:
+            self.seen_plans.add(plan_id)
         self.plan_pub.publish(
             String(data=json.dumps(payload, ensure_ascii=False)))
 

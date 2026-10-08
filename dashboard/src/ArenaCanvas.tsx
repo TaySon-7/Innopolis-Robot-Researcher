@@ -552,8 +552,14 @@ export function ArenaCanvas({
         })
 
         context.save()
-        const [clipLeft, clipTop] = screen(bounds.xmin, bounds.ymax)
-        const [clipRight, clipBottom] = screen(bounds.xmax, bounds.ymin)
+        // Clipped to the walls themselves, not to the view box: `bounds` is the
+        // wall outline pulled in by its own thickness so the drivable floor fits
+        // the canvas. A beam stops *at* the wall, so cutting at the inner edge
+        // makes every return that reaches a wall vanish a third of a metre short
+        // of it, and the scan appears to float inside the arena.
+        const wall = geometry?.bounds ?? FALLBACK_BOUNDS
+        const [clipLeft, clipTop] = screen(wall.xmin, wall.ymax)
+        const [clipRight, clipBottom] = screen(wall.xmax, wall.ymin)
         context.beginPath()
         context.rect(clipLeft, clipTop, clipRight - clipLeft, clipBottom - clipTop)
         context.clip()

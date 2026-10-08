@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
+import textwrap
 import time
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +41,14 @@ class JournalConfig:
     chain_path: str = DEFAULT_CHAIN
     #: Mirror exchanges into the ROS log so they show up in ``make logs``.
     mirror_to_log: bool = True
+    #: Print the whole prompt and the whole answer into the ROS log. The
+    #: ``jsonl`` file has them either way, but a file inside the container is
+    #: invisible during a run; counting characters told us nothing about what
+    #: the model was actually asked or what it said.
+    log_full_exchanges: bool = True
+    #: Cap on how much of one message is echoed, so a runaway prompt cannot
+    #: flood the log and push everything else out of view.
+    log_exchange_chars: int = 4000
 
 
 class Journal:
@@ -65,12 +74,14 @@ class Journal:
 
     # -------------------------------------------------------------- exchanges
     def log_exchange(self, tag: str, system: str, user: str, raw_response: str,
-                     parsed: Dict[str, Any], model: str) -> None:
+                     parsed: Dict[str, Any], model: str,
+                     seconds: float = 0.0) -> None:
         """Record one request/response pair."""
         record = {
             'ts': time.time(),
             'tag': tag,
             'model': model,
+            'seconds': seconds,
             'system': system,
             'user': user,
             'raw_response': raw_response,
@@ -78,8 +89,60 @@ class Journal:
         }
         self._append(DEFAULT_EXCHANGES, self.cfg.exchanges_path, record)
         if self.cfg.mirror_to_log:
-            self._say('info', f'[LLM] exchange "{tag}" -> '
-                             f'{len(json.dumps(parsed, ensure_ascii=False))} chars')
+            self._say('info', self._exchange_report(
+                tag, model, seconds, system, user, raw_response))
+
+    def _exchange_report(self, tag: str, model: str, seconds: float,
+                         system: str, user: str, raw: str) -> str:
+        """One block a human can read: what went out, what came back."""
+        limit = self.cfg.log_exchange_chars
+
+        bar = '─' * 62
+        return '\n'.join([
+            '',
+            f'{bar}',
+            f'БУРГЕР → LLM   [{tag}]   модель {model}',
+            f'{bar}',
+            self._display(system, limit),
+            '',
+            '··· запрос ···',
+            '',
+            self._display(user, limit),
+            '',
+            f'{bar}',
+            f'LLM → БУРГЕР   [{tag}]   {seconds:.1f} с, '
+            f'{len(raw)} симв.',
+            f'{bar}',
+            self._display(raw, limit) if raw else '(пустой ответ)',
+            '',
+        ])
+
+    def _display(self, text: str, limit: int) -> str:
+        """Lay a message out for a terminal that trims line starts.
+
+        The ROS logger drops leading whitespace on every line, so a prompt
+        that is soft-wrapped in the source came out as ``управляешьроботом``
+        — the space that sat at the end of the source line was trailing
+        whitespace and got stripped too. Re-flowing here keeps the blank-line
+        paragraph structure the prompt actually uses and wraps each paragraph
+        to a fixed width, so what is logged is readable and still faithful.
+        """
+        paragraphs: list[str] = []
+        for block in text.split('\n\n'):
+            joined = ' '.join(part.strip() for part in block.split('\n')
+                              if part.strip())
+            if joined:
+                paragraphs.append(joined)
+        body = '\n'.join(
+            textwrap.fill(paragraph, width=78,
+                          initial_indent='  ', subsequent_indent='  ')
+            for paragraph in paragraphs)
+        if len(body) <= limit:
+            return body
+        clipped = body[:limit].rsplit('\n', 1)[0]
+        return (f'{clipped}\n  … ещё примерно '
+                f'{len(body) - len(clipped)} симв. '
+                f'(полностью — в {self.cfg.exchanges_path})')
 
     # ------------------------------------------------------------ hypotheses
     def next_hypothesis_id(self) -> str:

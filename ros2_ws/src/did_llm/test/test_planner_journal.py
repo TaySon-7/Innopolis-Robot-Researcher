@@ -75,20 +75,15 @@ def test_collection_event_announces_llm_replanning():
     }]
 
 
-def test_collectable_signal_triggers_local_search_and_collect_without_llm():
+def test_collectable_signal_triggers_direct_collect_without_llm():
     link = _Link()
     link.signal_value = 0.82
     planner = Planner(link, object())
 
     assert planner._collect_when_close() is True
 
-    assert [item['type'] for item in link.published[0]['subgoals']] == [
-        'search_around', 'collect',
-    ]
+    assert [item['type'] for item in link.published[0]['subgoals']] == ['collect']
     assert link.published[0]['source'] == 'auto_collect'
-    search = link.published[0]['subgoals'][0]
-    assert (search['x'], search['y']) == link.pose_value
-    assert 0.15 <= search['radius'] <= 0.4
 
 
 def test_collectable_but_noisy_signal_does_not_trigger_collection():
@@ -99,6 +94,16 @@ def test_collectable_but_noisy_signal_does_not_trigger_collection():
 
     assert planner._collect_when_close() is False
     assert link.published == []
+
+
+def test_very_strong_signal_survives_hard_scenario_noise():
+    link = _Link()
+    link.signal_value = 1.0
+    link.noise_value = 0.15
+    planner = Planner(link, object())
+
+    assert planner._collect_when_close() is True
+    assert [item['type'] for item in link.published[0]['subgoals']] == ['collect']
 
 
 def test_current_subgoal_uses_executor_zero_based_index():
@@ -119,7 +124,7 @@ def test_rising_signal_does_not_restart_an_active_search():
     link.pose_value = (0.0, 0.0)
     planner = Planner(link, object())
     planner.inflight = 'p1'
-    search = Subgoal(type='search_around', x=0.9, y=0.0, radius=0.9)
+    search = Subgoal(type='search_around', x=0.0, y=0.0, radius=0.9)
     planner.sent_subgoals = [('p1', 0, search)]
     link.status = {'plan_id': 'p1', 'index': 0, 'state': 'running'}
 

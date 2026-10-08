@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import hypot, isfinite
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -217,16 +217,49 @@ SEARCH_WORTH_IT = 5.0
 #: the agent's autonomous policy uses, so both agree on what "near" means.
 SIGNAL_NEAR = 0.08
 
-#: In the public sensor model ``signal = 1 - distance / 1.5``.  The judge
-#: accepts collection at 0.30 m, hence 0.80 is the first collectible signal.
-#: The local search re-reads and averages the sensor before the service call;
-#: this value is only the trigger for that deterministic search + collect.
-SIGNAL_COLLECTABLE = 0.80
+#: Reading above which the sample is a step away rather than merely nearby.
+#:
+#: The sensor is ``max(0, 1 - d/1.5)``, so 0.6 means 0.60 m and 0.7 means 0.45 m.
+#: A collect only succeeds under 0.30 m, so going straight for one here would
+#: earn a ``false_collect`` and its penalty. What is needed instead is a short
+#: approach, so this band gets a tight search circle rather than a wider one.
+SIGNAL_CLOSE = 0.6
 
-#: Noise level above which the sensor reading stops being trustworthy. In the
-#: hard scenario the judge injects a fault that pushes it to 0.15, and a single
-#: reading then means nothing.
+#: Reading above which the sample is already inside collect range and searching
+#: for it is worse than useless.
+#:
+#: ``1 - 0.30/1.5`` is 0.80: past that the sample is within the radius where
+#: ``collect`` succeeds. The agent's search reports success at ``found_level``
+#: 0.7, which is 0.45 m — so a plan that searches and then collects walks the
+#: robot around the sample and hands it a ``false_collect`` instead. Above this
+#: reading the only useful action is to collect where it stands.
+SIGNAL_TAKE = 0.8
+
+#: Compatibility name used by the prompt: both values describe the judge's
+#: exact 0.30 m collection boundary.
+SIGNAL_COLLECTABLE = SIGNAL_TAKE
+
+#: A useful UI/prompt warning threshold. Runtime decisions do not discard all
+#: readings above it; :func:`signal_margin` subtracts the measured noise so a
+#: very strong signal can still be acted on during the hard-scenario fault.
 NOISE_UNTRUSTWORTHY = 0.06
+
+
+def signal_margin(signal: float | None, noise: float | None) -> float:
+    """The part of a reading that is more than the noise.
+
+    ``noise_estimate`` is how far a reading may sit from the truth, so a noisy
+    sample says much less than the number suggests. Subtracting it leaves only
+    what can be relied on: 0.19 against a noise of 0.18 is nothing, while 0.85
+    against the same noise still means a sample within half a metre.
+
+    Ignoring the sensor outright once it is noisy — the earlier rule — throws
+    the strong readings away with the weak ones, and the robot drives past
+    samples that were right under it for as long as the fault lasts.
+    """
+    if signal is None:
+        return -1.0
+    return signal - max(0.0, noise or 0.0)
 
 #: A leg longer than this is treated as a journey rather than a repositioning,
 #: and is judged on what the floor along it costs.
@@ -236,6 +269,22 @@ LEG_WORTH_M = 2.0
 #: it to mean "right here", so refusing it would force a repair round over every
 #: strong-signal plan — one wasted model call each.
 GOTO_NOOP_M = 0.7
+
+#: How close a target may be to a place the robot has already hit.
+COLLISION_RADIUS_M = 0.7
+
+#: How close a point has to be to the robot to count as "where it already
+#: stands". Big enough to cover the spread of a stuck pose across a few
+#: replans, small enough that it is not a licence to plan anywhere nearby.
+HERE_M = 0.45
+
+
+def _under_robot(x: float, y: float,
+                 pose: Sequence[float] | None) -> bool:
+    """Whether (x, y) is the spot the robot is already standing on."""
+    if not pose or len(pose) < 2:
+        return False
+    return hypot(x - float(pose[0]), y - float(pose[1])) < HERE_M
 
 #: Battery a single long leg may cost before the plan is refused outright.
 #: A search point is a maybe: it may find nothing. Nine units is already more
@@ -462,6 +511,7 @@ def check_plan(plan: Plan,
                sensor_noise: float | None = None,
                pose: tuple[float, float] | None = None,
                battery: float | None = None,
+               hits: list[tuple[float, float]] | None = None,
                cost_per_search: float = 1.2) -> list[str]:
     """Everything wrong with an otherwise well-formed plan.
 
@@ -488,6 +538,33 @@ def check_plan(plan: Plan,
                             f'({subgoal.x:g}; {subgoal.y:g}) — туда уже ехали')
                         break
             visited.append((subgoal.type, subgoal.x, subgoal.y))
+
+    # Ground the robot has already hit. Sending it back to the same spot is
+    # what turns one collision into a loop: the judge emits an event every two
+    # seconds while it is stuck, and each one would trigger a new plan aimed at
+    # the same obstacle.
+    #
+    # But a robot stuck against something is standing *on* that spot, and the
+    # veto has to let it work from where it is. Refusing the robot's own
+    # position is a livelock: on medium the robot wedged itself at (0.5; -0.79)
+    # with the sensor at 0.73 — a sample within reach — and every plan that
+    # said "search here, then collect" was turned down as a return to known
+    # bad ground, while the model kept writing exactly that plan. It sat there
+    # colliding until the battery ran down. A ``search_around`` where the robot
+    # already stands is not a trip back into the obstacle; it is the spiral
+    # that walks it off, and it is where a nearby sample gets collected.
+    for index, subgoal in enumerate(plan.subgoals):
+        if subgoal.type not in ('goto', 'search_around'):
+            continue
+        if subgoal.type == 'search_around' and _under_robot(subgoal.x,
+                                                            subgoal.y, pose):
+            continue
+        if any(hypot(subgoal.x - hx, subgoal.y - hy) < COLLISION_RADIUS_M
+               for hx, hy in hits or ()):
+            problems.append(
+                f'подцель {index}: ({subgoal.x:g}; {subgoal.y:g}) — там уже '
+                'было столкновение, не отправляй робота туда снова')
+            break
 
     # Expensive ground is refused outright. The mission says to avoid it, and
     # a plan that crosses it burns the battery the next sector needs.
@@ -533,9 +610,17 @@ def check_plan(plan: Plan,
 
     # A collect with no search before it is a false collect: the judge charges
     # a penalty for collecting where nothing is.
+    # A collect on its own is normally a guess and earns a false_collect, so it
+    # has to follow a search. Not when the reading already puts the sample
+    # inside the collection radius: searching there drives the robot away from
+    # the very thing it was told to take, which is the same false_collect by a
+    # longer route.
+    take_now = signal_margin(signal_high, sensor_noise) >= SIGNAL_TAKE
     for index in collects:
         before = plan.subgoals[:index]
         if not any(item.type in ('search_around',) for item in before):
+            if take_now:
+                continue
             problems.append(
                 f'подцель {index}: collect без предшествующего поиска — '
                 'сначала search_around, потом collect')
@@ -551,11 +636,11 @@ def check_plan(plan: Plan,
     # another one is, so a distant search point burns battery crossing the
     # arena while a collectible sample goes unpicked.
     #
-    # The reading is only trusted when it clears the noise. Under the judge's
-    # sensor fault the reading is pure jitter, and obeying it would pin the
-    # robot to one spot while a real sample goes unpicked elsewhere.
-    near = (signal_high is not None and signal_high >= SIGNAL_NEAR
-            and (sensor_noise is None or sensor_noise < NOISE_UNTRUSTWORTHY))
+    # The reading is believed only as far as it clears the noise. Under the
+    # judge's sensor fault a lone sample is jitter, and obeying it would pin the
+    # robot to one spot while a real sample goes unpicked elsewhere — but a
+    # reading that still stands above the noise is worth following.
+    near = signal_margin(signal_high, sensor_noise) >= SIGNAL_NEAR
     if near:
         first_move = next((i for i, s in enumerate(plan.subgoals)
                            if s.type in ('goto', 'search_around')), None)
