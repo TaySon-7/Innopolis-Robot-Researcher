@@ -17,10 +17,13 @@ import rclpy
 from rclpy.utilities import remove_ros_args
 
 from did_agent.autonomous import AutonomousAgent
+from did_agent.costmap import CostMap
 from did_agent.dashboard_core import costmap_layers
+from did_agent.dashboard_core import valid_scenario_name
 from did_agent.executor import PlanExecutor
 from did_agent.adaptation import Adaptation
 from did_agent.nav_node import Navigator
+from did_agent.navigator_core import NavigatorCore
 from did_agent.plan import Plan
 from did_agent.plan import PlanError
 from did_agent.plan import parse_plan
@@ -45,6 +48,7 @@ class AgentNode(Navigator):
         self._current: dict[str, Any] = {}
         self.cost_log: list[dict[str, Any]] = []
         self._command: str | None = None
+        self._scenario_reset: str | None = None
         self._published_cost_signature: tuple[int, int] | None = None
 
         self.adaptation = Adaptation(
@@ -67,6 +71,7 @@ class AgentNode(Navigator):
         self.create_subscription(String, '/agent/plan', self._on_plan, 10)
         self.create_subscription(String, '/agent/cost_update', self._on_cost_update, 10)
         self.create_subscription(String, '/agent/command', self._on_command, 10)
+        self.create_subscription(String, '/did/scenario/select', self._on_scenario_select, 10)
         self._collect = self.create_client(Trigger, '/did/collect')
         self._finish = self.create_client(Trigger, '/did/finish')
         self.create_timer(1.0, self._publish_state)
@@ -134,6 +139,56 @@ class AgentNode(Navigator):
             self.core.cancel()
             self.stop()
             self.journal('decision', 'Остановка по команде оператора')
+
+    def _on_scenario_select(self, message: String) -> None:
+        """Preempt the current episode; its learned state is reset in the main loop."""
+        raw = message.data.strip()
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = raw
+        name = payload.get('name') if isinstance(payload, dict) else payload
+        if isinstance(name, str):
+            name = name.strip().lower()
+        if not valid_scenario_name(name):
+            return
+        self.get_logger().info(f'preparing clean agent state for scenario {name}')
+        self._scenario_reset = name
+        self._preempt = True
+        self._pending = None
+        self._command = None
+        self.core.cancel()
+        self.stop()
+
+    def _reset_for_scenario(self, name: str) -> None:
+        """Forget knowledge from the previous episode after execution has stopped."""
+        self.costmap = CostMap()
+        self.core = NavigatorCore(self.costmap)
+        self.cost_log.clear()
+        self._battery = INITIAL_BATTERY
+        self._sensor = 0.0
+        self._sensor_count = 0
+        self._score = {}
+        self._current = {}
+        self._pending = None
+        self._command = None
+        self._preempt = False
+        self._scenario_reset = None
+        self._published_cost_signature = None
+        self.adaptation = Adaptation(
+            self.costmap,
+            lambda kind, title, text, status: self.journal(kind, title, text, status),
+        )
+        self.monitor = self.adaptation.monitor
+        self.skills = Skills(self)
+        self.plan_executor = PlanExecutor(self.skills, self._publish_status)
+        self._publish_status({
+            'plan_id': '', 'index': 0, 'type': '', 'subgoal': '',
+            'state': 'idle', 'reason': f'scenario {name} selected', 'data': {},
+        })
+        self._publish_costmap()
+        self.journal('decision', f'Сценарий {name.upper()} загружен',
+                     'Предыдущие знания сброшены. Начинаю новый независимый прогон.')
 
     def _on_cost_update(self, message: String) -> None:
         try:
@@ -289,7 +344,9 @@ class AgentNode(Navigator):
         self.get_logger().info('waiting for plans on /agent/plan and commands on /agent/command')
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.1)
-            if self._command == 'auto':
+            if self._scenario_reset is not None:
+                self._reset_for_scenario(self._scenario_reset)
+            elif self._command == 'auto':
                 self._command, self._preempt = None, False
                 self._run_auto_with_status()
             elif self._pending is not None:

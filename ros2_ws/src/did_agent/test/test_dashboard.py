@@ -9,6 +9,7 @@ from did_agent.costmap import CostMap
 from did_agent.dashboard_core import DashboardData
 from did_agent.dashboard_core import DashboardServer
 from did_agent.dashboard_core import costmap_layers
+from did_agent.dashboard_core import preview_from_scenario
 from did_agent.dashboard_core import render_geometry
 from did_agent.dashboard_core import terrain_runs
 from did_agent.dashboard_core import truth_from_scenario
@@ -107,6 +108,20 @@ def test_data_store_keeps_a_thin_trail_and_marks_collections():
     assert data.snapshot()['collected_at'] == [(-1.901, -0.5)]
 
 
+def test_data_store_resets_episode_data_but_keeps_current_pose():
+    data = DashboardData()
+    data.on_pose(-1.5, 0.25, 0.1)
+    data.on_score({'scenario': 'easy', 'collected': 1})
+    data.on_event({'event': 'sample_collected', 't': 5.0})
+    data.on_journal({'title': 'old run'})
+    data.reset_run()
+    snapshot = data.snapshot()
+    assert snapshot['pose'] == {'x': -1.5, 'y': 0.25, 'yaw': 0.1}
+    assert snapshot['trail'] == [[-1.5, 0.25]]
+    assert snapshot['score'] == {} and snapshot['events'] == []
+    assert snapshot['journal'] == [] and snapshot['collected_at'] == []
+
+
 def test_a_plan_explanation_becomes_a_journal_decision():
     data = DashboardData()
     data.on_plan(json.dumps({
@@ -135,12 +150,29 @@ def test_truth_overlay_applies_silent_environment_events_at_their_time():
     assert hazard['hazard_zones'][0]['id'] == 'h1'
 
 
+def test_setup_preview_includes_future_dynamic_hazard_details():
+    preview = preview_from_scenario(load_scenario(scenario_path('hard')))
+    assert preview['seed'] == 2028
+    assert preview['future_hazard_zones'][0]['id'] == 'h1'
+    assert preview['future_hazard_zones'][0]['appears_at'] == 150.0
+    assert [event['type'] for event in preview['events']] == [
+        'soil_change', 'hazard_appear', 'sensor_fault',
+    ]
+
+
 @pytest.fixture()
 def server(geometry):
-    sent = {'plans': [], 'commands': []}
+    sent = {'plans': [], 'commands': [], 'scenarios': [], 'previews': []}
+
+    def preview(name):
+        sent['previews'].append(name)
+        return {'name': name, 'seed': 7, 'samples': [], 'soil_zones': []}
+
     srv = DashboardServer(
         DashboardData(), geometry,
-        sent['plans'].append, sent['commands'].append, port=0, host='127.0.0.1',
+        sent['plans'].append, sent['commands'].append, sent['scenarios'].append,
+        preview,
+        port=0, host='127.0.0.1',
     )
     srv.start()
     yield srv, sent
@@ -216,10 +248,38 @@ def test_commands_are_whitelisted(server):
     assert sent['commands'] == ['auto', 'stop']
 
 
+def test_scenario_selection_is_whitelisted(server):
+    srv, sent = server
+    status, body, _ = call(srv, '/api/scenario', {'scenario': 'hard'})
+    assert status == 200 and json.loads(body) == {'ok': True, 'scenario': 'hard'}
+    status, body, _ = call(srv, '/api/scenario', {'scenario': 'hard@42'})
+    assert status == 200 and json.loads(body)['scenario'] == 'hard@42'
+    assert call(srv, '/api/scenario', {'scenario': 'custom.yaml'})[0] == 400
+    assert call(srv, '/api/scenario', {'scenario': '../easy'})[0] == 400
+    assert call(srv, '/api/scenario', {'scenario': 'easy@01'})[0] == 400
+    assert call(srv, '/api/scenario', {'scenario': 'easy@2147483648'})[0] == 400
+    assert sent['scenarios'] == ['hard', 'hard@42']
+
+
+def test_seeded_scenario_preview_is_returned_without_starting(server):
+    srv, sent = server
+    status, body, _ = call(srv, '/api/scenario/preview', {'scenario': 'medium@17'})
+    payload = json.loads(body)
+    assert status == 200 and payload['ok']
+    assert payload['scenario'] == 'medium@17'
+    assert payload['preview']['name'] == 'medium@17'
+    assert sent['previews'] == ['medium@17']
+    assert sent['scenarios'] == []
+
+
 def test_garbage_bodies_do_not_crash_the_server(server):
     srv, _ = server
     url = f'http://127.0.0.1:{srv.port}/api/plan'
     request = urllib.request.Request(url, data=b'{not json')
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(request, timeout=5)
+    assert error.value.code == 400
+    request = urllib.request.Request(url, data=b'[]', headers={'Content-Type': 'application/json'})
     with pytest.raises(urllib.error.HTTPError) as error:
         urllib.request.urlopen(request, timeout=5)
     assert error.value.code == 400

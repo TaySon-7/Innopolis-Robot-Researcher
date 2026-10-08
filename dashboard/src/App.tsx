@@ -10,6 +10,7 @@ import {
   Ruler,
   SatelliteDish,
   Search,
+  Settings2,
   Waypoints,
   Zap,
 } from 'lucide-react'
@@ -18,8 +19,10 @@ import { AgentJournal, AgentPanel } from './AgentPanels'
 import { ArenaCanvas } from './ArenaCanvas'
 import type { MapMode, PlannerLayer } from './ArenaCanvas'
 import { useAgentApi } from './agentApi'
-import type { NavigationMode } from './agentApi'
+import type { AgentScenarioPreview, Difficulty, NavigationMode } from './agentApi'
 import { useRosbridge } from './rosbridge'
+import { ScenarioSetup } from './ScenarioSetup'
+import type { ScenarioMode } from './ScenarioSetup'
 
 type Motion = 'forward' | 'reverse' | 'left' | 'right' | null
 
@@ -57,7 +60,19 @@ function App() {
     sendGoto,
     sendCommand,
     sendPlan,
+    selectScenario,
+    previewScenario,
   } = useAgentApi()
+  const [view, setView] = useState<'setup' | 'dashboard'>('setup')
+  const [difficulty, setDifficulty] = useState<Difficulty>('easy')
+  const [difficultyTouched, setDifficultyTouched] = useState(false)
+  const [scenarioMode, setScenarioMode] = useState<ScenarioMode>('standard')
+  const [scenarioSeed, setScenarioSeed] = useState('7')
+  const [scenarioPreview, setScenarioPreview] = useState<AgentScenarioPreview | null>(null)
+  const [previewBusy, setPreviewBusy] = useState(false)
+  const [previewError, setPreviewError] = useState<string | null>(null)
+  const [scenarioBusy, setScenarioBusy] = useState(false)
+  const [scenarioError, setScenarioError] = useState<string | null>(null)
   const [linearSpeed, setLinearSpeed] = useState(0.12)
   const [angularSpeed, setAngularSpeed] = useState(0.6)
   const [motion, setMotion] = useState<Motion>(null)
@@ -70,6 +85,15 @@ function App() {
   const [plannerLayer, setPlannerLayer] = useState<PlannerLayer>('total')
   const [mapHover, setMapHover] = useState<{ x: number; y: number } | null>(null)
   const connected = snapshot.status === 'connected'
+  const scenarioName = useMemo(() => {
+    if (scenarioMode === 'standard') return difficulty
+    if (!/^\d+$/.test(scenarioSeed)) return null
+    const numericSeed = Number(scenarioSeed)
+    if (!Number.isSafeInteger(numericSeed) || numericSeed < 0 || numericSeed > 2_147_483_647) {
+      return null
+    }
+    return `${difficulty}@${numericSeed}`
+  }, [difficulty, scenarioMode, scenarioSeed])
 
   const command = useMemo(() => {
     switch (motion) {
@@ -105,7 +129,7 @@ function App() {
   }, [sendCommand, stop])
 
   useEffect(() => {
-    if (!connected || !motion) return
+    if (view !== 'dashboard' || !connected || !motion) return
     publishVelocity(command.linear, command.angular)
     const timer = window.setInterval(
       () => publishVelocity(command.linear, command.angular),
@@ -115,10 +139,11 @@ function App() {
       window.clearInterval(timer)
       publishVelocity(0, 0)
     }
-  }, [command, connected, motion, publishVelocity])
+  }, [command, connected, motion, publishVelocity, view])
 
   useEffect(() => {
     const keyDown = (event: KeyboardEvent) => {
+      if (view !== 'dashboard') return
       if (event.target instanceof HTMLInputElement || event.metaKey || event.ctrlKey) return
       const key = event.key.toLowerCase()
       if (key === 's' || key === ' ') {
@@ -149,11 +174,63 @@ function App() {
       window.removeEventListener('pointerup', safetyStop)
       document.removeEventListener('visibilitychange', safetyStop)
     }
-  }, [connected, emergencyStop, startMotion, stop])
+  }, [connected, emergencyStop, startMotion, stop, view])
 
   useEffect(() => {
     if (!connected) setMotion(null)
   }, [connected])
+
+  useEffect(() => {
+    if (difficultyTouched) return
+    const [current, activeSeed] = agentSnapshot.scenario?.split('@') ?? []
+    if (current === 'easy' || current === 'medium' || current === 'hard') {
+      setDifficulty(current)
+      if (activeSeed && /^\d+$/.test(activeSeed)) {
+        setScenarioMode('seeded')
+        setScenarioSeed(String(Number(activeSeed)))
+      } else {
+        setScenarioMode('standard')
+      }
+    }
+  }, [agentSnapshot.scenario, difficultyTouched])
+
+  useEffect(() => {
+    if (view !== 'setup') return
+    if (!scenarioName) {
+      setScenarioPreview(null)
+      setPreviewBusy(false)
+      setPreviewError('Seed должен быть числом от 0 до 2147483647')
+      return
+    }
+    if (agentConnection !== 'connected') {
+      setScenarioPreview(null)
+      setPreviewBusy(false)
+      setPreviewError(null)
+      return
+    }
+    let cancelled = false
+    setScenarioPreview(null)
+    setPreviewError(null)
+    setPreviewBusy(true)
+    const timer = window.setTimeout(() => {
+      void previewScenario(scenarioName)
+        .then((next) => {
+          if (!cancelled) setScenarioPreview(next)
+        })
+        .catch((error) => {
+          if (!cancelled) {
+            setPreviewError(error instanceof Error ? error.message : 'Не удалось создать превью')
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setPreviewBusy(false)
+        })
+    }, scenarioMode === 'seeded' ? 250 : 0)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [agentConnection, previewScenario, scenarioMode, scenarioName, view])
 
   const runService = async (service: '/did/collect' | '/did/finish') => {
     stop()
@@ -183,6 +260,29 @@ function App() {
     } finally {
       setAgentBusy(false)
     }
+  }
+
+  const startScenario = async () => {
+    if (!scenarioName || scenarioPreview?.name !== scenarioName) return
+    stop()
+    setScenarioBusy(true)
+    setScenarioError(null)
+    try {
+      await selectScenario(scenarioName)
+      setNotice(`Сценарий ${scenarioName.toUpperCase()} создан — карта готова к работе`)
+      setView('dashboard')
+    } catch (error) {
+      setScenarioError(error instanceof Error ? error.message : 'Не удалось создать сценарий')
+    } finally {
+      setScenarioBusy(false)
+    }
+  }
+
+  const openScenarioSetup = () => {
+    stop()
+    void sendCommand('stop').catch(() => undefined)
+    setScenarioError(null)
+    setView('setup')
   }
 
   const navigateFromMap = useCallback((x: number, y: number, mode: NavigationMode) => {
@@ -242,6 +342,44 @@ function App() {
         ? 'Сильный сигнал: образец совсем рядом'
         : 'Исследуйте арену и следите за сигналом датчика'
 
+  if (view === 'setup') {
+    return (
+      <ScenarioSetup
+        selected={difficulty}
+        mode={scenarioMode}
+        seed={scenarioSeed}
+        scenarioName={scenarioName}
+        activeScenario={agentSnapshot.scenario}
+        connection={agentConnection}
+        geometry={agentGeometry}
+        preview={scenarioPreview}
+        previewBusy={previewBusy}
+        previewError={previewError}
+        busy={scenarioBusy}
+        error={scenarioError}
+        onSelect={(next) => {
+          setDifficultyTouched(true)
+          setDifficulty(next)
+        }}
+        onModeChange={(next) => {
+          setDifficultyTouched(true)
+          setScenarioMode(next)
+        }}
+        onSeedChange={(next) => {
+          setDifficultyTouched(true)
+          setScenarioSeed(next)
+        }}
+        onRandomSeed={() => {
+          const value = new Uint32Array(1)
+          crypto.getRandomValues(value)
+          setDifficultyTouched(true)
+          setScenarioSeed(String(value[0] % 2_147_483_648))
+        }}
+        onStart={() => void startScenario()}
+      />
+    )
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -255,6 +393,9 @@ function App() {
           </div>
         </div>
         <div className="connection-group">
+          <button className="topbar-action" type="button" onClick={openScenarioSetup}>
+            <Settings2 size={15} />Сценарий
+          </button>
           <div className={`connection connection--${agentConnection}`} role="status">
             <span className="connection-dot" />
             <span>{agentConnection === 'connected' ? 'Агент готов' : 'Agent API недоступен'}</span>
@@ -338,10 +479,7 @@ function App() {
           </div>
         </section>
 
-        <AgentJournal journal={agentSnapshot.journal} events={agentSnapshot.events} />
-
-        <aside className="side-rail">
-        <section className="panel telemetry-panel">
+        <section className="panel telemetry-panel telemetry-panel--wide">
           <div className="panel-header">
             <div>
               <span className="eyebrow">TELEMETRY</span>
@@ -399,6 +537,9 @@ function App() {
             </div>
           </div>
         </section>
+
+        <aside className="side-rail">
+          <AgentJournal journal={agentSnapshot.journal} events={agentSnapshot.events} />
 
           <AgentPanel
             snapshot={agentSnapshot}

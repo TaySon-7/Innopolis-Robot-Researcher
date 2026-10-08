@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import re
 from typing import Any
 
 from nav_msgs.msg import Odometry
@@ -17,6 +19,41 @@ from std_srvs.srv import Trigger
 from did_judge.judge_model import JudgeModel
 from did_judge.judge_model import scan_clearance
 from did_judge.scenario import load_scenario
+from did_judge.scenario import scenario_path
+
+SCENARIOS = ('easy', 'medium', 'hard')
+SEEDED_SCENARIO = re.compile(r'^(easy|medium|hard)@(0|[1-9][0-9]{0,9})$')
+GENERATED_SCENARIO_DIR = Path('/tmp/scenarios')
+
+
+def scenario_request(text: str) -> tuple[str, Path]:
+    """Resolve a trusted built-in or dashboard-generated scenario request."""
+    raw = text.strip()
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        payload = raw
+    if isinstance(payload, dict):
+        name = payload.get('name')
+        supplied_path = payload.get('scenario_file')
+    else:
+        name = payload
+        supplied_path = None
+    if not isinstance(name, str):
+        raise ValueError('scenario name must be a string')
+    name = name.strip().lower()
+    if name in SCENARIOS:
+        return name, scenario_path(name)
+    match = SEEDED_SCENARIO.fullmatch(name)
+    if match is None or int(match.group(2)) > 2_147_483_647:
+        raise ValueError(f'unknown scenario {name!r}')
+    if not isinstance(supplied_path, str):
+        raise ValueError('generated scenario requires scenario_file')
+    path = Path(supplied_path).resolve()
+    root = GENERATED_SCENARIO_DIR.resolve()
+    if path.parent != root or path.suffix != '.yaml':
+        raise ValueError('generated scenario_file is outside the allowed directory')
+    return name, path
 
 
 class JudgeNode(Node):
@@ -32,11 +69,13 @@ class JudgeNode(Node):
         if not scenario_file:
             raise RuntimeError('parameter scenario_file is required')
         scenario = load_scenario(scenario_file)
+        self._collision_clearance = float(self.get_parameter('collision_clearance').value)
+        self._collision_cooldown = float(self.get_parameter('collision_cooldown').value)
         self._scenario_file = scenario_file
         self._model = JudgeModel(
             scenario,
-            collision_clearance=float(self.get_parameter('collision_clearance').value),
-            collision_cooldown=float(self.get_parameter('collision_cooldown').value),
+            collision_clearance=self._collision_clearance,
+            collision_cooldown=self._collision_cooldown,
         )
         self._start_time: float | None = None
         self._logged_environment = 0
@@ -50,6 +89,7 @@ class JudgeNode(Node):
         self._score_publisher = self.create_publisher(String, '/did/score', 10)
         self._events_publisher = self.create_publisher(String, '/did/events', 10)
         self.create_subscription(Odometry, '/odom', self._on_odometry, 10)
+        self.create_subscription(String, '/did/scenario/select', self._on_scenario_select, 10)
         self.create_subscription(
             LaserScan,
             '/scan',
@@ -62,6 +102,32 @@ class JudgeNode(Node):
 
         self.get_logger().info(
             f'Judge ready: scenario={scenario.name}, '
+            f'samples={len(self._model.samples)}, battery={self._model.battery:.1f}'
+        )
+
+    def _on_scenario_select(self, message: String) -> None:
+        """Start a fresh built-in or reproducibly generated episode."""
+        try:
+            name, path = scenario_request(message.data)
+            scenario = load_scenario(path)
+            if scenario.name != name:
+                raise ValueError(
+                    f'scenario file contains {scenario.name!r}, expected {name!r}'
+                )
+        except (OSError, ValueError, KeyError) as error:
+            self.get_logger().error(f'could not load scenario request: {error}')
+            return
+        self._scenario_file = str(path)
+        self._model = JudgeModel(
+            scenario,
+            collision_clearance=self._collision_clearance,
+            collision_cooldown=self._collision_cooldown,
+        )
+        self._start_time = None
+        self._logged_environment = 0
+        self._publish_event('scenario_selected', scenario=name)
+        self.get_logger().info(
+            f'Judge reset: scenario={scenario.name}, '
             f'samples={len(self._model.samples)}, battery={self._model.battery:.1f}'
         )
 

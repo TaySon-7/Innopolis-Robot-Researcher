@@ -10,6 +10,7 @@ from math import hypot
 from math import isfinite
 from pathlib import Path
 import json
+import re
 import threading
 from typing import Any
 from typing import Callable
@@ -22,7 +23,20 @@ from did_agent.plan import parse_plan
 
 WEB_DIR_SOURCE = Path(__file__).resolve().parent.parent / 'web'
 COMMANDS = ('auto', 'stop')
+SCENARIOS = ('easy', 'medium', 'hard')
+MAX_SCENARIO_SEED = 2_147_483_647
+SCENARIO_NAME = re.compile(r'^(easy|medium|hard)@(0|[1-9][0-9]{0,9})$')
 MAX_BODY = 20_000
+
+
+def valid_scenario_name(value: Any) -> bool:
+    """Return whether ``value`` is a built-in name or a bounded seeded name."""
+    if not isinstance(value, str):
+        return False
+    if value in SCENARIOS:
+        return True
+    match = SCENARIO_NAME.fullmatch(value)
+    return match is not None and int(match.group(2)) <= MAX_SCENARIO_SEED
 
 
 def web_dir() -> Path:
@@ -356,6 +370,29 @@ class DashboardData:
                 't': self.state.get('t'),
             })
 
+    def reset_run(self) -> None:
+        """Clear episode-specific UI data while keeping the latest robot pose."""
+        with self.lock:
+            self.state = {}
+            self.status = {}
+            self.score = {}
+            self.costmap = {
+                'version': -1,
+                'knowledge': [],
+                'terrain': [],
+                'wall_cost': [],
+                'total': [],
+                'blocked': [],
+            }
+            self.truth = None
+            self.plan_text = ''
+            self.events.clear()
+            self.journal.clear()
+            self.trail.clear()
+            if self.pose is not None:
+                self.trail.append((self.pose['x'], self.pose['y']))
+            self.collected_at.clear()
+
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             return {
@@ -397,6 +434,30 @@ def truth_from_scenario(scenario, at: float = 0.0) -> dict[str, Any]:
     }
 
 
+def preview_from_scenario(scenario) -> dict[str, Any]:
+    """Full setup preview, including dynamic zones that appear later."""
+    preview = truth_from_scenario(scenario, 0.0)
+    events: list[dict[str, Any]] = []
+    future_hazards: list[dict[str, Any]] = []
+    for event in scenario.events:
+        item: dict[str, Any] = {'at': event.at, 'type': event.type}
+        if event.type == 'soil_change':
+            item.update(zone=event.zone, cost_multiplier=event.cost_multiplier)
+        elif event.type == 'hazard_appear':
+            zone = asdict(event.zone)
+            item['zone'] = zone
+            future_hazards.append({**zone, 'appears_at': event.at})
+        elif event.type == 'sensor_fault':
+            item.update(noise_stddev=event.noise_stddev, duration=event.duration)
+        events.append(item)
+    preview.update(
+        seed=scenario.seed,
+        events=events,
+        future_hazard_zones=future_hazards,
+    )
+    return preview
+
+
 # --- HTTP ----------------------------------------------------------------------------------------
 
 
@@ -409,6 +470,8 @@ class DashboardServer:
         geometry: dict[str, Any],
         send_plan: Callable[[str], None],
         send_command: Callable[[str], None],
+        send_scenario: Callable[[str], None] | None = None,
+        preview_scenario: Callable[[str], dict[str, Any]] | None = None,
         *,
         port: int = 8080,
         host: str = '0.0.0.0',
@@ -418,6 +481,8 @@ class DashboardServer:
         self.geometry = geometry
         self.send_plan = send_plan
         self.send_command = send_command
+        self.send_scenario = send_scenario
+        self.preview_scenario = preview_scenario
         self.log = log
         owner = self
 
@@ -460,6 +525,9 @@ class DashboardServer:
                 except ValueError:
                     self._json({'ok': False, 'error': 'invalid JSON'}, 400)
                     return
+                if not isinstance(body, dict):
+                    self._json({'ok': False, 'error': 'JSON body must be an object'}, 400)
+                    return
                 path = self.path.split('?')[0]
                 owner.log(
                     f'control request {path} {json.dumps(body, ensure_ascii=False)[:120]} '
@@ -476,6 +544,42 @@ class DashboardServer:
                         return
                     owner.send_command(command)
                     self._json({'ok': True})
+                    return
+                elif path == '/api/scenario':
+                    scenario = body.get('scenario')
+                    if not valid_scenario_name(scenario):
+                        self._json({
+                            'ok': False,
+                            'error': f'unknown scenario {scenario!r}',
+                        }, 400)
+                        return
+                    if owner.send_scenario is None:
+                        self._json({'ok': False, 'error': 'scenario control unavailable'}, 503)
+                        return
+                    try:
+                        owner.send_scenario(scenario)
+                    except (OSError, RuntimeError, ValueError) as error:
+                        self._json({'ok': False, 'error': str(error)}, 400)
+                        return
+                    self._json({'ok': True, 'scenario': scenario})
+                    return
+                elif path == '/api/scenario/preview':
+                    scenario = body.get('scenario')
+                    if not valid_scenario_name(scenario):
+                        self._json({
+                            'ok': False,
+                            'error': f'unknown scenario {scenario!r}',
+                        }, 400)
+                        return
+                    if owner.preview_scenario is None:
+                        self._json({'ok': False, 'error': 'scenario preview unavailable'}, 503)
+                        return
+                    try:
+                        preview = owner.preview_scenario(scenario)
+                    except (OSError, RuntimeError, ValueError) as error:
+                        self._json({'ok': False, 'error': str(error)}, 400)
+                        return
+                    self._json({'ok': True, 'scenario': scenario, 'preview': preview})
                     return
                 else:
                     self._send(404, b'not found', 'text/plain')

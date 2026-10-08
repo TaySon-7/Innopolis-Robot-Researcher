@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 export type AgentConnection = 'connecting' | 'connected' | 'disconnected'
 export type NavigationMode = 'goto' | 'search'
+export type Difficulty = 'easy' | 'medium' | 'hard'
 export type CostRun = [number, number, number, number]
 export type MaskRun = [number, number, number]
 
@@ -102,10 +103,31 @@ export interface ScenarioZone {
 export interface AgentTruth {
   name?: string
   at?: number
+  seed?: number
   base?: { x: number; y: number }
-  samples?: Array<{ x: number; y: number }>
+  samples?: Array<{ id?: string; x: number; y: number }>
   soil_zones?: ScenarioZone[]
   hazard_zones?: ScenarioZone[]
+  events?: ScenarioPreviewEvent[]
+}
+
+export interface ScenarioPreviewEvent {
+  at: number
+  type: 'soil_change' | 'hazard_appear' | 'sensor_fault' | string
+  zone?: string | ScenarioZone
+  cost_multiplier?: number
+  noise_stddev?: number
+  duration?: number
+}
+
+export interface AgentScenarioPreview extends AgentTruth {
+  name: string
+  seed: number
+  samples: Array<{ id?: string; x: number; y: number }>
+  soil_zones: ScenarioZone[]
+  hazard_zones: ScenarioZone[]
+  future_hazard_zones: Array<ScenarioZone & { appears_at?: number }>
+  events: ScenarioPreviewEvent[]
 }
 
 export interface AgentGeometry {
@@ -127,6 +149,11 @@ export interface AgentGeometry {
 interface ApiResult {
   ok: boolean
   error?: string
+}
+
+interface ScenarioPreviewResult extends ApiResult {
+  scenario: string
+  preview: AgentScenarioPreview
 }
 
 const EMPTY_SNAPSHOT: AgentSnapshot = {
@@ -156,7 +183,7 @@ async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   return response.json() as Promise<T>
 }
 
-async function postJson(url: string, body: unknown): Promise<ApiResult> {
+async function postJson<T extends ApiResult = ApiResult>(url: string, body: unknown): Promise<T> {
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -165,7 +192,7 @@ async function postJson(url: string, body: unknown): Promise<ApiResult> {
   const result = (await response.json().catch(() => ({
     ok: false,
     error: `API ответил ${response.status}`,
-  }))) as ApiResult
+  }))) as T
   if (!response.ok || !result.ok) {
     throw new Error(result.error || `API ответил ${response.status}`)
   }
@@ -250,6 +277,27 @@ export function useAgentApi() {
       request('/api/plan', { plan_id: 'react-ui', subgoals }),
     [request],
   )
+  const selectScenario = useCallback(
+    async (scenario: string) => {
+      const result = await request('/api/scenario', { scenario })
+      scenarioRef.current = null
+      truthFetchedAtRef.current = 0
+      setTruth(null)
+      return result
+    },
+    [request],
+  )
+  const previewScenario = useCallback(
+    async (scenario: string) => {
+      const result = await postJson<ScenarioPreviewResult>(
+        '/api/scenario/preview',
+        { scenario },
+      )
+      setLastError(null)
+      return result.preview
+    },
+    [],
+  )
 
   return {
     snapshot,
@@ -260,5 +308,7 @@ export function useAgentApi() {
     sendGoto,
     sendCommand,
     sendPlan,
+    selectScenario,
+    previewScenario,
   }
 }
