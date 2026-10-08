@@ -40,10 +40,46 @@ const INNER_HEX = [
   { x: 1.4665, y: -2.54 },
 ]
 const PILLARS = [-1.1, 0, 1.1].flatMap((x) =>
-  [-1.1, 0, 1.1].map((y) => ({ x, y })),
+  [-1.1, 0, 1.1].map((y) => ({ x, y, r: 0.15 })),
 )
 
 type ScreenProjector = (x: number, y: number) => [number, number]
+type ArenaPoint = { x: number; y: number }
+type ArenaBounds = { xmin: number; xmax: number; ymin: number; ymax: number }
+
+const FALLBACK_BOUNDS: ArenaBounds = {
+  xmin: -3.55,
+  xmax: 3.55,
+  ymin: -3.1,
+  ymax: 3.1,
+}
+
+function arenaFloor(geometry: AgentGeometry | null): ArenaPoint[] {
+  if (!geometry?.floor || geometry.floor.length < 3) return INNER_HEX
+  return geometry.floor.map(([x, y]) => ({ x, y }))
+}
+
+function arenaBounds(geometry: AgentGeometry | null): ArenaBounds {
+  return geometry?.bounds ?? FALLBACK_BOUNDS
+}
+
+function arenaView(width: number, height: number, bounds: ArenaBounds) {
+  const worldWidth = Math.max(0.1, bounds.xmax - bounds.xmin)
+  const worldHeight = Math.max(0.1, bounds.ymax - bounds.ymin)
+  const worldCenterX = (bounds.xmin + bounds.xmax) / 2
+  const worldCenterY = (bounds.ymin + bounds.ymax) / 2
+  const scale = Math.min(
+    Math.max(1, width - 54) / worldWidth,
+    Math.max(1, height - 42) / worldHeight,
+  )
+  const centerX = width / 2
+  const centerY = height / 2
+  const screen: ScreenProjector = (x, y) => [
+    centerX + (x - worldCenterX) * scale,
+    centerY - (y - worldCenterY) * scale,
+  ]
+  return { scale, screen, worldCenterX, worldCenterY }
+}
 
 function tracePolygon(
   context: CanvasRenderingContext2D,
@@ -132,24 +168,35 @@ export function ArenaCanvas({
       context.setTransform(ratio, 0, 0, ratio, 0, 0)
       context.clearRect(0, 0, rect.width, rect.height)
 
-      // The camera is fixed to the world frame. Only the robot and scan change.
-      const scale = Math.min((rect.width - 54) / 7.15, (rect.height - 42) / 6.25)
-      const centerX = rect.width / 2
-      const centerY = rect.height / 2
-      const screen: ScreenProjector = (x, y) => [
-        centerX + x * scale,
-        centerY - y * scale,
-      ]
+      // The camera is fixed to the world frame. Geometry comes from the exact
+      // occupancy map used by navigation, including the extra side facets in
+      // the stock TurtleBot3 world.
+      const floor = arenaFloor(geometry)
+      const bounds = arenaBounds(geometry)
+      const pillars = (geometry?.pillars?.length ? geometry.pillars : PILLARS)
+        .slice()
+        .sort((a, b) => a.x - b.x || a.y - b.y)
+      const { scale, screen } = arenaView(rect.width, rect.height, bounds)
 
       // Solid outer wall and the inner drivable floor.
-      tracePolygon(context, OUTER_HEX, screen)
-      context.fillStyle = '#1a323a'
-      context.strokeStyle = '#49616a'
-      context.lineWidth = 1.3
-      context.fill()
-      context.stroke()
+      if (geometry?.floor?.length) {
+        tracePolygon(context, floor, screen)
+        context.strokeStyle = '#1a323a'
+        context.lineJoin = 'miter'
+        context.miterLimit = 4
+        const wallDepth = Math.max(0.22, Math.min(0.34, geometry.wall * 2.5))
+        context.lineWidth = wallDepth * scale * 2
+        context.stroke()
+      } else {
+        tracePolygon(context, OUTER_HEX, screen)
+        context.fillStyle = '#1a323a'
+        context.strokeStyle = '#49616a'
+        context.lineWidth = 1.3
+        context.fill()
+        context.stroke()
+      }
 
-      tracePolygon(context, INNER_HEX, screen)
+      tracePolygon(context, floor, screen)
       context.fillStyle = '#07171f'
       context.strokeStyle = '#36535c'
       context.lineWidth = 1
@@ -158,32 +205,35 @@ export function ArenaCanvas({
 
       // Metric grid is clipped to the arena so its frame can never appear to pan.
       context.save()
-      tracePolygon(context, INNER_HEX, screen)
+      tracePolygon(context, floor, screen)
       context.clip()
       context.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace'
       context.textAlign = 'center'
       context.textBaseline = 'top'
+      const [, axisY] = screen(0, 0)
       for (let value = -3; value <= 3; value += 1) {
-        const [gx] = screen(value, 0)
-        const [, gy] = screen(0, value)
+        const [gx, top] = screen(value, bounds.ymax)
+        const [, bottom] = screen(value, bounds.ymin)
+        const [left, gy] = screen(bounds.xmin, value)
+        const [right] = screen(bounds.xmax, value)
         context.strokeStyle = value === 0 ? '#294650' : '#173039'
         context.lineWidth = value === 0 ? 1.2 : 1
         context.beginPath()
-        context.moveTo(gx, centerY - 3.1 * scale)
-        context.lineTo(gx, centerY + 3.1 * scale)
-        context.moveTo(centerX - 3.55 * scale, gy)
-        context.lineTo(centerX + 3.55 * scale, gy)
+        context.moveTo(gx, top)
+        context.lineTo(gx, bottom)
+        context.moveTo(left, gy)
+        context.lineTo(right, gy)
         context.stroke()
         if (value !== 0) {
           context.fillStyle = '#5f7a7b'
-          context.fillText(String(value), gx, centerY + 8)
+          context.fillText(String(value), gx, axisY + 8)
         }
       }
       context.restore()
 
       if (showCostmap && geometry && costmapRuns.length) {
         context.save()
-        tracePolygon(context, INNER_HEX, screen)
+        tracePolygon(context, floor, screen)
         context.clip()
         const resolution = geometry.resolution
         for (const [row, start, end, value] of costmapRuns) {
@@ -297,10 +347,10 @@ export function ArenaCanvas({
         context.globalAlpha = 1
       })
 
-      // Nine 0.15 m radius cylinders from model.sdf, in a 3 × 3 grid.
-      PILLARS.forEach(({ x, y }, index) => {
+      // Pillars come from the same occupancy map as the navigation costmap.
+      pillars.forEach(({ x, y, r }, index) => {
         const [px, py] = screen(x, y)
-        const radius = Math.max(7, 0.15 * scale)
+        const radius = Math.max(7, r * scale)
         const gradient = context.createRadialGradient(
           px - radius * 0.35,
           py - radius * 0.4,
@@ -338,7 +388,10 @@ export function ArenaCanvas({
         })
 
         context.save()
-        tracePolygon(context, OUTER_HEX, screen)
+        const [clipLeft, clipTop] = screen(bounds.xmin, bounds.ymax)
+        const [clipRight, clipBottom] = screen(bounds.xmax, bounds.ymin)
+        context.beginPath()
+        context.rect(clipLeft, clipTop, clipRight - clipLeft, clipBottom - clipTop)
         context.clip()
 
         // A restrained subset of rays makes the scan direction readable without
@@ -466,10 +519,12 @@ export function ArenaCanvas({
     const canvas = canvasRef.current
     if (!canvas) return null
     const rect = canvas.getBoundingClientRect()
-    const scale = Math.min((rect.width - 54) / 7.15, (rect.height - 42) / 6.25)
-    const x = (clientX - rect.left - rect.width / 2) / scale
-    const y = (rect.height / 2 - (clientY - rect.top)) / scale
-    return pointInPolygon(x, y, INNER_HEX) ? { x, y } : null
+    const floor = arenaFloor(geometry)
+    const bounds = arenaBounds(geometry)
+    const { scale, worldCenterX, worldCenterY } = arenaView(rect.width, rect.height, bounds)
+    const x = worldCenterX + (clientX - rect.left - rect.width / 2) / scale
+    const y = worldCenterY + (rect.height / 2 - (clientY - rect.top)) / scale
+    return pointInPolygon(x, y, floor) ? { x, y } : null
   }
 
   return (

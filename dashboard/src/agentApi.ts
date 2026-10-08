@@ -96,6 +96,15 @@ export interface AgentTruth {
 }
 
 export interface AgentGeometry {
+  floor: Array<[number, number]>
+  pillars: Array<{ x: number; y: number; r: number }>
+  wall: number
+  bounds: {
+    xmin: number
+    xmax: number
+    ymin: number
+    ymax: number
+  }
   resolution: number
   origin: [number, number]
 }
