@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import hypot, isfinite
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -263,6 +263,19 @@ GOTO_NOOP_M = 0.7
 #: How close a target may be to a place the robot has already hit.
 COLLISION_RADIUS_M = 0.7
 
+#: How close a point has to be to the robot to count as "where it already
+#: stands". Big enough to cover the spread of a stuck pose across a few
+#: replans, small enough that it is not a licence to plan anywhere nearby.
+HERE_M = 0.45
+
+
+def _under_robot(x: float, y: float,
+                 pose: Sequence[float] | None) -> bool:
+    """Whether (x, y) is the spot the robot is already standing on."""
+    if not pose or len(pose) < 2:
+        return False
+    return hypot(x - float(pose[0]), y - float(pose[1])) < HERE_M
+
 #: Battery a single long leg may cost before the plan is refused outright.
 #: A search point is a maybe: it may find nothing. Nine units is already more
 #: than any single discovery is worth, so a leg that costs more is a bad bet
@@ -484,8 +497,21 @@ def check_plan(plan: Plan,
     # what turns one collision into a loop: the judge emits an event every two
     # seconds while it is stuck, and each one would trigger a new plan aimed at
     # the same obstacle.
+    #
+    # But a robot stuck against something is standing *on* that spot, and the
+    # veto has to let it work from where it is. Refusing the robot's own
+    # position is a livelock: on medium the robot wedged itself at (0.5; -0.79)
+    # with the sensor at 0.73 — a sample within reach — and every plan that
+    # said "search here, then collect" was turned down as a return to known
+    # bad ground, while the model kept writing exactly that plan. It sat there
+    # colliding until the battery ran down. A ``search_around`` where the robot
+    # already stands is not a trip back into the obstacle; it is the spiral
+    # that walks it off, and it is where a nearby sample gets collected.
     for index, subgoal in enumerate(plan.subgoals):
         if subgoal.type not in ('goto', 'search_around'):
+            continue
+        if subgoal.type == 'search_around' and _under_robot(subgoal.x,
+                                                            subgoal.y, pose):
             continue
         if any(hypot(subgoal.x - hx, subgoal.y - hy) < COLLISION_RADIUS_M
                for hx, hy in hits or ()):

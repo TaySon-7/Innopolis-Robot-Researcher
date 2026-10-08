@@ -155,6 +155,7 @@ def build_planner_prompt(mission: str, state: dict[str, Any],
                          expensive: list[dict[str, float]] | None = None,
                          budget: dict[str, Any] | None = None,
                          searched: list[tuple[float, float, float]] | None = None,
+                         uncovered: list[tuple[float, float]] | None = None,
                          round_number: int = 0) -> str:
     """Assemble the planner prompt from one state snapshot.
 
@@ -171,7 +172,7 @@ def build_planner_prompt(mission: str, state: dict[str, Any],
         '',
         _ground_block(expensive),
         '',
-        _coverage_block(searched),
+        _coverage_block(searched, uncovered),
         '',
         _budget_block(state, budget),
         '',
@@ -209,8 +210,9 @@ def _ground_block(expensive: list[dict[str, float]] | None) -> str:
     return '\n'.join(lines)
 
 
-def _coverage_block(searched: list[tuple[float, float, float]] | None) -> str:
-    """Where the robot has already looked, so it does not look there again.
+def _coverage_block(searched: list[tuple[float, float, float]] | None,
+                    uncovered: list[tuple[float, float]] | None = None) -> str:
+    """Where the robot has already looked, and what is left worth looking at.
 
     The sample sensor reports how close the nearest sample is and nothing about
     which way it lies, and the samples themselves are not on any map the model
@@ -220,24 +222,35 @@ def _coverage_block(searched: list[tuple[float, float, float]] | None) -> str:
     -west and south-east corners three times each, while the agent's own policy
     covered the same ground in eighteen metres and took all three.
 
-    This is the one thing the planner knows and the model cannot infer, so it is
-    stated plainly rather than left to be guessed from the pose history.
+    Naming the swept circles stops the repeats but leaves the model to invent a
+    replacement from nothing, which is the same blind guess with a fresh label.
+    So the remaining candidates go with them: a lattice of arena cells no search
+    has covered, nearest first. The model still chooses — it knows things the
+    lattice cannot, such as where it last heard something — but it chooses from
+    places that are actually still worth searching.
     """
-    if not searched:
-        return ('ГДЕ УЖЕ ИСКАЛИ: пока ничего — это первая точка плана. '
-                'Образцов на карте нет, выбирай любую свободную точку; '
-                'датчик сам подскажет, когда близко.')
+    parts = []
+    if searched:
+        circles = ', '.join(f'({x:.1f}; {y:.1f}) r={r:.1f}' for x, y, r in searched)
+        parts.append(
+            'ГДЕ УЖЕ ИСКАЛИ (там поиск прошёл, образцов не оказалось):\n'
+            f'  {circles}\n'
+            '  Не ставь goto или search_around внутрь этих кругов: там уже пусто, '
+            'а батарея расходуется на пути.'
+        )
+    else:
+        parts.append('ГДЕ УЖЕ ИСКАЛИ: пока ничего — это первая точка плана.')
 
-    circles = ', '.join(f'({x:.1f}; {y:.1f}) r={r:.1f}' for x, y, r in searched)
-    return (
-        'ГДЕ УЖЕ ИСКАЛИ (кругими отмечены места, где поиск уже прошёл и '
-        'образцов не оказалось):\n'
-        f'  {circles}\n'
-        '  Не ставь goto или search_around внутрь этих кругов: там уже пусто, '
-        'а батарея расходуется на пути. Ищи в непроверенных местах арены.\n'
-        '  Если датчик молчит, лучше короткий круг на непроверенном участке, '
-        'чем переезд через всю арену к уже проверенному углу.'
-    )
+    if uncovered:
+        cells = ', '.join(f'({x:.1f}; {y:.1f})' for x, y in uncovered)
+        parts.append(
+            'КУДА СТОИТ ПОЙТИ (свободные точки арены, которых поиск ещё не '
+            f'касался, ближайшие к роботу):\n'
+            f'  {cells}\n'
+            '  Выбирай цель отсюда. Если датчик молчит, точка отсюда — лучше, '
+            'чем выдуманный угол: она ещё не проверена, и до неё ближе.'
+        )
+    return '\n'.join(parts)
 
 
 def _budget_block(state: dict[str, Any],

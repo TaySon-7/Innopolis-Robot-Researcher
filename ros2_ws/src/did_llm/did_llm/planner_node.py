@@ -97,6 +97,15 @@ SEARCH_REACH_SLACK_M = 0.05
 #: the longest thing in it.
 SEARCH_MEMORY = 12
 
+#: Spacing of the candidate lattice handed to the model as places still worth
+#: searching. Coarse on purpose: these are suggestions, and every one of them
+#: costs a trip, so naming thirty would read as a queue to work through.
+UNCOVERED_STEP = 1.2
+
+#: How many candidate cells the prompt names. Enough that the model has a real
+#: choice, few enough that it does not read as an instruction to tour them all.
+UNCOVERED_HINTS = 5
+
 
 def search_radius(margin: float) -> float:
     """The circle to sweep for a sample the reading puts ``margin`` above noise.
@@ -242,6 +251,10 @@ class Planner:
         #: Set while the agent is driving itself, so it clears again when
         #: autonomous mode ends.
         self.yielded = False
+        #: The operator pressed «Стоп»: stay quiet until the next run.
+        self.quiet = False
+        #: The judge's clock, watched only to notice it jumping back to zero.
+        self.last_sim_t = 0.0
         #: Whether the last plan we sent was "go home".
         self._last_was_return = False
         #: Every rejection the executor reported, kept for the next prompt.
@@ -269,6 +282,13 @@ class Planner:
         if self.link.state_age() > self.cfg.max_state_staleness_sec:
             # The agent stopped publishing, which means it is not running or
             # the episode is over. Planning on a stale pose would be a guess.
+            return
+        if self.link.command_pending:
+            self.link.command_pending = False
+            self._on_operator_command(self.link.command)
+        if self._new_episode():
+            self.quiet = False
+        if self.quiet:
             return
         if self.link.finished():
             return
@@ -300,6 +320,21 @@ class Planner:
             return
 
         if self._stop_on_anomaly():
+            return
+
+        if self._operator_is_driving():
+            # Someone else has the robot. Publishing over them is what made the
+            # dashboard's buttons look broken: "Стоп", "На базу" and clicks on
+            # the map all arrive as a plan, the agent starts obeying, and thirty
+            # seconds later this planner replaces it and turns the robot back
+            # out into the arena.
+            if not self.yielded:
+                self.yielded = True
+                self.inflight = None
+                self.link.log.info(
+                    f'чужой план {self.link.status.get("plan_id")} выполняется '
+                    f'({self.link.status.get("subgoal")}), планирование '
+                    f'приостановлено')
             return
 
         if must_return(self.link.battery(), self.link.return_cost()):
@@ -355,6 +390,7 @@ class Planner:
             self.link.status, self.feedback,
             expensive=self.link.expensive_ground(), budget=budget,
             searched=self.searched_circles(),
+            uncovered=self.uncovered_cells(),
             round_number=self.round_number,
         )
         self.busy = True
@@ -399,6 +435,14 @@ class Planner:
         for attempt in range(self.cfg.repair_attempts + 1):
             try:
                 plan = parse_model_plan(answer, self._next_id())
+                # Whatever I can fix without asking the model is fixed first,
+                # before validation. Running the checks on a plan I am about to
+                # change reports problems that are no longer there, and every
+                # one of them costs a repair round with the robot standing
+                # still. Trimming afterwards meant the premature-return_to_base
+                # cut — the rule I added for that — never got the chance: the
+                # plan was already rejected by the time _trim saw it.
+                self._trim(plan, budget)
                 problems = check_plan(
                     plan, self.link.expensive_ground(),
                     min_battery=budget.get('floor'),
@@ -457,7 +501,6 @@ class Planner:
                 self.failures = 0
                 continue
 
-            self._trim(plan, budget)
             self._publish(plan, source='llm')
             return
 
@@ -478,6 +521,7 @@ class Planner:
         it leaves a plan that starts halfway through.
         """
         plan.subgoals = _with_collect(plan.subgoals)
+        self._clamp_radii(plan)
 
         # A trailing ``return_to_base`` while samples remain ends the episode at
         # whatever has been collected, so it is refused. Refusing the whole plan
@@ -487,6 +531,7 @@ class Planner:
         # reaches for it almost every round — and each one cost a repair call
         # while the robot stood still.
         if (plan.subgoals and plan.subgoals[-1].type == 'return_to_base'
+                and len(plan.subgoals) > 1
                 and self.link.remaining_samples()):
             floor = budget.get('floor')
             if floor is None or floor > SEARCH_WORTH_IT:
@@ -507,6 +552,81 @@ class Planner:
         if status is None:
             return None
         return status
+
+    def _on_operator_command(self, command: str | None) -> None:
+        """React to the dashboard's Стоп / Автономно.
+
+        The operator pressing «Стоп» is the one instruction in this system
+        that has no reason to be second-guessed. It used to be: the stop
+        cancelled the goal but left no plan behind, so thirty seconds later
+        this planner published a fresh one and the robot drove off again —
+        which is what "кнопка не работает" looked like from the browser. So
+        «Стоп» means quiet until the next run starts.
+        """
+        if command == 'stop':
+            self.quiet = True
+            self.inflight = None
+            self.link.log.info(
+                'оператор нажал «Стоп» — бургер не вмешивается до нового прогона')
+        elif command:
+            self.quiet = False
+            self.link.log.info(f'оператор: {command} — бургер продолжает')
+
+    def _new_episode(self) -> bool:
+        """Whether the judge has started a different run.
+
+        The only cheap witness is the clock: a new scenario restarts ``t`` at
+        zero, and nothing else makes it go backwards. Detecting it this way is
+        what lets «Стоп» last as long as the operator wants it to without
+        leaving the planner permanently silent for the next run.
+        """
+        now = self.link.now()
+        if self.last_sim_t and now < self.last_sim_t - 1.0:
+            self.last_sim_t = now
+            self.link.log.info('новый прогон — бургер снова планирует')
+            return True
+        self.last_sim_t = max(self.last_sim_t, now)
+        return False
+
+    def _operator_is_driving(self) -> bool:
+        """Whether a plan this planner did not write is running on the agent.
+
+        The operator's dashboard controls — ``Стоп``, ``На базу``, ``Собрать
+        здесь``, a click on the map — all arrive as a plan on ``/agent/plan``,
+        not as a mode switch. So they are only visible as a status whose plan
+        is not ours, and the only way to respect them is to notice that and
+        stay quiet for as long as it runs.
+        """
+        status = self.link.status
+        if not status:
+            return False
+        plan_id = str(status.get('plan_id') or '')
+        if not plan_id:
+            return False
+        if plan_id in self.link.seen_plans:
+            return False
+        return plan_id != (self.inflight or '')
+
+    def _clamp_radii(self, plan: Plan) -> None:
+        """Pull any too-wide search down to what the reading allows.
+
+        A radius over the cap is not a plan that cannot be executed, only one
+        that is worse than it needs to be — a wide circle sweeps ground the
+        sample is not on and walks the robot back out of range it already had.
+        Refusing the whole plan for it cost a model call and left the robot
+        standing still, which is how a marginally-too-wide circle turned into
+        a minute of nothing happening.
+        """
+        margin = signal_margin(self.link.signal(), self.link.noise())
+        allowed = max(0.4, 1.6 * max(0.0, 1.0 - margin))
+        for subgoal in plan.subgoals:
+            if subgoal.type != 'search_around' or subgoal.radius <= allowed + 0.05:
+                continue
+            shrunk = round(allowed, 2)
+            self.link.log.info(
+                f'   поправил радиус {subgoal.describe()}: '
+                f'{subgoal.radius:g} → {shrunk:g} м (сигнал {margin:.2f})')
+            subgoal.radius = shrunk
 
     def _note_outcome(self, status: dict[str, Any]) -> None:
         """Record how the last plan ended and turn it into the next prompt."""
@@ -747,18 +867,22 @@ class Planner:
         pose = self.link.pose()
         if pose is None:
             return False
-        # A search in progress is normally left alone — interrupting it every
-        # tick would spin the robot in place. But its circle has a fixed radius,
-        # and a circle narrower than the reading calls for searches ground the
-        # sample is not on: a 0.5 m circle centred 0.65 m from the sample spent
-        # its whole budget turning on the spot and then failed, with the sensor
-        # reading 0.57 throughout. So it is replaced only by a *wider* circle,
-        # never by the same one — which also guarantees this ends instead of
-        # interrupting the search with an identical plan every tick.
+        # A search in progress is normally left alone — but only if its circle
+        # is the one this reading calls for, and that means both directions.
+        #
+        # Too narrow searches ground the sample is not on: a 0.5 m circle 0.65 m
+        # from the sample turned on the spot until its budget ran out, with the
+        # reading at 0.57 throughout. Too wide is worse, because it drives the
+        # robot back out of range it already had — a 0.7 m circle while the sample
+        # sat 0.26 m away and the reading said 0.80, which is inside collect
+        # range. It circled out of reach and could not collect.
+        #
+        # Comparing both ways is also what keeps this from looping: an identical
+        # circle never triggers it, and the pause below stops a slow drift.
         wanted = search_radius(margin)
         if (subgoal.type == 'search_around'
                 and hypot(subgoal.x - pose[0], subgoal.y - pose[1]) < 0.6
-                and subgoal.radius >= wanted - SEARCH_REACH_SLACK_M):
+                and abs(subgoal.radius - wanted) <= SEARCH_REACH_SLACK_M):
             return False
         # A live signal persists while the robot circles the sample, so without
         # a pause the interrupt would fire every tick and the robot would spin
@@ -825,6 +949,37 @@ class Planner:
     def searched_circles(self) -> list[tuple[float, float, float]]:
         """The circles the model is told have already been swept."""
         return list(self.searched)
+
+    def uncovered_cells(self, limit: int = UNCOVERED_HINTS
+                        ) -> list[tuple[float, float]]:
+        """Free arena cells that no search has swept yet, nearest first.
+
+        The model picks its own targets, but it picks them blind: the sensor says
+        how far the nearest sample is and never which way, and no map shows where
+        samples are. Telling it only where it has been leaves it inventing a
+        replacement, which is the same blind guess under a new name. This gives
+        it somewhere real to choose from — the coverage it is missing, sorted so
+        the cheap nearby ones come first and the battery pays for distance only
+        when there is nothing closer left.
+        """
+        pose = self.link.pose() or (BASE_X, BASE_Y)
+        arena = ARENA
+        cells = []
+        y = arena.y_min + UNCOVERED_STEP / 2
+        while y < arena.y_max:
+            x = arena.x_min + UNCOVERED_STEP / 2
+            while x < arena.x_max:
+                point = (round(x, 2), round(y, 2))
+                if arena_problem(*point) is None and not self._was_searched(point):
+                    cells.append((hypot(point[0] - pose[0], point[1] - pose[1]),
+                                  point))
+                x += UNCOVERED_STEP
+            y += UNCOVERED_STEP
+        cells.sort(key=lambda item: item[0])
+        return [point for _, point in cells[:limit]]
+
+    def _was_searched(self, point: tuple[float, float]) -> bool:
+        return any(hypot(point[0] - x, point[1] - y) <= r for x, y, r in self.searched)
 
     def _current_subgoal(self) -> Subgoal | None:
         """The subgoal the executor is on, taken from the plan we sent."""
@@ -913,6 +1068,10 @@ class Planner:
         self.link.log.warn(f'передача в автономный режим: {why}')
 
     def _publish(self, plan: Plan, *, source: str) -> None:
+        # Read the clock before it is reset: the delay since the previous plan
+        # is what tells us whether the model is keeping up, and setting
+        # ``last_plan_at`` first made every line read "за 0 с модели".
+        since = self.link.now() - self.last_plan_at
         self.link.publish_plan(plan.to_wire())
         self.inflight = plan.plan_id
         self.last_plan_at = self.link.now()
@@ -925,13 +1084,26 @@ class Planner:
         # against, whether the model wrote it or the budget forced it.
         self._last_was_return = bool(
             plan.subgoals and plan.subgoals[-1].type == 'return_to_base')
+        if not plan.subgoals:
+            self.link.log.warn(
+                f'БУРГЕР → АГЕНТ   план {plan.plan_id} ({source}) ПУСТОЙ '
+                f'— это команда «стоп», эпизод встанет')
+            return
+        body = '\n'.join(
+            f'   {index + 1}. {item.describe()}'
+            for index, item in enumerate(plan.subgoals))
         self.link.log.info(
-            f'план {plan.plan_id} ({source}) за '
-            f'{self.link.now() - self.last_plan_at:.0f} с модели: '
-            f'{[item.describe() for item in plan.subgoals]}'
-        )
+            '\n'.join([
+                '',
+                '─' * 62,
+                f'БУРГЕР → АГЕНТ   план {plan.plan_id}   '
+                f'источник: {source}   {len(plan.subgoals)} подц.   '
+                f'прошло с прошлого плана {since:.0f} с',
+                '─' * 62,
+                body,
+            ]))
         if plan.explanation:
-            self.link.log.info(f'  {plan.explanation}')
+            self.link.log.info(f'   почему: {plan.explanation}')
         # No journal entry here on purpose: the agent's dashboard already turns
         # a plan's "explanation" into a `decision` entry, so writing one too
         # would show every plan twice in the feed.

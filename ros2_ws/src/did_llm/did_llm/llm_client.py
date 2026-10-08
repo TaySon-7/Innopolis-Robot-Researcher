@@ -208,7 +208,9 @@ class LLMClient:
                 raise LLMUnavailable(detail, reason=reason)
             try:
                 self._budget.record()
+                asked = time.monotonic()
                 raw = self._post(system, user)
+                waited = time.monotonic() - asked
                 data = extract_json(raw)
             except urllib.error.HTTPError as error:
                 last_error = f'HTTP {error.code}'
@@ -226,7 +228,7 @@ class LLMClient:
             else:
                 if self.journal is not None:
                     self.journal.log_exchange(tag, system, user, raw, data,
-                                              self.cfg.model)
+                                              self.cfg.model, waited)
                 if self.cfg.cache_enabled:
                     self._cache[key] = (
                         json.dumps(data, ensure_ascii=False),
