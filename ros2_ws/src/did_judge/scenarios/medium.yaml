@@ -1,0 +1,21 @@
+name: medium
+seed: 2027
+base: {x: -2.0, y: -0.5}
+battery: {initial: 60.0, cost_per_meter: 1.0}
+collection_radius: 0.30
+sensor: {range: 1.5, noise_stddev: 0.02}
+
+samples:
+  - {id: s1, x: -1.60, y: 0.70}
+  - {id: s2, x: -0.55, y: 0.55}
+  - {id: s3, x: 0.55, y: -0.55}
+  - {id: s4, x: 1.70, y: 0.50}
+  - {id: s5, x: 0.00, y: 1.90}
+
+soil_zones:
+  - {id: z1, shape: circle, x: -0.60, y: -0.60, radius: 0.40, cost_multiplier: 2.0}
+  - {id: z2, shape: rect, x_min: 0.30, y_min: 0.30, x_max: 1.00, y_max: 0.90, cost_multiplier: 3.0}
+  - {id: z3, shape: circle, x: 1.70, y: -0.90, radius: 0.40, cost_multiplier: 4.0}
+
+hazard_zones: []
+events: []

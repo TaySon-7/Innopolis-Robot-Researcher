@@ -19,3 +19,6 @@ artifacts/
 tmp/
 
 .idea
+
+# Generated scenarios
+scenarios_custom/

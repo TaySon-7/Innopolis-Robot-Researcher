@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot Researcher — пульт</title>
+<style>
+:root {
+  --bg: #f2f4f8; --card: #ffffff; --line: #dde3ec; --text: #1c2430; --muted: #6b7788;
+  --accent: #0f9d8a; --warn: #c98a0a; --danger: #d64545; --info: #2f6fdb;
+  --floor: #ffffff; --grid: rgba(60,80,110,.10); --trail: #2f6fdb; --path: #0f9d8a;
+  --soil: 201, 138, 10; --robot: #1c2430;
+  --wall: #7d8ba0; --edge: rgba(15,157,138,.55); --vignette: rgba(60,80,110,.10);
+  --pillar: #9aa8bb; --pillar-hi: #d5dce8; --shadow: rgba(20,30,50,.22); --ink: #1c2430;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117; --card: #151b24; --line: #243040; --text: #dbe3ee; --muted: #8493a6;
+    --accent: #35d0b5; --warn: #f2b84b; --danger: #ff6b6b; --info: #6aa9ff;
+    --floor: #10161e; --grid: rgba(150,175,210,.10); --trail: #6aa9ff; --path: #35d0b5;
+    --soil: 242, 184, 75; --robot: #f4f7fb;
+    --wall: #3c4859; --edge: rgba(53,208,181,.5); --vignette: rgba(0,0,0,.38);
+    --pillar: #46556b; --pillar-hi: #70829c; --shadow: rgba(0,0,0,.45); --ink: #dbe3ee;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--card); }
+header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); font-size: 12px; color: var(--muted); white-space: nowrap; }
+.chip b { color: var(--text); font-weight: 600; }
+.chip.on { border-color: var(--accent); color: var(--accent); }
+.chip.warn { border-color: var(--danger); color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.dot.run { background: var(--accent); animation: pulse 1.2s infinite; }
+.dot.fail { background: var(--danger); }
+@keyframes pulse { 50% { opacity: .35; } }
+.spacer { flex: 1; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 16px; padding: 16px 20px 24px; max-width: 1500px; margin: 0 auto; }
+@media (max-width: 960px) { main { grid-template-columns: 1fr; } }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+.card h2 { margin: 0; padding: 10px 14px; font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .9px; color: var(--muted); border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; }
+.pad { padding: 12px 14px; }
+#mapwrap { padding: 10px; }
+canvas { width: 100%; display: block; border-radius: 10px; background: transparent; cursor: crosshair; touch-action: none; }
+#mapwrap { background: radial-gradient(ellipse at 50% 45%, var(--card), var(--bg)); border-radius: 12px; }
+.mapbar { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; padding: 8px 4px 2px; color: var(--muted); font-size: 12px; }
+.mapbar label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; user-select: none; }
+.mapbar .coords { margin-left: auto; font-variant-numeric: tabular-nums; font-family: ui-monospace, Menlo, monospace; }
+.side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.battery .top { display: flex; justify-content: space-between; align-items: baseline; }
+.battery .num { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.battery .of { color: var(--muted); font-size: 13px; }
+.bar { position: relative; height: 12px; border-radius: 7px; background: var(--line); margin: 8px 0 4px; overflow: visible; }
+.bar > i { position: absolute; inset: 0 auto 0 0; border-radius: 7px; background: var(--accent); transition: width .4s; }
+.bar > i.low { background: var(--danger); }
+.bar > s { position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--warn); }
+.hint { color: var(--muted); font-size: 12px; }
+.grid2 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); border-radius: 0 0 12px 12px; overflow: hidden; }
+.stat { background: var(--card); padding: 10px 14px; }
+.stat span { display: block; color: var(--muted); font-size: 11px; }
+.stat b { font-size: 20px; font-variant-numeric: tabular-nums; font-weight: 650; }
+.stat b.bad { color: var(--danger); }
+.now { display: grid; gap: 6px; }
+.now .big { font-size: 15px; font-weight: 600; }
+.flags { display: flex; flex-wrap: wrap; gap: 6px; }
+.btns { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+button { font: inherit; padding: 9px 12px; border-radius: 9px; border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer; transition: transform .05s, border-color .15s; }
+button:hover { border-color: var(--accent); }
+button:active { transform: translateY(1px); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #04120f; font-weight: 650; }
+button.danger:hover { border-color: var(--danger); color: var(--danger); }
+.tabs { display: flex; gap: 2px; }
+.tabs button { padding: 3px 10px; border-radius: 999px; font-size: 11px; border-color: transparent; background: transparent; color: var(--muted); text-transform: none; letter-spacing: 0; }
+.tabs button.sel { background: var(--line); color: var(--text); }
+.feed { max-height: 260px; overflow-y: auto; }
+.item { padding: 8px 14px; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 46px 1fr; gap: 8px; }
+.item:last-child { border-bottom: 0; }
+.item time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; padding-top: 2px; }
+.item .t { font-weight: 600; font-size: 13px; }
+.item .x { color: var(--muted); font-size: 12px; margin-top: 1px; overflow-wrap: anywhere; }
+.tag { font-size: 10px; text-transform: uppercase; letter-spacing: .6px; padding: 1px 6px; border-radius: 4px; margin-right: 6px; border: 1px solid var(--line); color: var(--muted); }
+.tag.hypothesis { color: var(--info); border-color: var(--info); }
+.tag.result.confirmed, .tag.confirmed { color: var(--accent); border-color: var(--accent); }
+.tag.rejected { color: var(--danger); border-color: var(--danger); }
+.tag.decision { color: var(--warn); border-color: var(--warn); }
+.empty { padding: 18px 14px; color: var(--muted); font-size: 12px; text-align: center; }
+#spark { height: 44px; border-radius: 6px; cursor: default; background: transparent; }
+#toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 16px; border-radius: 999px; font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .2s; }
+#toast.show { opacity: 1; }
+.legend { display: flex; gap: 12px; flex-wrap: wrap; padding: 4px; font-size: 11px; color: var(--muted); }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Robot Researcher</h1>
+  <span class="chip">сценарий <b id="scn">—</b></span>
+  <span class="chip">время <b id="clock">0 с</b></span>
+  <span class="chip" id="runchip"><span class="dot" id="rundot"></span><b id="runtxt">ожидание</b></span>
+  <span class="spacer"></span>
+  <span class="chip" id="conn">нет связи</span>
+</header>
+<main>
+  <section class="card" id="mapcard">
+    <h2><span>Карта лаборатории</span><span class="hint" style="text-transform:none;letter-spacing:0;font-weight:400">клик — ехать · Shift+клик — искать образец здесь</span></h2>
+    <div id="mapwrap">
+      <canvas id="map"></canvas>
+      <div class="mapbar">
+        <label><input type="checkbox" id="l-trail" checked> след</label>
+        <label><input type="checkbox" id="l-path" checked> маршрут</label>
+        <label><input type="checkbox" id="l-cost" checked> что агент знает о грунте</label>
+        <label><input type="checkbox" id="l-truth"> показать истину</label>
+        <span class="coords" id="coords">—</span>
+      </div>
+      <div class="legend" id="legend"></div>
+    </div>
+  </section>
+
+  <aside class="side">
+    <section class="card battery">
+      <h2><span>Батарея</span><span id="retinfo" class="hint" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+      <div class="pad">
+        <div class="top"><span class="num" id="bat">—</span><span class="of">из 60</span></div>
+        <div class="bar"><i id="batbar" style="width:0"></i><s id="retmark" style="left:0;display:none" title="нужно на возврат"></s></div>
+        <div class="hint">жёлтая метка — сколько нужно на дорогу домой</div>
+      </div>
+      <div class="grid2">
+        <div class="stat"><span>образцы</span><b id="s-col">0/0</b></div>
+        <div class="stat"><span>счёт</span><b id="s-score">0</b></div>
+        <div class="stat"><span>путь, м</span><b id="s-dist">0</b></div>
+        <div class="stat"><span>столкновения</span><b id="s-coll">0</b></div>
+        <div class="stat"><span>ложные сборы</span><b id="s-false">0</b></div>
+        <div class="stat"><span>опасные зоны</span><b id="s-haz">0</b></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2><span>Сейчас</span><span id="navinfo" class="hint" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+      <div class="pad now">
+        <div class="big" id="now">ожидает команду</div>
+        <div class="hint" id="nowreason"></div>
+        <div class="flags" id="flags"></div>
+        <div><div class="hint" style="margin-bottom:2px">сигнал датчика образцов</div><canvas id="spark"></canvas></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2><span>Управление</span></h2>
+      <div class="pad btns">
+        <button class="primary" id="b-auto">▶ Автономно</button>
+        <button class="danger" id="b-stop">■ Стоп</button>
+        <button id="b-collect">Собрать здесь</button>
+        <button id="b-home">Вернуться на базу</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2><span class="tabs"><button class="sel" data-tab="journal">Журнал</button><button data-tab="events">События судьи</button></span><span class="hint" id="feedcount"></span></h2>
+      <div class="feed" id="feed"></div>
+    </section>
+  </aside>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let snap = null, truth = null, truthFor = null, tab = 'journal';
+const sensorHist = [];
+let lastStateT = null;
+
+const cv = $('map'), ctx = cv.getContext('2d');
+
+async function getJSON(url) { const r = await fetch(url, {cache: 'no-store'}); return r.json(); }
+async function post(url, body) {
+  const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const j = await r.json().catch(() => ({ok: false, error: 'ошибка ответа'}));
+  toast(j.ok ? 'отправлено' : 'отклонено: ' + (j.error || '?'), !j.ok);
+  return j;
+}
+let toastTimer;
+function toast(text, bad) {
+  const t = $('toast'); t.textContent = text; t.style.background = bad ? 'var(--danger)' : 'var(--text)';
+  t.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+}
+
+// ---- geometry ---------------------------------------------------------------------
+// The arena is vector geometry (floor polygon + circular pillars), so it stays
+// crisp at any size instead of showing the 5 cm cells of the occupancy grid.
+let geo = null, S = 1, cssW = 0, cssH = 0, dpr = 1, hover = null;
+const statCv = document.createElement('canvas'), heatCv = document.createElement('canvas');
+let heatVersion = null, heatBox = null, disp = null, lastTs = 0;
+const X = x => (x - geo.bounds.xmin) * S, Y = y => (geo.bounds.ymax - y) * S;
+const toWorld = (px, py) => [px / S + geo.bounds.xmin, geo.bounds.ymax - py / S];
+
+function layout() {
+  if (!geo) return;
+  const b = geo.bounds, w = cv.parentElement.clientWidth - 20;
+  dpr = window.devicePixelRatio || 1; S = w / (b.xmax - b.xmin); cssW = w; cssH = S * (b.ymax - b.ymin);
+  cv.style.height = cssH + 'px';
+  for (const c of [cv, statCv]) { c.width = Math.round(cssW * dpr); c.height = Math.round(cssH * dpr); }
+  heatVersion = null; drawStatic();
+}
+function floorPath(g) { g.beginPath(); geo.floor.forEach(([x, y], i) => i ? g.lineTo(X(x), Y(y)) : g.moveTo(X(x), Y(y))); g.closePath(); }
+function circle(g, x, y, r) { g.beginPath(); g.arc(X(x), Y(y), r * S, 0, 7); }
+
+function drawStatic() {                       // floor, walls, pillars, grid: redrawn only on resize / theme change
+  const g = statCv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, cssW, cssH);
+  g.lineJoin = 'round';
+  g.strokeStyle = css('--wall'); g.lineWidth = geo.wall * S * 2; floorPath(g); g.stroke();      // wall band (outer half shows)
+  floorPath(g); g.fillStyle = css('--floor'); g.fill();
+  g.save(); floorPath(g); g.clip();
+  const gr = g.createRadialGradient(cssW / 2, cssH / 2, S * .6, cssW / 2, cssH / 2, Math.max(cssW, cssH) * .62);
+  gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, css('--vignette'));
+  g.fillStyle = gr; g.fillRect(0, 0, cssW, cssH);
+  g.strokeStyle = css('--grid'); g.lineWidth = 1; g.beginPath();
+  const b = geo.bounds;
+  for (let x = Math.ceil(b.xmin); x <= b.xmax; x++) { g.moveTo(X(x), 0); g.lineTo(X(x), cssH); }
+  for (let y = Math.ceil(b.ymin); y <= b.ymax; y++) { g.moveTo(0, Y(y)); g.lineTo(cssW, Y(y)); }
+  g.stroke(); g.restore();
+  g.strokeStyle = css('--edge'); g.lineWidth = 1.5; floorPath(g); g.stroke();                   // glowing inner edge
+  for (const p of geo.pillars) {                                                                // pillars: shadow + shaded body
+    g.fillStyle = css('--shadow'); circle(g, p.x + .02, p.y - .035, p.r * 1.04); g.fill();
+    const pg = g.createRadialGradient(X(p.x) - p.r * S * .35, Y(p.y) - p.r * S * .4, 1, X(p.x), Y(p.y), p.r * S);
+    pg.addColorStop(0, css('--pillar-hi')); pg.addColorStop(1, css('--pillar'));
+    g.fillStyle = pg; circle(g, p.x, p.y, p.r); g.fill();
+    g.strokeStyle = 'rgba(255,255,255,.18)'; g.lineWidth = 1; g.stroke();
+  }
+  g.fillStyle = css('--muted'); g.font = '10px ui-monospace, Menlo, monospace'; g.textAlign = 'center';  // metre ticks
+  for (let x = Math.ceil(b.xmin + .4); x <= b.xmax - .4; x++) g.fillText(x, X(x), cssH - 5);
+  g.textAlign = 'left';
+  for (let y = Math.ceil(b.ymin + .4); y <= b.ymax - .4; y++) g.fillText(y, 5, Y(y) + 3);
+}
+
+function buildHeat() {                         // learned floor prices as a soft heat map
+  const runs = snap.costmap.runs, res = geo.resolution, b = geo.bounds;
+  const c0 = Math.floor((b.xmin - geo.origin[0]) / res), r0 = Math.floor((b.ymin - geo.origin[1]) / res);
+  const w = Math.ceil((b.xmax - b.xmin) / res), h = Math.ceil((b.ymax - b.ymin) / res);
+  heatCv.width = w; heatCv.height = h;
+  const g = heatCv.getContext('2d'), img = g.createImageData(w, h), rgb = css('--soil').split(',').map(Number);
+  for (const [row, a, z, v] of runs) {
+    if (v < 1.15) continue;                    // tiny deviations are noise to the eye, the planner still uses them
+    const alpha = Math.round(255 * (0.28 + 0.55 * Math.min(1, (v - 1) / 4))), y = h - 1 - (row - r0);
+    if (y < 0 || y >= h) continue;
+    for (let c = a; c <= z; c++) { const x = c - c0; if (x < 0 || x >= w) continue; const i = (y * w + x) * 4; img.data.set([rgb[0], rgb[1], rgb[2], alpha], i); }
+  }
+  g.putImageData(img, 0, 0);
+  heatBox = {x: geo.origin[0] + c0 * res, y: geo.origin[1] + (r0 + h) * res, w: w * res, h: h * res};
+  heatVersion = snap.costmap.version;
+}
+
+function chip(text, x, y, color) {
+  ctx.font = '600 11px system-ui'; const w = ctx.measureText(text).width + 10;
+  ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.beginPath(); ctx.roundRect(x - w / 2, y - 9, w, 18, 9); ctx.fill();
+  ctx.fillStyle = color; ctx.textAlign = 'center'; ctx.fillText(text, x, y + 4); ctx.textAlign = 'start';
+}
+function zoneShape(z) {
+  ctx.beginPath();
+  if (z.shape === 'circle') { ctx.arc(X(z.x), Y(z.y), z.radius * S, 0, 7); return [X(z.x), Y(z.y)]; }
+  ctx.roundRect(X(z.x_min), Y(z.y_max), (z.x_max - z.x_min) * S, (z.y_max - z.y_min) * S, 6);
+  return [X((z.x_min + z.x_max) / 2), Y((z.y_min + z.y_max) / 2)];
+}
+let hatch = null;
+function hatchPattern() {
+  if (hatch) return hatch; const c = document.createElement('canvas'); c.width = c.height = 8; const g = c.getContext('2d');
+  g.strokeStyle = css('--danger'); g.globalAlpha = .55; g.lineWidth = 1.5; g.beginPath(); g.moveTo(-2, 10); g.lineTo(10, -2); g.stroke();
+  return hatch = ctx.createPattern(c, 'repeat');
+}
+
+function drawFrame(ts) {
+  const t = ts / 1000;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, cssW, cssH);
+  ctx.drawImage(statCv, 0, 0, cssW, cssH);
+
+  if ($('l-cost').checked && snap && snap.costmap) {
+    if (heatVersion !== snap.costmap.version) buildHeat();
+    ctx.save(); floorPath(ctx); ctx.clip(); ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    try { ctx.filter = `blur(${Math.max(2, .035 * S)}px)`; } catch (e) {}
+    ctx.drawImage(heatCv, X(heatBox.x), Y(heatBox.y), heatBox.w * S, heatBox.h * S);
+    ctx.filter = 'none'; ctx.restore();
+  }
+
+  if ($('l-truth').checked && truth && truth.base) {                  // hidden truth (optional)
+    ctx.lineWidth = 1.6; ctx.setLineDash([6, 4]);
+    for (const z of truth.soil_zones || []) {
+      const c = zoneShape(z), col = `rgba(${css('--soil')},1)`;
+      ctx.fillStyle = `rgba(${css('--soil')},.10)`; ctx.fill(); ctx.strokeStyle = col; ctx.stroke(); chip('×' + z.cost_multiplier, c[0], c[1], col);
+    }
+    for (const z of truth.hazard_zones || []) { zoneShape(z); ctx.fillStyle = hatchPattern(); ctx.fill(); ctx.strokeStyle = css('--danger'); ctx.stroke(); }
+    ctx.setLineDash([]);
+    const done = (snap && snap.collected_at) || [];
+    for (const s of truth.samples || []) {
+      const got = done.some(p => Math.hypot(p[0] - s.x, p[1] - s.y) < .45), px = X(s.x), py = Y(s.y), r = .085 * S + 2;
+      ctx.beginPath(); ctx.moveTo(px, py - r); ctx.lineTo(px + r, py); ctx.lineTo(px, py + r); ctx.lineTo(px - r, py); ctx.closePath();
+      ctx.fillStyle = got ? 'rgba(125,140,160,.25)' : 'rgba(106,169,255,.28)'; ctx.fill();
+      ctx.strokeStyle = got ? css('--muted') : css('--info'); ctx.lineWidth = 2; ctx.stroke();
+    }
+  }
+
+  const b = (truth && truth.base) || {x: -2.0, y: -0.5}, bx = X(b.x), by = Y(b.y);   // base: the finish zone is 0.3 m
+  ctx.strokeStyle = css('--accent'); ctx.lineWidth = 1.5; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.arc(bx, by, .3 * S, 0, 7); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = css('--accent'); ctx.globalAlpha = .18; ctx.beginPath(); ctx.arc(bx, by, .3 * S, 0, 7); ctx.fill(); ctx.globalAlpha = 1;
+  ctx.font = '700 10px system-ui'; ctx.textAlign = 'center'; ctx.fillText('БАЗА', bx, by - .3 * S - 5); ctx.textAlign = 'start';
+
+  if ($('l-trail').checked && snap && snap.trail.length > 1) {         // trail fades with age
+    const pts = snap.trail, n = pts.length, parts = 6;
+    ctx.lineWidth = 2.4; ctx.lineJoin = ctx.lineCap = 'round'; ctx.strokeStyle = css('--trail');
+    for (let k = 0; k < parts; k++) {
+      const i0 = Math.floor(n * k / parts), i1 = Math.min(n - 1, Math.floor(n * (k + 1) / parts) + 1);
+      ctx.globalAlpha = .12 + .7 * (k + 1) / parts; ctx.beginPath();
+      for (let i = i0; i <= i1; i++) { const x = X(pts[i][0]), y = Y(pts[i][1]); i === i0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  const nav = snap && snap.state && snap.state.navigation;               // planned path, marching dashes
+  if ($('l-path').checked && nav && nav.waypoints && nav.waypoints.length && disp) {
+    ctx.strokeStyle = css('--path'); ctx.lineWidth = 2.4; ctx.setLineDash([7, 6]); ctx.lineDashOffset = -t * 18; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(X(disp.x), Y(disp.y)); nav.waypoints.forEach(([x, y]) => ctx.lineTo(X(x), Y(y))); ctx.stroke();
+    ctx.setLineDash([]); ctx.lineDashOffset = 0;
+    const g = nav.waypoints[nav.waypoints.length - 1], pulse = 1 + .25 * Math.sin(t * 5);
+    ctx.strokeStyle = css('--path'); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(X(g[0]), Y(g[1]), 7 * pulse, 0, 7); ctx.stroke();
+    ctx.fillStyle = css('--path'); ctx.beginPath(); ctx.arc(X(g[0]), Y(g[1]), 3, 0, 7); ctx.fill();
+  }
+
+  if (hover) {                                                          // where a click would send the robot
+    ctx.strokeStyle = css('--accent'); ctx.globalAlpha = .6; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(X(hover[0]), Y(hover[1]), .12 * S, 0, 7); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(X(hover[0]) - 5, Y(hover[1])); ctx.lineTo(X(hover[0]) + 5, Y(hover[1])); ctx.moveTo(X(hover[0]), Y(hover[1]) - 5); ctx.lineTo(X(hover[0]), Y(hover[1]) + 5); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+
+  if (disp) {                                                           // robot at its true size (radius 0.105 m)
+    const rx = X(disp.x), ry = Y(disp.y), R = Math.max(5, .105 * S);
+    const glow = ctx.createRadialGradient(rx, ry, R * .6, rx, ry, R * 3); glow.addColorStop(0, css('--edge')); glow.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(rx, ry, R * 3, 0, 7); ctx.fill();
+    ctx.save(); ctx.translate(rx, ry); ctx.rotate(-disp.yaw);
+    ctx.fillStyle = css('--shadow'); ctx.beginPath(); ctx.arc(1, 2, R, 0, 7); ctx.fill();
+    ctx.fillStyle = css('--robot'); ctx.beginPath(); ctx.arc(0, 0, R, 0, 7); ctx.fill();
+    ctx.fillStyle = css('--accent'); ctx.beginPath(); ctx.moveTo(R * 1.55, 0); ctx.lineTo(R * .35, R * .62); ctx.lineTo(R * .35, -R * .62); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = css('--floor'); ctx.beginPath(); ctx.arc(-R * .15, 0, R * .26, 0, 7); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function frame(ts) {                            // smooth the robot between the 4 Hz state updates
+  requestAnimationFrame(frame);
+  if (!geo) return;
+  const dt = Math.min(.1, (ts - lastTs) / 1000 || .016); lastTs = ts;
+  const p = snap && snap.pose;
+  if (p) {
+    if (!disp || Math.hypot(p.x - disp.x, p.y - disp.y) > 1.2) disp = {...p};
+    else {
+      const k = 1 - Math.exp(-dt / .07); let d = p.yaw - disp.yaw; d = Math.atan2(Math.sin(d), Math.cos(d));
+      disp.x += (p.x - disp.x) * k; disp.y += (p.y - disp.y) * k; disp.yaw += d * k;
+    }
+  }
+  drawFrame(ts);
+}
+const draw = () => {};                           // kept so older call sites stay harmless
+const fit = layout;
+
+// ---- panels -----------------------------------------------------------------------------
+const FLAGS = [['battery_deviation', 'расход вне прогноза'], ['penalties_burst', 'серия штрафов'], ['sensor_noise_up', 'шум датчика вырос']];
+function fmt(n, d = 1) { return n == null || Number.isNaN(n) ? '—' : Number(n).toFixed(d); }
+
+function update() {
+  const st = snap.state || {}, sc = snap.score || {}, status = snap.status || {};
+  $('scn').textContent = snap.scenario || '—';
+  const t = sc.t != null ? sc.t : st.t;
+  $('clock').textContent = t != null ? Math.round(t) + ' с' : '0 с';
+
+  const bat = sc.battery != null ? sc.battery : st.battery;
+  $('bat').textContent = fmt(bat);
+  const bar = $('batbar'); bar.style.width = Math.max(0, Math.min(100, (bat || 0) / 60 * 100)) + '%';
+  const ret = st.return_cost_estimate, need = ret != null ? ret * 1.3 + 4 : null;
+  bar.classList.toggle('low', need != null && bat != null && bat < need);
+  const m = $('retmark');
+  if (need != null) { m.style.display = ''; m.style.left = Math.min(100, need / 60 * 100) + '%'; $('retinfo').textContent = 'домой: ' + fmt(ret) + ' ед.'; }
+
+  $('s-col').textContent = (sc.collected ?? 0) + '/' + (sc.samples_total ?? 0);
+  $('s-score').textContent = fmt(sc.score ?? st.score, 0);
+  $('s-dist').textContent = fmt(sc.distance_travelled);
+  setStat('s-coll', sc.collisions); setStat('s-false', sc.false_collects); setStat('s-haz', sc.hazard_hits);
+
+  // run state
+  const stt = status.state || 'idle';
+  const running = stt === 'running';
+  $('rundot').className = 'dot' + (running ? ' run' : stt === 'failed' ? ' fail' : '');
+  $('runtxt').textContent = {running: 'выполняет', done: sc.finished ? 'завершил' : 'готов', failed: 'ошибка', preempted: 'прервано', idle: 'ожидание'}[stt] || stt;
+  $('now').textContent = status.subgoal || 'ожидает команду';
+  $('nowreason').textContent = status.reason ? 'причина: ' + status.reason : (status.data && status.data.collected != null && stt === 'done' ? '' : '');
+  const nav = st.navigation || {};
+  $('navinfo').textContent = nav.status ? 'навигация: ' + nav.status + (nav.replans ? ' · перепланирований ' + nav.replans : '') : '';
+
+  const an = st.anomaly || {};
+  $('flags').replaceChildren(...FLAGS.map(([k, label]) => {
+    const e = document.createElement('span'); e.className = 'chip' + (an[k] ? ' warn' : ''); e.textContent = label; return e;
+  }));
+
+  if (st.t != null && st.t !== lastStateT && st.sensor) { lastStateT = st.t; sensorHist.push(st.sensor.value); if (sensorHist.length > 120) sensorHist.shift(); drawSpark(); }
+  renderFeed();
+  renderLegend();
+}
+function setStat(id, v) { const e = $(id); e.textContent = v ?? 0; e.classList.toggle('bad', (v ?? 0) > 0); }
+
+function drawSpark() {
+  const c = $('spark'), dpr = window.devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+  c.width = w * dpr; c.height = h * dpr; const g = c.getContext('2d'); g.scale(dpr, dpr);
+  g.strokeStyle = css('--line'); g.beginPath(); g.moveTo(0, h - .5); g.lineTo(w, h - .5); g.stroke();
+  if (sensorHist.length < 2) return;
+  g.strokeStyle = css('--info'); g.lineWidth = 1.6; g.beginPath();
+  sensorHist.forEach((v, i) => { const x = i / (sensorHist.length - 1) * w, y = h - 3 - Math.min(1, v) * (h - 6); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+  g.stroke();
+}
+
+const KIND = {hypothesis: 'гипотеза', result: 'вывод', decision: 'решение', agent: 'агент'};
+function renderFeed() {
+  const feed = $('feed');
+  const items = tab === 'journal' ? (snap.journal || []) : (snap.events || []);
+  const stick = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 30;
+  if (!items.length) {
+    feed.innerHTML = '<div class="empty">' + (tab === 'journal' ? 'Записей пока нет. Здесь появятся гипотезы, выводы и решения агента.' : 'Штрафных событий и сборов пока нет.') + '</div>';
+    $('feedcount').textContent = ''; return;
+  }
+  feed.replaceChildren(...items.map(it => {
+    const row = document.createElement('div'); row.className = 'item';
+    const tm = document.createElement('time'); tm.textContent = it.t != null ? Math.round(it.t) + ' с' : '';
+    const body = document.createElement('div'), title = document.createElement('div'); title.className = 't';
+    if (tab === 'journal') {
+      const tag = document.createElement('span'); tag.className = 'tag ' + (it.kind || '') + ' ' + (it.status || ''); tag.textContent = (KIND[it.kind] || it.kind || '') + (it.status && it.status !== 'open' ? ' · ' + ({confirmed: 'подтверждена', rejected: 'отвергнута'}[it.status] || it.status) : '');
+      title.append(tag, it.title || '');
+      body.append(title);
+      if (it.text) { const x = document.createElement('div'); x.className = 'x'; x.textContent = it.text; body.append(x); }
+    } else {
+      title.textContent = ({collision: 'столкновение', false_collect: 'ложный сбор', hazard_hit: 'опасная зона', sample_collected: 'образец собран'}[it.event] || it.event);
+      body.append(title);
+      const rest = Object.entries(it).filter(([k]) => !['event', 't'].includes(k)).map(([k, v]) => k + ': ' + v).join(' · ');
+      if (rest) { const x = document.createElement('div'); x.className = 'x'; x.textContent = rest; body.append(x); }
+    }
+    row.append(tm, body); return row;
+  }));
+  $('feedcount').textContent = items.length;
+  if (stick) feed.scrollTop = feed.scrollHeight;
+}
+function renderLegend() {
+  $('legend').innerHTML = '<span><i style="background:var(--robot)"></i>робот</span><span><i style="background:var(--trail)"></i>след</span><span><i style="background:var(--path)"></i>маршрут</span><span><i style="background:rgba(var(--soil),.6)"></i>дорогой грунт (по оценке агента)</span>' + ($('l-truth').checked ? '<span><i style="background:var(--info)"></i>образец</span><span><i style="background:var(--danger)"></i>опасная зона</span>' : '');
+}
+
+// ---- interaction ---------------------------------------------------------------------------
+function worldAt(ev) {
+  const r = cv.getBoundingClientRect();
+  return toWorld((ev.clientX - r.left) / r.width * cssW, (ev.clientY - r.top) / r.height * cssH);
+}
+cv.addEventListener('mousemove', ev => { if (!geo) return; const [x, y] = worldAt(ev); hover = [x, y]; $('coords').textContent = `x ${x.toFixed(2)}  y ${y.toFixed(2)}`; });
+cv.addEventListener('mouseleave', () => { hover = null; $('coords').textContent = '—'; });
+cv.addEventListener('click', ev => {
+  if (!geo) return; const [x, y] = worldAt(ev);
+  post('/api/goto', {x: +x.toFixed(3), y: +y.toFixed(3), mode: ev.shiftKey ? 'search' : 'goto'});
+});
+$('b-auto').onclick = () => post('/api/command', {cmd: 'auto'});
+$('b-stop').onclick = () => post('/api/command', {cmd: 'stop'});
+$('b-collect').onclick = () => post('/api/plan', {plan_id: 'ui', subgoals: [{type: 'collect'}]});
+$('b-home').onclick = () => post('/api/plan', {plan_id: 'ui', subgoals: [{type: 'return_to_base'}]});
+document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
+  tab = b.dataset.tab; document.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('sel', x === b)); if (snap) renderFeed();
+});
+['l-trail', 'l-path', 'l-cost', 'l-truth'].forEach(id => $(id).onchange = () => renderLegend());
+window.addEventListener('resize', () => { layout(); drawSpark(); });
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { hatch = null; heatVersion = null; layout(); drawSpark(); });
+
+// ---- loop ------------------------------------------------------------------------------------------
+async function boot() {
+  geo = await getJSON('/api/geometry');
+  layout(); requestAnimationFrame(frame);
+}
+let busy = false;
+async function tick() {
+  if (busy) return; busy = true;
+  try {
+    snap = await getJSON('/api/state');
+    $('conn').textContent = 'связь есть'; $('conn').className = 'chip on';
+    if (snap.scenario && truthFor !== snap.scenario) { truthFor = snap.scenario; truth = await getJSON('/api/truth'); }
+    if (geo) update();
+  } catch (e) { $('conn').textContent = 'нет связи'; $('conn').className = 'chip warn'; }
+  busy = false;
+}
+boot().then(() => { tick(); setInterval(tick, 150); });
+</script>
+</body>
+</html>

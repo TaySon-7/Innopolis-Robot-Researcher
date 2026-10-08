@@ -11,13 +11,18 @@ services:
       ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-30}"
       RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
       TURTLEBOT3_MODEL: burger
+    ports:
+      - "127.0.0.1:8080:8080"
     command:
       - ros2
       - launch
-      - did_judge
-      - level0.launch.py
+      - did_agent
+      - demo.launch.py
+      - scenario:=${SCENARIO:-easy}
+      - scenario_file:=${SCENARIO_FILE:-none}
     volumes:
       - gz-cache:/root/.gz
+      - ./scenarios_custom:/scenarios_custom
     stop_grace_period: 15s
 
 volumes:

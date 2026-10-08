@@ -5,7 +5,7 @@ from setuptools import find_packages
 from setuptools import setup
 
 
-package_name = 'did_judge'
+package_name = 'did_agent'
 
 
 setup(
@@ -18,21 +18,26 @@ setup(
             ['resource/' + package_name],
         ),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'maps'), glob('maps/*')),
+        (os.path.join('share', package_name, 'web'), glob('web/*')),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
-        (os.path.join('share', package_name, 'scenarios'), glob('scenarios/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='DID team',
     maintainer_email='team@example.com',
-    description='Judge, scenarios and smoke checks for Robot Researcher.',
+    description='Navigation, skills and executor of the Robot Researcher agent.',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'judge = did_judge.judge_node:main',
-            'level0_check = did_judge.level0_check:main',
+            'goto = did_agent.nav_node:main',
+            'agent = did_agent.agent_node:main',
+            'auto = did_agent.agent_node:main_auto',
+            'send_plan = did_agent.agent_node:main_send_plan',
+            'command = did_agent.agent_node:main_command',
+            'dashboard = did_agent.dashboard_node:main',
+            'generate_scenario = did_agent.scenario_generator:main',
         ],
     },
 )
-

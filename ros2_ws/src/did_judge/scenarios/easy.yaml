@@ -1,0 +1,17 @@
+name: easy
+seed: 2026
+base: {x: -2.0, y: -0.5}
+battery: {initial: 60.0, cost_per_meter: 1.0}
+collection_radius: 0.30
+sensor: {range: 1.5, noise_stddev: 0.01}
+
+samples:
+  - {id: s1, x: -0.55, y: -0.55}
+  - {id: s2, x: 0.55, y: 0.55}
+  - {id: s3, x: 1.70, y: -0.50}
+
+soil_zones:
+  - {id: z1, shape: circle, x: 0.50, y: -0.60, radius: 0.45, cost_multiplier: 2.5}
+
+hazard_zones: []
+events: []
