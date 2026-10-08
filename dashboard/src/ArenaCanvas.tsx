@@ -9,6 +9,7 @@ import type {
   ScenarioZone,
 } from './agentApi'
 import type { LaserScan, Pose2D, SampleState } from './rosbridge'
+import { projectLidarHit } from './lidarSync'
 
 export type MapMode = 'truth' | 'knowledge' | 'planner'
 export type PlannerLayer = 'terrain' | 'wall_cost' | 'total'
@@ -539,9 +540,13 @@ export function ArenaCanvas({
           if (!Number.isFinite(range) || range < scan.rangeMin || range > scan.rangeMax) {
             return []
           }
-          const angle = scan.origin.yaw + scan.angleMin + index * scan.angleIncrement
-          const worldX = scan.origin.x + range * Math.cos(angle)
-          const worldY = scan.origin.y + range * Math.sin(angle)
+          const world = projectLidarHit(
+            scan.origin,
+            scan.angleMin + index * scan.angleIncrement,
+            range,
+          )
+          const worldX = world.x
+          const worldY = world.y
           const [x, y] = screen(worldX, worldY)
           return [{ index, range, worldX, worldY, x, y }]
         })

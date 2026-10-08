@@ -19,16 +19,18 @@ from did_llm.agent_plan import (
     SIGNAL_NEAR,
     Plan,
     PlanRejected,
+    SIGNAL_COLLECTABLE,
     Subgoal,
     check_plan,
     home_plan,
     must_return,
     parse_model_plan,
+    plan_response_format,
     spendable_budget,
 )
 from did_llm.llm_client import LLMClient, LLMUnavailable
 from did_llm.prompts import (
-    PLANNER_SYSTEM,
+    build_planner_system,
     build_planner_prompt,
 )
 
@@ -130,6 +132,8 @@ class Planner:
         self.link = link
         self.client = client
         self.cfg = config or PlannerConfig()
+        self.system_prompt = build_planner_system(self.cfg.max_subgoals)
+        self.response_format = plan_response_format(self.cfg.max_subgoals)
 
         self.plan_counter = 0
         self.inflight: str | None = None
@@ -216,13 +220,16 @@ class Planner:
             self._go_autonomous('API не настроен')
             return
 
-        if self._interrupt_for_sample():
-            return
-
         if self._handle_event():
             return
 
         if self._stop_on_anomaly():
+            return
+
+        if self._collect_when_close():
+            return
+
+        if self._interrupt_for_sample():
             return
 
         if must_return(self.link.battery(), self.link.return_cost()):
@@ -285,8 +292,9 @@ class Planner:
 
         def work() -> None:
             try:
-                answer = self.client.complete_json(PLANNER_SYSTEM, prompt,
-                                                   tag='plan')
+                answer = self.client.complete_json(self.system_prompt, prompt,
+                                                   tag='plan',
+                                                   response_format=self.response_format)
                 self.pending = ('plan', answer, prompt, budget)
             except LLMUnavailable as error:
                 self.pending = ('error', error, prompt, budget)
@@ -320,10 +328,13 @@ class Planner:
                        budget: dict[str, float]) -> None:
         for attempt in range(self.cfg.repair_attempts + 1):
             try:
-                plan = parse_model_plan(answer, self._next_id())
+                plan = parse_model_plan(
+                    answer, self._next_id(),
+                    max_subgoals=self.cfg.max_subgoals,
+                )
                 problems = check_plan(
                     plan, self.link.expensive_ground(),
-                    min_battery=budget.get('floor'),
+                    min_battery=budget.get('search_budget'),
                     samples_remaining=self.link.remaining_samples(),
                     signal_high=self.link.signal(),
                     sensor_noise=self.link.noise(),
@@ -357,10 +368,11 @@ class Planner:
                     return
                 try:
                     answer = self.client.complete_json(
-                        PLANNER_SYSTEM,
+                        self.system_prompt,
                         f'{prompt}\n\nТвой прошлый ответ отклонён: {reason}\n'
                         'Исправь и верни полный JSON заново.',
                         tag='repair',
+                        response_format=self.response_format,
                     )
                 except LLMUnavailable as error:
                     if error.reason == 'rate_limited':
@@ -446,18 +458,37 @@ class Planner:
         A successful collection is news but not an emergency — it does not
         stop the robot, it just clears the way for the next plan.
         """
+        collected_seen = False
         while True:
             event = self.link.take_event()
             if event is None:
-                return False
+                # Give /agent/state one publishing tick to replace the sensor
+                # value that still belonged to the sample just collected.
+                return collected_seen
             name = str(event.get('event') or '')
             if name == 'sample_collected':
                 collected = event.get('collected')
                 if isinstance(collected, (int, float)):
                     self.link.note_collected(int(collected))
+                state = self.link.state or {}
+                total = state.get('samples_total')
+                progress = ''
+                if isinstance(collected, (int, float)):
+                    progress = f'Собрано образцов: {int(collected)}'
+                    if isinstance(total, (int, float)):
+                        progress += f'/{int(total)}'
+                    progress += '. '
+                self.link.journal(
+                    'llm',
+                    'Получено новое состояние, готовится следующий план',
+                    progress + 'Датчик теперь указывает на ближайший '
+                    'оставшийся образец.',
+                    source='llm_planner',
+                )
                 self.feedback = ('образец собран, ищи следующий: '
                                  'сейчас датчик снова указывает на ближайший')
                 self.force_replan = True
+                collected_seen = True
                 continue
             if name in STOP_EVENTS:
                 self.stop_and_replan(name)
@@ -528,9 +559,10 @@ class Planner:
         pose = self.link.pose()
         if pose is None:
             return False
-        # Already searching where it stands: let it finish.
-        if (subgoal.type == 'search_around'
-                and hypot(subgoal.x - pose[0], subgoal.y - pose[1]) < 0.6):
+        # ``search_around`` is already measuring and following the gradient.
+        # Replacing it whenever the signal rises restarts the skill mid-sweep
+        # and makes the robot appear to circle forever instead of converging.
+        if subgoal.type == 'search_around':
             return False
         # A live signal persists while the robot circles the sample, so without
         # a pause the interrupt would fire every tick and the robot would spin
@@ -555,24 +587,71 @@ class Planner:
         self._publish(plan, source='signal')
         return True
 
+    def _collect_when_close(self) -> bool:
+        """Search locally and collect without asking the model at >= 0.80.
+
+        A single live reading is not sufficient proof because the signal is
+        noisy.  ``search_around`` takes a robust batch of readings and only
+        reports success at the same 0.80 boundary; the following ``collect``
+        lets the judge make the final ground-truth distance check.
+        """
+        signal = self.link.signal()
+        if signal is None or signal < SIGNAL_COLLECTABLE:
+            return False
+        noise = self.link.noise()
+        if noise is not None and noise >= NOISE_UNTRUSTWORTHY:
+            return False
+
+        current = self._current_subgoal()
+        if self.inflight is not None:
+            # Do not replace a plan before its first status arrives, and do not
+            # interrupt the exact search/collect sequence already doing this.
+            if current is None or current.type in ('search_around', 'collect'):
+                return False
+
+        pose = self.link.pose()
+        if pose is None:
+            return False
+        if self.link.now() - self.last_interrupt_at < self.cfg.interrupt_pause_sec:
+            return False
+
+        radius = max(0.15, min(0.4, 1.6 * (1.0 - signal)))
+        plan = Plan(
+            plan_id=self._next_id(),
+            subgoals=[
+                Subgoal(type='search_around', x=round(pose[0], 2),
+                        y=round(pose[1], 2), radius=round(radius, 2)),
+                Subgoal(type='collect'),
+            ],
+            explanation=(f'сигнал {signal:.2f} соответствует зоне сбора: '
+                         'проверяю максимум на месте и собираю автоматически'),
+        )
+        self.link.log.info(
+            f'сигнал {signal:.2f} >= {SIGNAL_COLLECTABLE:.2f}: '
+            'локальная проверка и автоматический сбор'
+        )
+        self.last_interrupt_at = self.link.now()
+        self._publish(plan, source='auto_collect')
+        return True
+
     def _current_subgoal(self) -> Subgoal | None:
         """The subgoal the executor is on, taken from the plan we sent."""
         status = self.link.status
         if not status or status.get('plan_id') != self.inflight:
             return None
-        index = int(status.get('index') or 0) - 1
+        index = int(status.get('index') or 0)
         for sent in self.sent_subgoals:
             if sent[0] == self.inflight and sent[1] == index:
                 return sent[2]
         return None
 
     def _budget(self) -> dict[str, float]:
-        """What may be spent away from the base, and the floor below it."""
+        """What may be spent on new work after reserving the trip home."""
         battery = self.link.battery()
         return_cost = self.link.return_cost()
         spendable = spendable_budget(battery, return_cost)
         return {
-            'floor': round(spendable, 1),
+            'search_budget': round(spendable, 1),
             'cost_to_come_back': round(max(0.0, return_cost or 0.0), 2),
             'battery': round(battery, 1),
         }
@@ -596,7 +675,10 @@ class Planner:
             self.link.status, 'сеть отвечает снова, продолжим планирование',
         )
         try:
-            self.client.complete_json(PLANNER_SYSTEM, prompt, tag='probe')
+            self.client.complete_json(
+                self.system_prompt, prompt, tag='probe',
+                response_format=self.response_format,
+            )
         except LLMUnavailable as error:
             if error.reason == 'rate_limited':
                 return
@@ -642,7 +724,9 @@ class Planner:
         self.link.log.warn(f'передача в автономный режим: {why}')
 
     def _publish(self, plan: Plan, *, source: str) -> None:
-        self.link.publish_plan(plan.to_wire())
+        payload = plan.to_wire()
+        payload['source'] = source
+        self.link.publish_plan(payload)
         self.inflight = plan.plan_id
         self.last_plan_at = self.link.now()
         self.force_replan = False

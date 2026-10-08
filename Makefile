@@ -132,8 +132,8 @@ check:
 
 test:
 	docker compose run --rm --no-deps sim bash -lc \
-		"cd /opt/did_ws/src && python3 -m pytest -q did_judge/test did_agent/test"
+		"cd /opt/did_ws/src && python3 -m pytest -q did_judge/test did_agent/test did_llm/test"
 
 # The same tests on a host with Python, numpy, pyyaml and pytest.
 test-fast:
-	cd ros2_ws/src && python3 -m pytest -q did_judge/test did_agent/test
+	cd ros2_ws/src && python3 -m pytest -q did_judge/test did_agent/test did_llm/test

@@ -96,6 +96,14 @@ class AutonomousAgent:
             if not self.skills.battery_allows_more():
                 self.log('Запас батареи на пределе, еду домой')
                 break
+        if self.robot.preempted():
+            return {
+                'collected': self.robot.collected(),
+                'samples_total': self.robot.samples_total(),
+                'battery': round(self.robot.battery(), 2),
+                'returned_to_base': False,
+                'reason': 'preempted',
+            }
         returned = self.skills.return_to_base()
         return {
             'collected': self.robot.collected(),

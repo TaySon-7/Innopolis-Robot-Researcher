@@ -63,6 +63,16 @@ def generate_launch_description():
             'llm', default_value='false',
             description='Start the LLM planner alongside the agent.'),
         OpaqueFunction(function=_simulation),
+        Node(
+            package='ros_gz_bridge',
+            executable='parameter_bridge',
+            name='gazebo_restart_bridge',
+            output='screen',
+            arguments=[
+                '/world/default/remove/blocking@ros_gz_interfaces/srv/DeleteEntity',
+                '/world/default/create/blocking@ros_gz_interfaces/srv/SpawnEntity',
+            ],
+        ),
         Node(package='did_agent', executable='agent', name='agent', output='screen'),
         Node(package='did_agent', executable='dashboard', name='dashboard', output='screen'),
         Node(

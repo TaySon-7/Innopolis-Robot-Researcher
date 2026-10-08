@@ -34,6 +34,13 @@ class PlanExecutor:
     def _status(self, plan: Plan, index: int, state: str, reason: str = '',
                 data: dict[str, Any] | None = None) -> dict[str, Any]:
         subgoal = plan.subgoals[index] if index < len(plan.subgoals) else None
+        details: dict[str, Any] = {}
+        if subgoal is not None and subgoal.type in ('goto', 'search_around'):
+            details['target'] = {'x': subgoal.x, 'y': subgoal.y}
+            if subgoal.type == 'search_around':
+                details['target']['radius'] = subgoal.radius
+        if data:
+            details.update(data)
         status = {
             'plan_id': plan.plan_id,
             'index': index,
@@ -41,7 +48,7 @@ class PlanExecutor:
             'subgoal': subgoal.describe() if subgoal else '',
             'state': state,
             'reason': reason,
-            'data': data or {},
+            'data': details,
         }
         self.publish_status(status)
         return status

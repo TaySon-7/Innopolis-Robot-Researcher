@@ -75,7 +75,16 @@ class Skills:
             'x': round(found.x, 3),
             'y': round(found.y, 3),
             'readings': len(found.trace),
+            'trace': [
+                {'x': round(tx, 3), 'y': round(ty, 3), 'signal': round(signal, 3)}
+                for tx, ty, signal in found.trace
+            ],
         }
+        if found.gradient is not None:
+            data['gradient'] = {
+                'dx': round(found.gradient[0], 3),
+                'dy': round(found.gradient[1], 3),
+            }
         if found.found:
             return SkillResult(True, data=data)
         return SkillResult(False, found.reason or 'sample not found', data)

@@ -174,6 +174,7 @@ class LLMClient:
     # ------------------------------------------------------------------ public
     def complete_json(self, system: str, user: str, *, tag: str = 'generic',
                       max_retries: Optional[int] = None,
+                      response_format: Dict[str, Any] | None = None,
                       ) -> Dict[str, Any]:
         """Return a parsed JSON object, or raise :class:`LLMUnavailable`.
 
@@ -184,7 +185,7 @@ class LLMClient:
             raise LLMUnavailable('LLM is not configured: base_url, api_key and model are required')
 
         retries = self.cfg.max_retries if max_retries is None else max_retries
-        key = _cache_key(system, user, tag)
+        key = _cache_key(system, user, tag, response_format)
 
         cached = self._cache.get(key)
         if cached and self.cfg.cache_enabled:
@@ -208,10 +209,14 @@ class LLMClient:
                 raise LLMUnavailable(detail, reason=reason)
             try:
                 self._budget.record()
-                raw = self._post(system, user)
+                raw = self._post(system, user, response_format=response_format)
                 data = extract_json(raw)
             except urllib.error.HTTPError as error:
-                last_error = f'HTTP {error.code}'
+                try:
+                    detail = error.read().decode('utf-8', errors='replace')[:500]
+                except Exception:  # noqa: BLE001 - diagnostic only
+                    detail = ''
+                last_error = f'HTTP {error.code}' + (f': {detail}' if detail else '')
                 if error.code not in _RETRYABLE_STATUS:
                     break
             except (urllib.error.URLError, TimeoutError, OSError) as error:
@@ -280,7 +285,8 @@ class LLMClient:
                 time.sleep(pause * (attempt + 1))
         raise OSError(f'DNS не ответил для {host}: {last}')
 
-    def _post(self, system: str, user: str) -> str:
+    def _post(self, system: str, user: str,
+              response_format: Dict[str, Any] | None = None) -> str:
         url_host = urllib.parse.urlsplit(self.cfg.base_url).hostname or ''
         if url_host:
             self._resolve(url_host)
@@ -295,6 +301,8 @@ class LLMClient:
         }
         if self.cfg.reasoning_effort:
             payload['reasoning_effort'] = self.cfg.reasoning_effort
+        if response_format is not None:
+            payload['response_format'] = response_format
         request = urllib.request.Request(
             url,
             data=json.dumps(payload).encode('utf-8'),
@@ -320,13 +328,18 @@ class LLMClient:
         return content
 
 
-def _cache_key(system: str, user: str, tag: str) -> str:
+def _cache_key(system: str, user: str, tag: str,
+               response_format: Dict[str, Any] | None = None) -> str:
     digest = hashlib.sha256()
     digest.update(tag.encode('utf-8'))
     digest.update(b'\x00')
     digest.update(system.encode('utf-8'))
     digest.update(b'\x00')
     digest.update(user.encode('utf-8'))
+    if response_format is not None:
+        digest.update(b'\x00')
+        digest.update(json.dumps(response_format, sort_keys=True,
+                                 separators=(',', ':')).encode('utf-8'))
     return digest.hexdigest()
 
 

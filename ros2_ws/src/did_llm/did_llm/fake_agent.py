@@ -244,6 +244,7 @@ class FakeAgent(Node):
         # flag lives in the judge's /did/score, not here.
         state = {
             't': 0.0,
+            'scenario': 'easy',
             'pose': {key: round(value, 3)
                      for key, value in self.pose.items()},
             'battery': round(self.battery, 3),
@@ -263,7 +264,7 @@ class FakeAgent(Node):
 
         # The judge's score topic, which is where "finished" is published.
         self.score_pub.publish(String(data=json.dumps({
-            'scenario': 'fake',
+            'scenario': 'easy',
             'battery': round(self.battery, 3),
             'collected': self.collected,
             'samples_total': len(SAMPLES),

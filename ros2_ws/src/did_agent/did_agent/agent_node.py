@@ -27,11 +27,14 @@ from did_agent.navigator_core import NavigatorCore
 from did_agent.plan import Plan
 from did_agent.plan import PlanError
 from did_agent.plan import parse_plan
+from did_agent.planner import plan_waypoints
 from did_agent.robot import NavResult
 from did_agent.robot import Reading
+from did_agent.search import SAMPLE_SENSOR_RANGE
 from did_agent.skills import Skills
 
 INITIAL_BATTERY = 60.0
+MAX_JOURNAL_READINGS = 12
 
 
 class AgentNode(Navigator):
@@ -284,6 +287,157 @@ class AgentNode(Navigator):
                  'text': text, 'status': status}
         self._journal_pub.publish(String(data=json.dumps(entry, ensure_ascii=False)))
 
+    def _target(self, status: dict[str, Any]) -> dict[str, float] | None:
+        """Return the structured target attached by the plan executor."""
+        data = status.get('data')
+        target = data.get('target') if isinstance(data, dict) else None
+        if not isinstance(target, dict):
+            return None
+        x, y = target.get('x'), target.get('y')
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return None
+        result = {'x': float(x), 'y': float(y)}
+        radius = target.get('radius')
+        if isinstance(radius, (int, float)):
+            result['radius'] = float(radius)
+        return result
+
+    def _route_text(self, target: dict[str, float]) -> str:
+        """Describe the real route the navigator is about to execute."""
+        pose = self.pose()
+        if pose is None:
+            return f'цель ({target["x"]:.2f}; {target["y"]:.2f})'
+        route = plan_waypoints(
+            self.costmap, (pose.x, pose.y), (target['x'], target['y'])
+        )
+        if route is None:
+            return f'к цели ({target["x"]:.2f}; {target["y"]:.2f}) нет пути'
+        path = [(pose.x, pose.y), *route]
+        cost = self.costmap.energy_cost(
+            path, pessimism=self.skills.pessimism, now=self.now()
+        )
+        return (
+            f'цель ({target["x"]:.2f}; {target["y"]:.2f}) · '
+            f'{len(route)} точек · длина {self.costmap.path_length(path):.2f} м · '
+            f'оценка стоимости {cost:.2f}'
+        )
+
+    def _search_text(self, status: dict[str, Any]) -> str:
+        """Format the measurements that led the local search to its maximum."""
+        data = status.get('data')
+        if not isinstance(data, dict):
+            return str(status.get('reason') or '')
+        trace = data.get('trace')
+        indexed = list(enumerate(trace, 1)) if isinstance(trace, list) else []
+        if len(indexed) > MAX_JOURNAL_READINGS:
+            half = MAX_JOURNAL_READINGS // 2
+            shown: list[tuple[int, Any] | None] = [
+                *indexed[:half], None, *indexed[-half:],
+            ]
+        else:
+            shown = list(indexed)
+
+        lines: list[str] = []
+        for item in shown:
+            if item is None:
+                lines.append(
+                    f'… пропущено {len(indexed) - MAX_JOURNAL_READINGS} '
+                    'промежуточных замеров'
+                )
+                continue
+            index, reading = item
+            if not isinstance(reading, dict):
+                continue
+            x, y, signal = reading.get('x'), reading.get('y'), reading.get('signal')
+            if all(isinstance(value, (int, float)) for value in (x, y, signal)):
+                lines.append(
+                    f'Замер {index}: x={float(x):.2f} y={float(y):.2f} '
+                    f'signal={float(signal):.3f}'
+                )
+
+        gradient = data.get('gradient')
+        if isinstance(gradient, dict) and isinstance(gradient.get('dx'), (int, float)) \
+                and isinstance(gradient.get('dy'), (int, float)):
+            lines.append(
+                f'Градиент: dx={float(gradient["dx"]):.3f} '
+                f'dy={float(gradient["dy"]):.3f}'
+            )
+        elif indexed:
+            lines.append('Градиент: недостаточно пространственных замеров')
+
+        peak, x, y = data.get('peak'), data.get('x'), data.get('y')
+        if all(isinstance(value, (int, float)) for value in (peak, x, y)):
+            distance = SAMPLE_SENSOR_RANGE * max(0.0, 1.0 - float(peak))
+            lines.append(
+                f'Максимум: signal={float(peak):.3f}, '
+                f'x={float(x):.2f} y={float(y):.2f}, '
+                f'оценка дистанции {distance:.2f} м'
+            )
+        reason = str(status.get('reason') or '')
+        if reason:
+            lines.append(f'Результат: {reason}')
+        return '\n'.join(lines)
+
+    def _journal_execution(self, status: dict[str, Any]) -> None:
+        """Turn executor transitions into a readable, source-labelled log."""
+        kind = str(status.get('type') or '')
+        state = str(status.get('state') or '')
+        data = status.get('data') if isinstance(status.get('data'), dict) else {}
+        target = self._target(status)
+
+        if kind == 'goto':
+            if state == 'running' and target:
+                self.journal('robot', 'Маршрут построен', self._route_text(target))
+            elif state == 'done':
+                pose = self.pose()
+                where = '' if pose is None else f'({pose.x:.2f}; {pose.y:.2f})'
+                self.journal(
+                    'robot', 'Цель достигнута',
+                    f'позиция {where} · перепланирований {data.get("replans", 0)}'.strip(),
+                )
+            elif state in ('failed', 'preempted'):
+                self.journal('robot', 'Маршрут не завершён',
+                             str(status.get('reason') or state), 'rejected')
+            return
+
+        if kind == 'search_around':
+            if state == 'running' and target:
+                self.journal(
+                    'search', 'Локальный поиск начат',
+                    f'центр ({target["x"]:.2f}; {target["y"]:.2f}) · '
+                    f'радиус {target.get("radius", 0.0):.2f} м',
+                )
+            elif state in ('done', 'failed', 'preempted'):
+                self.journal(
+                    'search',
+                    'Локальный поиск завершён' if state == 'done'
+                    else 'Локальный поиск не завершён',
+                    self._search_text(status),
+                    'open' if state == 'done' else 'rejected',
+                )
+            return
+
+        if kind == 'collect' and state in ('done', 'failed'):
+            if state == 'done':
+                collected = data.get('collected', self.collected())
+                self.journal(
+                    'collect', f'Образец собран: {collected}/{self.samples_total()}',
+                    'Команда collect принята судьёй.',
+                )
+            else:
+                self.journal('collect', 'Сбор не выполнен',
+                             str(status.get('reason') or ''), 'rejected')
+            return
+
+        if kind == 'return_to_base':
+            if state == 'running':
+                self.journal('robot', 'Возвращаюсь на базу')
+            elif state == 'done':
+                self.journal('robot', 'Робот на базе', status='confirmed')
+            elif state in ('failed', 'preempted'):
+                self.journal('robot', 'Возврат не завершён',
+                             str(status.get('reason') or state), 'rejected')
+
     def _publish_costmap(self) -> None:
         signature = (self.costmap.version, self.adaptation.learner.observations)
         if signature == self._published_cost_signature:
@@ -295,6 +449,7 @@ class AgentNode(Navigator):
 
     def _publish_status(self, status: dict[str, Any]) -> None:
         self._current = status
+        self._journal_execution(status)
         self._status_pub.publish(String(data=json.dumps(status)))
 
     def _publish_state(self) -> None:
@@ -308,6 +463,7 @@ class AgentNode(Navigator):
             return_cost = float('nan')
         state = {
             't': round(t, 2),
+            'scenario': self._score.get('scenario'),
             'pose': {'x': round(pose.x, 3), 'y': round(pose.y, 3), 'yaw': round(pose.yaw, 3)},
             'battery': round(self._battery, 3),
             'collected': self.collected(),
@@ -364,13 +520,19 @@ class AgentNode(Navigator):
         summary = self.run_autonomous()
         state = 'preempted' if self._preempt else (
             'done' if summary['returned_to_base'] else 'failed')
+        if self._preempt:
+            self.journal('result', 'Автономный режим остановлен',
+                         'Текущий маршрут прерван до возврата и финиша.', 'rejected')
+        else:
+            self.journal('result', 'Эпизод завершён',
+                         f"Собрано {summary['collected']} из {summary['samples_total']}, "
+                         f"батарея {summary['battery']}, "
+                         f"{'на базе' if summary['returned_to_base'] else 'не вернулся на базу'}",
+                         'confirmed' if summary['returned_to_base'] else 'rejected')
+        # Publish the final status last: scenario reset waits on it as the
+        # barrier proving that no old-run journal or finish call remains.
         self._publish_status({**status, 'state': state,
                               'reason': summary.get('reason', ''), 'data': summary})
-        self.journal('result', 'Эпизод завершён',
-                     f"Собрано {summary['collected']} из {summary['samples_total']}, "
-                     f"батарея {summary['battery']}, "
-                     f"{'на базе' if summary['returned_to_base'] else 'не вернулся на базу'}",
-                     'confirmed' if summary['returned_to_base'] else 'rejected')
 
     def run_autonomous(self) -> dict[str, Any]:
         """Run the fallback planner without an LLM and return its summary."""

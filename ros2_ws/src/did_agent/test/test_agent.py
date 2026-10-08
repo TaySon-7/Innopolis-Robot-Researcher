@@ -7,6 +7,7 @@ from did_agent.autonomous import AutonomousAgent
 from did_agent.bench import run_scenario
 from did_agent.executor import PlanExecutor
 from did_agent.plan import parse_plan
+from did_agent.search import COLLECTION_SIGNAL_THRESHOLD
 from did_agent.search import SampleSearch
 from did_agent.sim_robot import SimRobot
 from did_agent.skills import Skills
@@ -38,6 +39,21 @@ def test_search_reports_silence_when_nothing_is_near():
     assert result.reason == 'no signal'
 
 
+def test_search_does_not_accept_the_old_point_seven_collection_boundary():
+    robot = robot_for()
+    Skills(robot).goto(-0.82, -0.55)
+    pose = robot.pose()
+
+    # Stop refinement to isolate the success threshold.  At roughly 0.4 m
+    # from s1 the old 0.70 threshold said "found", although the judge only
+    # accepts collection inside 0.30 m (signal 0.80 in the noiseless model).
+    result = SampleSearch(robot, max_refine=0).run(pose.x, pose.y, 0.1)
+
+    assert COLLECTION_SIGNAL_THRESHOLD == pytest.approx(0.80)
+    assert 0.70 < result.peak < COLLECTION_SIGNAL_THRESHOLD
+    assert not result.found
+
+
 def test_executor_runs_a_plan_end_to_end():
     robot = robot_for()
     statuses = []
@@ -55,6 +71,16 @@ def test_executor_runs_a_plan_end_to_end():
     assert robot.judge.finished
     assert [s['state'] for s in statuses if s['index'] == 2] == ['running', 'done']
     assert all(s['plan_id'] == 't1' for s in statuses)
+    goto_running = next(s for s in statuses
+                        if s['index'] == 0 and s['state'] == 'running')
+    search_done = next(s for s in statuses
+                       if s['index'] == 1 and s['state'] == 'done')
+    assert goto_running['data']['target'] == {'x': -1.5, 'y': -1.0}
+    assert search_done['data']['trace']
+    assert search_done['data']['gradient']
+    assert search_done['data']['target'] == {
+        'x': -1.5, 'y': -1.0, 'radius': 0.5,
+    }
 
 
 def test_executor_stops_at_the_first_failure_and_explains():
@@ -103,6 +129,15 @@ def test_agent_never_strands_itself_with_a_tiny_battery():
     summary = AutonomousAgent(robot).run()
     assert summary['returned_to_base']
     assert robot.battery() > 0.0
+
+
+def test_preempted_autonomous_run_does_not_return_or_finish():
+    robot = robot_for()
+    robot.on_tick = lambda current: setattr(current, 'preempt', current.now() > 0.5)
+    summary = AutonomousAgent(robot).run()
+    assert summary['reason'] == 'preempted'
+    assert not summary['returned_to_base']
+    assert not robot.judge.finished
 
 
 @pytest.mark.parametrize(

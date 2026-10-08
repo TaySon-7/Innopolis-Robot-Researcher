@@ -81,6 +81,7 @@ export interface AgentPlanSubgoal {
 
 export interface AgentPlan {
   plan_id?: string
+  source?: 'llm' | 'signal' | 'auto_collect' | 'budget' | string
   explanation?: string
   subgoals?: AgentPlanSubgoal[]
 }

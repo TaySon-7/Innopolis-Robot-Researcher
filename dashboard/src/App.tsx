@@ -41,12 +41,12 @@ function fixed(value: number | null, digits: number, suffix = ''): string {
   return value === null ? '—' : `${value.toFixed(digits)}${suffix}`
 }
 
-function formatSimTime(seconds: number | null): string {
-  if (seconds === null) return 'SIM --:--:--.---'
+function formatRunTime(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined) return 'RUN --:--:--.---'
   const hours = Math.floor(seconds / 3600)
   const minutes = Math.floor((seconds % 3600) / 60)
   const remaining = seconds % 60
-  return `SIM ${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${remaining.toFixed(3).padStart(6, '0')}`
+  return `RUN ${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${remaining.toFixed(3).padStart(6, '0')}`
 }
 
 function App() {
@@ -278,6 +278,22 @@ function App() {
     }
   }
 
+  const restartScenario = async () => {
+    const activeScenario = agentSnapshot.scenario
+    if (!activeScenario || scenarioBusy) return
+    stop()
+    setScenarioBusy(true)
+    setNotice(`Перезапускаю Gazebo и сценарий ${activeScenario.toUpperCase()}…`)
+    try {
+      await selectScenario(activeScenario)
+      setNotice(`Gazebo и сценарий ${activeScenario.toUpperCase()} перезапущены`)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Не удалось перезапустить симуляцию')
+    } finally {
+      setScenarioBusy(false)
+    }
+  }
+
   const openScenarioSetup = () => {
     stop()
     void sendCommand('stop').catch(() => undefined)
@@ -396,6 +412,16 @@ function App() {
           <button className="topbar-action" type="button" onClick={openScenarioSetup}>
             <Settings2 size={15} />Сценарий
           </button>
+          <button
+            className="topbar-action topbar-restart"
+            type="button"
+            disabled={scenarioBusy || agentConnection !== 'connected' || !agentSnapshot.scenario}
+            onClick={() => void restartScenario()}
+            title="Пересоздать Burger на базе в Gazebo и заново запустить текущий сценарий"
+          >
+            <RotateCcw className={scenarioBusy ? 'is-spinning' : undefined} size={15} />
+            {scenarioBusy ? 'Перезапуск…' : 'Перезапустить'}
+          </button>
           <div className={`connection connection--${agentConnection}`} role="status">
             <span className="connection-dot" />
             <span>{agentConnection === 'connected' ? 'Агент готов' : 'Agent API недоступен'}</span>
@@ -417,7 +443,7 @@ function App() {
               <h2>Арена, лидар и маршрут</h2>
             </div>
             <div className="map-meta">
-              <span>{formatSimTime(snapshot.simTimeSeconds)}</span>
+              <span>{formatRunTime(agentSnapshot.score.t)}</span>
               <span>
                 {mapHover
                   ? `КУРСОР ${mapHover.x.toFixed(2)} · ${mapHover.y.toFixed(2)}`

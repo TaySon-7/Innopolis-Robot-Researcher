@@ -16,15 +16,22 @@ from did_llm.agent_plan import (
     ARENA,
     BASE_X,
     BASE_Y,
-    MAX_SUBGOALS,
+    NOISE_UNTRUSTWORTHY,
     PILLAR_KEEPOUT,
     RADIUS_MAX,
     RADIUS_MIN,
+    SIGNAL_COLLECTABLE,
+    SIGNAL_NEAR,
     TARGET_SUBGOALS,
     WALL_MARGIN,
 )
 
-PLANNER_PROMPT_VERSION = 'agent-plan@3'
+PLANNER_PROMPT_VERSION = 'agent-plan@6'
+
+# This is the LLM planning horizon, not the executor's wire-format safety
+# ceiling (50).  The live Planner rebuilds the system prompt from its
+# ``max_subgoals`` ROS parameter, whose configured value is currently six.
+DEFAULT_PLANNER_MAX_SUBGOALS = 6
 
 #: Starting battery in the judge's scenarios, from INTERFACES section 2.
 BATTERY_FULL = 60.0
@@ -47,83 +54,112 @@ STRATEGIES: tuple[str, ...] = (
     'равномерно, чтобы не пропускать углы.',
     'От базы: проверь сначала ближний к базе пояс, потом двигайся к центру — '
     'так при нехватке батареи ты останешься рядом с домом.',
-    'По сигналу: одно показание обманчиво, поэтому ставь несколько точек рядом '
-    'с тем местом, где сигнал выше всего, прежде чем идти дальше.',
-    'Экономия: план должен быть короче, иначе батареи не хватит; лучше три '
-    'точки и возврат, чем шесть точек и пустая батарея.',
+    'По сигналу: если достоверный сигнал выше порога, запускай search_around '
+    'из текущей pose — локальный навык сам измерит пространственный градиент.',
+    'Экономия: план должен быть короче, иначе батареи не хватит; лучше один-два '
+    'локальных поиска, а return_to_base оставь только для реальной нехватки батареи.',
 )
 
-PLANNER_SYSTEM = f"""\
-Ты — планировщик верхнего уровня мобильного робота в арене. Ты НЕ управляешь\
-роботом и не выдаёшь скорости: ты составляешь список подцелей, а исполнитель\
-их выполняет.
+def build_planner_system(
+    max_subgoals: int = DEFAULT_PLANNER_MAX_SUBGOALS,
+) -> str:
+    """Build the system message from the planner's real plan-length limit."""
+    if max_subgoals < 1:
+        raise ValueError('max_subgoals must be positive')
+    return f"""\
+Ты — планировщик верхнего уровня мобильного робота. Ты выбираешь точки
+и навыки, но НЕ управляешь скоростью, лидаром или колёсами. Низкоуровневый
+исполнитель сам строит путь, обходит препятствия и вычисляет локальный градиент.
 
 МИССИЯ
-Собрать как можно больше образцов и вернуться на базу. Собранные образцы\
-важны, но вернуться на базу важнее: незавершённый эпизод не засчитывается.
+Собрать максимум доступных образцов и завершить эпизод на базе. Точное число
+образцов и уже собранное число приходят в блоке «СЦЕНАРИЙ ТЕКУЩЕГО ЗАПУСКА».
+return_to_base заканчивает эпизод. Он разрешён только, когда собраны все образцы или
+когда безопасного бюджета на ещё один поиск уже нет. Обычный план не обязан заканчиваться
+возвратом: после его выполнения ты получишь новое состояние и составишь следующий план.
+
+СЦЕНАРИЙ
+В каждом запросе тебе передаётся уровень easy, medium или hard, общее число образцов
+и обзор возможных событий. Обзор описывает правила, но не раскрывает скрытые координаты или
+время событий. Не выдумывай их из названия сценария или seed. В hard считай изменение
+свершившимся только после наблюдаемого события, новой карты стоимости или флага anomaly.
 
 ГЕОМЕТРИЯ
 База: ({BASE_X}, {BASE_Y}). Координаты мировые, в метрах.
-Точные границы и позиции столбов приходят в сообщении с состоянием, в разделе\
-«ГЕОМЕТРИЯ АРЕНЫ». Держись там подальше от столбов: план с точкой на столбе\
+Точные границы и позиции столбов приходят в сообщении с состоянием, в разделе
+«ГЕОМЕТРИЯ АРЕНЫ». Держись там подальше от столбов: план с точкой на столбе
 не пройдёт проверку и будет отклонён.
 
-ПОСЛЕ КАЖДОГО search_around СРАЗУ ИДИ collect: поиск заканчивается рядом с образцом,\
-и без collect он останется на полу.
-
 ЖЁСТКИЕ ПРАВИЛА, НАРУШЕНИЕ ОТКЛОНЯЕТСЯ
-1. Если sensor.value выше 0.08 — образец уже рядом. Первой подцелью ставь\
-search_around там, где робот стоит, и сразу collect. Подцель goto в другую точку\
-запрещена: датчик не показывает направление, поэтому уехать от образца — значит\
-потерять его.
-2. Не ставь return_to_base последней подцелью, пока collected < samples_total и\
-батареи хватает. return_to_base — только когда батареи реально не хватает.\
-Завершать эпизод раньше нельзя.
-3. Не начинай план с collect: сначала search_around, потом collect.
-4. Через дорогой грунт не ездить.
+1. После каждого search_around сразу ставь collect. Не начинай план с collect.
+2. Если sensor.value >= {SIGNAL_NEAR:g} и sensor.noise_estimate < {NOISE_UNTRUSTWORTHY:g}, образец рядом:
+начинай с search_around в текущей pose, затем collect. Не ставь перед ними goto в другую точку.
+3. Если сигнала нет или он ненадёжен из-за шума, выбери новую свободную точку:
+goto к этой точке, search_around с центром в ней, затем collect.
+4. Не ставь return_to_base, если образцы ещё остались и «бюджет на новые поиски» больше 5.
+5. Не ставь goto или search_around вне арены, на столбе или в известной дорогой зоне.
 
 ПОДЦЕЛИ
 - {{"type": "goto", "x": …, "y": …}} — доехать до точки.
-- {{"type": "search_around", "x": …, "y": …, "radius": …}} — обойти круг и\
-найти образец по максимуму сигнала датчика. radius от {RADIUS_MIN} до {RADIUS_MAX} м.
+- {{"type": "search_around", "x": …, "y": …, "radius": …}} — запустить
+локальный градиентный поиск: исполнитель измерит сигнал в нескольких точках,
+оценит направление его роста, уменьшит шаг и закончит у найденного максимума.
+radius от {RADIUS_MIN} до {RADIUS_MAX} м.
 - {{"type": "collect"}} — собрать найденный образец.
 - {{"type": "return_to_base"}} — вернуться на базу и завершить эпизод.
 
+СИГНАЛ И ГРАДИЕНТ
+- sensor.value — одно скалярное измерение без направления. По одному значению
+нельзя угадать, в какую сторону ехать.
+- Градиент вычисляет исполнитель внутри search_around по серии измерений в
+разных координатах. Не раскладывай этот локальный поиск на набор goto и не
+пытайся сам угадать направление.
+- Твоя задача — выбрать центр и радиус поиска по жёстким правилам выше. Не превращай
+просто сильный сигнал в выдуманное направление.
+- Исполнитель реагирует на датчик внутри навыка значительно чаще, чем приходит
+следующий ответ модели, поэтому не нужен новый LLM-план для каждого измерения.
+- При надёжном sensor.value >= {SIGNAL_COLLECTABLE:g} планировщик сам запускает
+короткий search_around + collect на месте, не ожидая нового ответа модели.
+
 КАК ЧИТАТЬ СОСТОЯНИЕ
-- sensor.value — близость к ближайшему несобранному образцу, 0..1. Если он\
-заметно больше нуля, образец рядом: едь к sensor и потом collect.
-- sensor.noise_estimate — шум датчика. При шуме ориентироваться на мгновенное\
-значение бессмысленно.
-- return_cost_estimate — сколько батареи стоит дорога домой по текущей карте\
-стоимостей. Это твой главный ориентир: не планируй, пока батареи меньше\
-return_cost_estimate × 1,4 + 8.
-- anomaly — флаги: battery_deviation (расход выше ожидаемого), penalties_burst\
-(серия штрафов), sensor_noise_up (датчик шумит). Если поднялся любой —\
-обойди этот участок и вернись раньше.
-- cost_map_updates — что агент уже знает о дорогом грунте. Не планируй путь\
+- sensor.value — близость к ближайшему несобранному образцу, 0..1, но не направление.
+- sensor.noise_estimate >= {NOISE_UNTRUSTWORTHY:g} — мгновенному sensor.value нельзя доверять.
+- return_cost_estimate — сколько батареи стоит дорога домой по текущей карте
+- anomaly — флаги: battery_deviation (расход выше ожидаемого), penalties_burst
+(серия штрафов), sensor_noise_up (датчик шумит). Флаг требует перепланирования, но сам по себе
+не разрешает ранний return_to_base.
+- cost_map_updates — что агент уже знает о дорогом грунте. Не планируй путь
 через известно дорогую зону.
-- current.state — если failed, посмотри reason: «no path to goal» значит, что\
-через эту точку не пройти, «no sample within radius» — образца там нет,\
-«signal too weak» — сигнал недостаточный, «battery reserve reached» —\
-батареи уже нет.
+- Если блок «ПОСЛЕДНИЙ РЕЗУЛЬТАТ ПОДЦЕЛИ» имеет state=failed, посмотри reason: «no path to goal» значит, что
+через эту точку не пройти, «no sample within radius» — образца там нет,
+«signal too weak» — сигнал недостаточный, «battery reserve reached» —
+резерв на возврат достигнут, новый поиск начинать нельзя.
 
 ПРАВИЛА
-1. Обычно {TARGET_SUBGOALS}–6 подцелей, максимум {MAX_SUBGOALS}. Меньше —\
-не успеем среагировать на смену среды, больше — потратим батарею вслепую.
-2. Поиск начинай там, где сигнал уже слышен. Если сигнала нет — обходи арену\
-равномерными точками.
+1. Обычно {min(TARGET_SUBGOALS, max_subgoals)}–{max_subgoals} подцелей,
+максимум {max_subgoals}. Исключения: search_around + collect на текущей позиции — 2,
+а return_to_base — 1. Не добавляй шаги для количества: короткий горизонт нужен для реакции на изменения.
+2. При надёжном сигнале ищи из текущей pose; без него перемещайся к новой точке обхода.
 3. Найден образец (collect) — потом ищи следующий.
-4. Батареи не хватает на обход — последней подцелью return_to_base.
+4. Все образцы собраны или бюджета на новый поиск не осталось — return_to_base.
 5. Не повторяй точку, на которой уже был и где ничего не нашлось.
 
-ФОРМАТ ОТВЕТА — строго JSON, без пояснений вне JSON:
+ПРИМЕР ниже — для случая без сигнала, когда образцы остались и бюджета хватает.
+ФОРМАТ ОТВЕТА — строго JSON по переданной JSON Schema, без текста вне JSON:
 {{"explanation": "одно предложение: почему такой план", "subgoals": [
   {{"type": "goto", "x": -0.75, "y": 0.25}},
-  {{"type": "search_around", "x": 0.0, "y": 0.0, "radius": 0.8}},
+  {{"type": "search_around", "x": -0.75, "y": 0.25, "radius": 0.8}},
   {{"type": "collect"}},
-  {{"type": "return_to_base"}}
+  {{"type": "goto", "x": 0.75, "y": 0.25}},
+  {{"type": "search_around", "x": 0.75, "y": 0.25, "radius": 0.8}},
+  {{"type": "collect"}}
 ]}}
 """
+
+
+# Compatibility export for tests and tools that inspect the default prompt.
+# The live planner uses ``build_planner_system(self.cfg.max_subgoals)`` below.
+PLANNER_SYSTEM = build_planner_system()
 
 HYPOTHESIS_SYSTEM = """\
 Ты — исследователь мобильного робота в арене. Формулируй ПРОВЕРЯЕМЫЕ гипотезы
@@ -166,6 +202,8 @@ def build_planner_prompt(mission: str, state: dict[str, Any],
         f'ПОДХОД К ЭТОМУ ПЛАНУ (раунд {round_number}): '
         f'{STRATEGIES[round_number % len(STRATEGIES)]}',
         '',
+        _scenario_block(state),
+        '',
         _geometry_block(),
         '',
         _ground_block(expensive),
@@ -185,6 +223,65 @@ def build_planner_prompt(mission: str, state: dict[str, Any],
     return '\n'.join(parts)
 
 
+def _scenario_block(state: dict[str, Any]) -> str:
+    """Describe scenario rules without leaking its hidden layout or schedule."""
+    raw_name = str(state.get('scenario') or '').strip().lower()
+    difficulty = raw_name.partition('@')[0]
+    generated = '@' in raw_name
+
+    total = state.get('samples_total')
+    collected = state.get('collected')
+    total_count = int(total) if isinstance(total, (int, float)) else None
+    collected_count = int(collected) if isinstance(collected, (int, float)) else None
+
+    lines = ['СЦЕНАРИЙ ТЕКУЩЕГО ЗАПУСКА:']
+    if raw_name:
+        lines.append(f'  режим: {raw_name}')
+    else:
+        lines.append('  режим: не передан; не угадывай его')
+
+    if total_count is not None and collected_count is not None:
+        remaining = max(0, total_count - collected_count)
+        lines.append(
+            f'  образцы: всего {total_count}, собрано {collected_count}, '
+            f'осталось {remaining}'
+        )
+    elif total_count is not None:
+        lines.append(f'  образцы: всего {total_count}')
+
+    if difficulty == 'easy':
+        lines += [
+            '  профиль easy: 1 зона медленного/дорогого грунта',
+            '  среда статична: событий во время прогона нет',
+        ]
+    elif difficulty == 'medium':
+        lines += [
+            '  профиль medium: 3 зоны медленного/дорогого грунта',
+            '  среда статична: событий во время прогона нет',
+        ]
+    elif difficulty == 'hard':
+        lines += [
+            '  профиль hard: 4 исходные зоны медленного/дорогого грунта',
+            '  во время прогона возможны: изменение стоимости грунта, '
+            'появление новой опасной зоны и временный рост шума датчика',
+            '  точные места и время этих событий тебе неизвестны',
+        ]
+    else:
+        lines.append(
+            '  профиль сложности неизвестен; опирайся только на наблюдения'
+        )
+
+    if generated:
+        lines.append(
+            '  seed делает раскладку воспроизводимой, но не раскрывает тебе '
+            'координаты образцов, грунта или опасностей'
+        )
+    lines.append(
+        '  скрытые координаты неизвестны; ищи по датчику и известной карте'
+    )
+    return '\n'.join(lines)
+
+
 def _ground_block(expensive: list[dict[str, float]] | None) -> str:
     """Ground the agent has already measured, and what it costs.
 
@@ -193,8 +290,9 @@ def _ground_block(expensive: list[dict[str, float]] | None) -> str:
     burns the battery crossing them.
     """
     if not expensive:
-        return ('ДОРОГОЙ ГРУНТ: пока ничего не измерено — все точки стоят 1.0. '
-                'Не выдумывай дорогие участки.')
+        return ('ДОРОГОЙ ГРУНТ: агент пока не измерил ни одной дорогой зоны. '
+                'Точные места из профиля сценария неизвестны: не выдумывай их, '
+                'а реагируй после измерения.')
     lines = ['ДОРОГОЙ ГРУНТ (измерен агентом, цена за метр пути):']
     for item in expensive[:12]:
         lines.append(f'  ({item["x"]:.2f}; {item["y"]:.2f}) цена ×{item["cost"]:.1f}'
@@ -210,22 +308,21 @@ def _budget_block(state: dict[str, Any],
                   budget: dict[str, Any] | None) -> str:
     """What is actually left, in terms the model can act on.
 
-    ``return_cost_estimate`` is the agent's own figure, but it is only
-    meaningful away from the base: standing on the base it reads as almost
-    zero, which the model reads as "the budget is unlimited" — and then it
-    plans a sweep of the whole arena on a battery that cannot pay for it. So
-    the number that gets the model's attention is the floor: the battery below
-    which coming back is not negotiable.
+    ``return_cost_estimate`` is the agent's own figure. ``search_budget`` has
+    already subtracted that trip and a safety reserve, so it must be described
+    as money available for new work, not as a battery threshold.
     """
     battery = state.get('battery')
     parts = ['БЮДЖЕТ:']
     if isinstance(battery, (int, float)):
         parts.append(f'  батарея {battery:.1f} из {BATTERY_FULL}')
     if budget:
-        floor = budget.get('floor')
-        if isinstance(floor, (int, float)):
-            parts.append(f'  ниже {floor:.1f} возвращаться обязательно, '
-                         'планировать выход нельзя')
+        search_budget = budget.get('search_budget')
+        if isinstance(search_budget, (int, float)):
+            parts.append(
+                f'  бюджет на новые поиски: {search_budget:.1f}; '
+                'это уже после резерва на возврат'
+            )
         spent = budget.get('cost_to_come_back')
         if isinstance(spent, (int, float)) and spent > 1.0:
             parts.append(f'  дорога домой уже стоит ≈{spent:.1f}')

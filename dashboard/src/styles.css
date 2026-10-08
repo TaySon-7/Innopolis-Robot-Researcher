@@ -115,6 +115,9 @@ button:focus-visible, input:focus-visible {
   cursor: pointer;
 }
 .topbar-action:hover { border-color: rgba(37,217,199,.45); color: var(--teal); background: var(--teal-soft); }
+.topbar-action:disabled { cursor: not-allowed; opacity: .45; }
+.topbar-restart { border-color: rgba(242,163,58,.24); }
+.topbar-restart:hover:not(:disabled) { border-color: rgba(242,163,58,.6); color: var(--amber); background: rgba(242,163,58,.08); }
 
 /* Scenario setup ------------------------------------------------------------------- */
 
@@ -493,11 +496,15 @@ button:disabled { opacity: .38; cursor: not-allowed; }
 .journal-entry:last-child { border-bottom: 0; }
 .journal-entry time { padding-top: 3px; color: var(--dim); font-family: "JetBrains Mono", monospace; font-size: .61rem; }
 .journal-entry strong { display: block; color: #cedddb; font-size: .78rem; font-weight: 600; line-height: 1.45; }
-.journal-entry p { margin: 5px 0 0; color: var(--muted); font-size: .7rem; line-height: 1.55; overflow-wrap: anywhere; }
+.journal-entry p { margin: 5px 0 0; color: var(--muted); font-size: .7rem; line-height: 1.55; overflow-wrap: anywhere; white-space: pre-line; }
 .journal-tag { display: inline-block; margin-right: 6px; padding: 2px 5px; border: 1px solid var(--line-bright); border-radius: 4px; color: var(--muted); font-size: .55rem; font-style: normal; font-weight: 500; text-transform: uppercase; }
 .journal-tag--hypothesis { border-color: rgba(125,168,255,.55); color: #9bbcff; }
 .journal-tag--result { border-color: rgba(110,231,168,.5); color: var(--green); }
 .journal-tag--decision { border-color: rgba(242,163,58,.55); color: var(--amber); }
+.journal-tag--llm { border-color: rgba(181,130,255,.62); color: #c9a7ff; background: rgba(155,104,230,.08); }
+.journal-tag--robot { border-color: rgba(86,201,255,.55); color: #8bd8ff; }
+.journal-tag--search { border-color: rgba(37,217,199,.55); color: var(--teal); }
+.journal-tag--collect { border-color: rgba(110,231,168,.55); color: var(--green); }
 
 .control-heading p { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--muted); font-size: .67rem; }
 .control-heading p svg { color: var(--amber); }

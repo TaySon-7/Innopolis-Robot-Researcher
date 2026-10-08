@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+from ament_index_python.packages import get_package_share_directory
 from math import atan2
 from pathlib import Path
+from threading import Event
+from time import monotonic
+from time import sleep
 import json
 
 from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.node import Node
+from ros_gz_interfaces.srv import DeleteEntity
+from ros_gz_interfaces.srv import SpawnEntity
 from std_msgs.msg import String
 
 from did_agent.dashboard_core import DashboardData
@@ -52,6 +58,18 @@ class DashboardNode(Node):
         self._plan_pub = self.create_publisher(String, '/agent/plan', 10)
         self._command_pub = self.create_publisher(String, '/agent/command', 10)
         self._scenario_pub = self.create_publisher(String, '/did/scenario/select', 10)
+        self._delete_entity = self.create_client(
+            DeleteEntity,
+            '/world/default/remove/blocking',
+        )
+        self._spawn_entity = self.create_client(
+            SpawnEntity,
+            '/world/default/create/blocking',
+        )
+        self._burger_sdf = (
+            Path(get_package_share_directory('turtlebot3_gazebo'))
+            / 'models' / 'turtlebot3_burger' / 'model.sdf'
+        )
         self.server = DashboardServer(
             self.data, geometry, self._send_plan, self._send_command,
             self._send_scenario, self._preview_scenario,
@@ -140,7 +158,7 @@ class DashboardNode(Node):
         return preview_from_scenario(self._load_named_scenario(name))
 
     def _send_scenario(self, scenario: str) -> None:
-        """Stop the current run and ask the judge and agent to load a clean scenario."""
+        """Reset Gazebo, then ask the judge and agent to load a clean scenario."""
         selected = self._load_named_scenario(scenario)
         if '@' in scenario:
             generated_dir = Path('/tmp/scenarios')
@@ -150,7 +168,9 @@ class DashboardNode(Node):
         else:
             path = scenario_path(scenario)
         self._send_command('stop')
-        self.data.reset_run()
+        self._wait_for_agent_stop()
+        self._reset_gazebo()
+        self.data.reset_run(reset_pose=True)
         self._truth_for = selected.name
         self._truth_scenario = selected
         self.data.on_truth(truth_from_scenario(selected, 0.0))
@@ -160,6 +180,77 @@ class DashboardNode(Node):
         }, sort_keys=True)
         self._scenario_pub.publish(String(data=request))
         self.get_logger().info(f'scenario selection requested: {scenario}')
+
+    def _wait_for_agent_stop(self, timeout: float = 3.0) -> None:
+        """Do not respawn Burger while an old plan can still call ``finish``."""
+        deadline = monotonic() + timeout
+        while self.data.run_state() == 'running':
+            if monotonic() >= deadline:
+                raise RuntimeError('Agent did not stop before Gazebo restart')
+            sleep(0.02)
+
+    def _reset_gazebo(self, timeout: float = 4.0) -> None:
+        """Recreate Burger without corrupting its Gazebo plugins.
+
+        Gazebo Harmonic's ``reset.all`` invalidates link and joint entities for
+        a model spawned after world load.  Removing and spawning Burger gives
+        us fresh diff-drive, odom and lidar systems while preserving the static
+        arena.  Episode time is reset by the judge together with the scenario;
+        resetting the global Gazebo clock races dynamic model creation.
+        """
+        deadline = monotonic() + timeout
+        clients = (
+            (self._delete_entity, 'remove'),
+            (self._spawn_entity, 'create'),
+        )
+        for client, name in clients:
+            remaining = max(0.0, deadline - monotonic())
+            if not client.wait_for_service(timeout_sec=remaining):
+                raise RuntimeError(f'Gazebo {name} service is unavailable')
+
+        remove = DeleteEntity.Request()
+        remove.entity.name = 'burger'
+        remove.entity.type = remove.entity.MODEL
+        self._call_gazebo(self._delete_entity, remove, 'remove Burger', deadline)
+
+        spawn = SpawnEntity.Request()
+        spawn.entity_factory.name = 'burger'
+        spawn.entity_factory.allow_renaming = False
+        spawn.entity_factory.sdf_filename = str(self._burger_sdf)
+        spawn.entity_factory.pose.position.x = self.data.base[0]
+        spawn.entity_factory.pose.position.y = self.data.base[1]
+        spawn.entity_factory.pose.position.z = 0.01
+        spawn.entity_factory.pose.orientation.w = 1.0
+        spawn.entity_factory.relative_to = 'world'
+
+        try:
+            # Even the blocking remove service returns before every system has
+            # observed the entity removal.  One short server-side barrier keeps
+            # a delayed removal command from deleting the replacement model.
+            sleep(0.25)
+        finally:
+            self._call_gazebo(
+                self._spawn_entity,
+                spawn,
+                'spawn Burger',
+                monotonic() + timeout,
+            )
+        self.get_logger().info('Gazebo restarted: Burger respawned at the base')
+
+    @staticmethod
+    def _call_gazebo(client, request, action: str, deadline: float) -> None:
+        """Wait for one Gazebo service response while the ROS executor spins."""
+        future = client.call_async(request)
+        completed = Event()
+        future.add_done_callback(lambda _future: completed.set())
+        if not completed.wait(max(0.0, deadline - monotonic())):
+            raise RuntimeError(f'Gazebo did not confirm {action} in time')
+        try:
+            response = future.result()
+        except Exception as error:
+            raise RuntimeError(f'Gazebo {action} failed: {error}') from error
+        if response is None or not response.success:
+            raise RuntimeError(f'Gazebo rejected {action}')
 
 
 def main(args=None) -> None:

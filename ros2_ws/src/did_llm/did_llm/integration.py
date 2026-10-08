@@ -82,6 +82,7 @@ class RobotLink:
 
         self.state = {
             't': round(self.robot.now(), 2),
+            'scenario': self.robot.judge.scenario.name,
             'pose': {'x': round(pose.x, 3), 'y': round(pose.y, 3),
                      'yaw': round(pose.yaw, 3)},
             'battery': round(self.robot.battery(), 3),

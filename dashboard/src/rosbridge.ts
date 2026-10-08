@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import {
+  appendTimedPose,
+  interpolateTimedPose,
+  lidarOrigin,
+  rosClockReset,
+} from './lidarSync'
+import type { TimedLidarPose } from './lidarSync'
+
 export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
 
 export interface Pose2D {
@@ -84,6 +92,7 @@ const initialSnapshot = (): RosSnapshot => ({
 
 type SnapshotListener = (snapshot: RosSnapshot) => void
 type JsonObject = Record<string, unknown>
+type PendingScan = Omit<LaserScan, 'origin'> & { stamp: number | null }
 
 function rosbridgeUrl(): string {
   const configured = import.meta.env.VITE_ROSBRIDGE_URL as string | undefined
@@ -100,12 +109,21 @@ function object(value: unknown): JsonObject {
   return value !== null && typeof value === 'object' ? (value as JsonObject) : {}
 }
 
+function messageStamp(message: JsonObject): number | null {
+  const stamp = object(object(message.header).stamp)
+  if (typeof stamp.sec !== 'number' && typeof stamp.nanosec !== 'number') return null
+  const value = number(stamp.sec) + number(stamp.nanosec) / 1e9
+  return Number.isFinite(value) ? value : null
+}
+
 function eventText(data: JsonObject): string {
   switch (data.event) {
     case 'sample_collected':
       return `Образец собран · ${number(data.collected)} из 3`
     case 'false_collect':
       return 'Рядом нет образца: подведите робота ближе'
+    case 'scenario_selected':
+      return `Сценарий ${String(data.scenario ?? '').toUpperCase()} перезапущен`
     default:
       return typeof data.event === 'string' ? data.event : 'Получено событие судьи'
   }
@@ -119,6 +137,8 @@ class RosbridgeClient {
   private reconnectAttempt = 0
   private stopped = false
   private sequence = 0
+  private odometryHistory: TimedLidarPose[] = []
+  private pendingScan: PendingScan | null = null
   private serviceCalls = new Map<
     string,
     {
@@ -302,9 +322,24 @@ class RosbridgeClient {
         break
       case '/clock': {
         const clock = object(message.clock)
+        const simTimeSeconds = number(clock.sec) + number(clock.nanosec) / 1e9
+        if (rosClockReset(this.snapshot.simTimeSeconds ?? undefined, simTimeSeconds)) {
+          this.odometryHistory = []
+          this.pendingScan = null
+          this.setSnapshot({
+            ...this.snapshot,
+            pose: { x: BASE.x, y: BASE.y, yaw: 0 },
+            linearVelocity: 0,
+            angularVelocity: 0,
+            scan: null,
+            trail: [{ x: BASE.x, y: BASE.y }],
+            simTimeSeconds,
+          })
+          break
+        }
         this.setSnapshot({
           ...this.snapshot,
-          simTimeSeconds: number(clock.sec) + number(clock.nanosec) / 1e9,
+          simTimeSeconds,
         })
         break
       }
@@ -331,6 +366,14 @@ class RosbridgeClient {
       y: BASE.y + number(position.y),
       yaw,
     }
+    const stamp = messageStamp(message)
+    if (stamp !== null) {
+      const previousStamp = this.odometryHistory.at(-1)?.stamp
+      if (rosClockReset(previousStamp, stamp)) {
+        this.pendingScan = null
+      }
+      this.odometryHistory = appendTimedPose(this.odometryHistory, { ...pose, stamp })
+    }
     const previous = this.snapshot.trail.at(-1)
     const moved =
       !previous || Math.hypot(pose.x - previous.x, pose.y - previous.y) >= 0.025
@@ -345,36 +388,55 @@ class RosbridgeClient {
       linearVelocity: number(linear.x),
       angularVelocity: number(angular.z),
     })
+    this.flushPendingScan()
   }
 
   private handleScan(message: JsonObject): void {
     const ranges = Array.isArray(message.ranges)
       ? message.ranges.map((value) => number(value, Number.NaN))
       : []
+    const pending: PendingScan = {
+      stamp: messageStamp(message),
+      angleMin: number(message.angle_min),
+      angleIncrement: number(message.angle_increment),
+      rangeMin: number(message.range_min),
+      rangeMax: number(message.range_max, 3.5),
+      ranges,
+    }
+    if (!this.publishSynchronizedScan(pending)) this.pendingScan = pending
+  }
+
+  private flushPendingScan(): void {
+    if (!this.pendingScan || !this.publishSynchronizedScan(this.pendingScan)) return
+    this.pendingScan = null
+  }
+
+  private publishSynchronizedScan(scan: PendingScan): boolean {
+    const pose = scan.stamp === null
+      ? this.snapshot.pose
+      : interpolateTimedPose(this.odometryHistory, scan.stamp)
+    if (!pose) return false
+    const measurement = {
+      angleMin: scan.angleMin,
+      angleIncrement: scan.angleIncrement,
+      rangeMin: scan.rangeMin,
+      rangeMax: scan.rangeMax,
+      ranges: scan.ranges,
+    }
     this.setSnapshot({
       ...this.snapshot,
       scan: {
-        // Freeze the transform at scan receipt. Reusing the newest odometry for
-        // an older scan makes the entire point cloud appear to follow the robot.
-        origin: {
-          x: this.snapshot.pose.x + LIDAR_X_OFFSET * Math.cos(this.snapshot.pose.yaw),
-          y: this.snapshot.pose.y + LIDAR_X_OFFSET * Math.sin(this.snapshot.pose.yaw),
-          yaw: this.snapshot.pose.yaw,
-        },
-        angleMin: number(message.angle_min),
-        angleIncrement: number(message.angle_increment),
-        rangeMin: number(message.range_min),
-        rangeMax: number(message.range_max, 3.5),
-        ranges,
+        ...measurement,
+        origin: lidarOrigin(pose, LIDAR_X_OFFSET),
       },
     })
+    return true
   }
 
   private handleScore(message: JsonObject): void {
     if (typeof message.data !== 'string') return
     try {
       const data = object(JSON.parse(message.data))
-      const worldPose = object(data.world_pose)
       const incomingSamples = Array.isArray(data.samples) ? data.samples : []
       const samples = incomingSamples.length
         ? incomingSamples.map((value) => {
@@ -389,11 +451,6 @@ class RosbridgeClient {
       this.setSnapshot({
         ...this.snapshot,
         battery: number(data.battery, this.snapshot.battery ?? 0),
-        pose: {
-          ...this.snapshot.pose,
-          x: number(worldPose.x, this.snapshot.pose.x),
-          y: number(worldPose.y, this.snapshot.pose.y),
-        },
         samples,
         score: {
           scenario: typeof data.scenario === 'string' ? data.scenario : 'easy',
@@ -412,9 +469,24 @@ class RosbridgeClient {
   private handleEvent(message: JsonObject): void {
     if (typeof message.data !== 'string') return
     try {
+      const event = object(JSON.parse(message.data))
+      if (event.event === 'scenario_selected') {
+        this.odometryHistory = []
+        this.pendingScan = null
+        this.setSnapshot({
+          ...this.snapshot,
+          pose: { x: BASE.x, y: BASE.y, yaw: 0 },
+          linearVelocity: 0,
+          angularVelocity: 0,
+          scan: null,
+          trail: [{ x: BASE.x, y: BASE.y }],
+          lastEvent: eventText(event),
+        })
+        return
+      }
       this.setSnapshot({
         ...this.snapshot,
-        lastEvent: eventText(object(JSON.parse(message.data))),
+        lastEvent: eventText(event),
       })
     } catch {
       this.setSnapshot({ ...this.snapshot, lastEvent: message.data })

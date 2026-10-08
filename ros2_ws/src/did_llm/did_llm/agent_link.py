@@ -209,10 +209,9 @@ class AgentLink:
                 status: str = 'open', **extra: Any) -> None:
         """One entry of the experiment journal, as the dashboard reads it.
 
-        ``kind`` is one of hypothesis, result, decision, agent; ``status`` one
-        of open, confirmed, rejected. The planner uses them as documented
-        rather than inventing a schema, so entries show up in the dashboard's
-        feed unchanged.
+        ``kind`` identifies the source (for example ``llm`` or ``robot``), and
+        ``status`` is one of open, confirmed, rejected. Entries pass through
+        unchanged so the dashboard can label and colour each source.
         """
         record = {
             't': round(self.now(), 2),

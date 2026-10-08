@@ -116,6 +116,10 @@ export function AgentPanel({
 }
 
 const JOURNAL_KIND: Record<string, string> = {
+  llm: 'LLM',
+  robot: 'робот',
+  search: 'поиск',
+  collect: 'сбор',
   hypothesis: 'гипотеза',
   result: 'вывод',
   decision: 'решение',

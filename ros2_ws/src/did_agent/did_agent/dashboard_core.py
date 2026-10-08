@@ -332,6 +332,11 @@ class DashboardData:
         with self.lock:
             self.status = status
 
+    def run_state(self) -> str:
+        """Return the executor state without copying the full dashboard payload."""
+        with self.lock:
+            return str(self.status.get('state') or 'idle')
+
     def on_score(self, score: dict[str, Any]) -> None:
         with self.lock:
             self.score = score
@@ -362,17 +367,45 @@ class DashboardData:
             data = json.loads(text)
         except ValueError:
             return
-        if isinstance(data, dict) and data.get('explanation'):
-            self.on_journal({
-                'kind': 'decision',
-                'title': f"План {data.get('plan_id', '')}".strip(),
-                'text': str(data['explanation']),
-                't': self.state.get('t'),
-            })
+        if not isinstance(data, dict) or not data.get('explanation'):
+            return
+        subgoals = data.get('subgoals')
+        items = subgoals if isinstance(subgoals, list) else []
+        source = str(data.get('source') or 'llm')
+        kind = 'llm' if source == 'llm' else 'robot'
+        search = next((item for item in items
+                       if isinstance(item, dict)
+                       and item.get('type') == 'search_around'), None)
+        if search and all(isinstance(search.get(key), (int, float))
+                          for key in ('x', 'y', 'radius')):
+            action = ('Выбран район поиска' if kind == 'llm'
+                      else 'Автоматический локальный поиск')
+            title = (
+                f'{action} '
+                f'({float(search["x"]):.2f}; {float(search["y"]):.2f}), '
+                f'радиус {float(search["radius"]):.2f}'
+            )
+        else:
+            title = f'Выбран план {data.get("plan_id", "")}'.strip()
+        steps = ' → '.join(
+            str(item.get('type')) for item in items
+            if isinstance(item, dict) and item.get('type')
+        )
+        detail = str(data['explanation'])
+        if steps:
+            detail += f'\nПодцели: {steps}'
+        self.on_journal({
+            'kind': kind,
+            'title': title,
+            'text': detail,
+            't': self.state.get('t'),
+        })
 
-    def reset_run(self) -> None:
-        """Clear episode-specific UI data while keeping the latest robot pose."""
+    def reset_run(self, *, reset_pose: bool = False) -> None:
+        """Clear episode data, optionally restoring the Gazebo spawn pose."""
         with self.lock:
+            if reset_pose:
+                self.pose = {'x': self.base[0], 'y': self.base[1], 'yaw': 0.0}
             self.state = {}
             self.status = {}
             self.score = {}

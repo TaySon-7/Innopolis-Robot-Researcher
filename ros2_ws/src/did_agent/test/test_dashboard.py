@@ -122,6 +122,24 @@ def test_data_store_resets_episode_data_but_keeps_current_pose():
     assert snapshot['journal'] == [] and snapshot['collected_at'] == []
 
 
+def test_data_store_can_reset_pose_and_trail_to_gazebo_spawn():
+    data = DashboardData()
+    data.on_pose(-0.4, 1.2, 2.1)
+    data.reset_run(reset_pose=True)
+    snapshot = data.snapshot()
+    assert snapshot['pose'] == {'x': -2.0, 'y': -0.5, 'yaw': 0.0}
+    assert snapshot['trail'] == [[-2.0, -0.5]]
+
+
+def test_data_store_exposes_executor_state_for_restart_barrier():
+    data = DashboardData()
+    assert data.run_state() == 'idle'
+    data.on_status({'state': 'running'})
+    assert data.run_state() == 'running'
+    data.on_status({'state': 'preempted'})
+    assert data.run_state() == 'preempted'
+
+
 def test_a_plan_explanation_becomes_a_journal_decision():
     data = DashboardData()
     data.on_plan(json.dumps({
@@ -129,8 +147,44 @@ def test_a_plan_explanation_becomes_a_journal_decision():
         'subgoals': [{'type': 'collect'}],
     }))
     entry = data.snapshot()['journal'][0]
-    assert entry['kind'] == 'decision' and 'объезжаю' in entry['text']
+    assert entry['kind'] == 'llm' and 'объезжаю' in entry['text']
+    assert entry['title'] == 'Выбран план p3'
     data.on_plan('not json')  # must not raise
+
+
+def test_search_plan_journal_names_the_region_and_subgoal_sequence():
+    data = DashboardData()
+    data.on_plan(json.dumps({
+        'plan_id': 'llm-1',
+        'explanation': 'Сигнал слабый, исследую новую область.',
+        'subgoals': [
+            {'type': 'goto', 'x': -1.75, 'y': 0.5},
+            {'type': 'search_around', 'x': -1.75, 'y': 0.5, 'radius': 0.9},
+            {'type': 'collect'},
+        ],
+    }))
+
+    entry = data.snapshot()['journal'][0]
+    assert entry['kind'] == 'llm'
+    assert '(-1.75; 0.50), радиус 0.90' in entry['title']
+    assert 'Подцели: goto → search_around → collect' in entry['text']
+
+
+def test_automatic_signal_plan_is_labelled_as_robot_not_llm():
+    data = DashboardData()
+    data.on_plan(json.dumps({
+        'plan_id': 'signal-1',
+        'source': 'auto_collect',
+        'explanation': 'Проверяю максимум и собираю автоматически.',
+        'subgoals': [
+            {'type': 'search_around', 'x': -0.5, 'y': -0.55, 'radius': 0.25},
+            {'type': 'collect'},
+        ],
+    }))
+
+    entry = data.snapshot()['journal'][0]
+    assert entry['kind'] == 'robot'
+    assert entry['title'].startswith('Автоматический локальный поиск')
 
 
 def test_truth_overlay_describes_the_scenario():

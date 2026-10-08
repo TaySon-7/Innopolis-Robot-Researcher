@@ -151,6 +151,6 @@ DASHBOARD_BIND=0.0.0.0 DASHBOARD_PORT=8080 docker compose up -d --build
 ## Тесты
 
 ```bash
-make test       # judge и agent внутри Docker
+make test       # judge, agent и LLM planner внутри Docker
 make test-fast  # те же тесты на подготовленном Python-хосте
 ```

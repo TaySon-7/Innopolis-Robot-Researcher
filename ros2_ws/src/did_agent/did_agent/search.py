@@ -19,6 +19,11 @@ from did_agent.robot import Reading
 from did_agent.robot import Robot
 
 GOLDEN_ANGLE = 2.399963
+SAMPLE_SENSOR_RANGE = 1.5
+SAMPLE_COLLECTION_RADIUS = 0.30
+# The judge uses signal = 1 - distance / range.  A search must not report
+# success outside the radius in which the following collect call is legal.
+COLLECTION_SIGNAL_THRESHOLD = 1.0 - SAMPLE_COLLECTION_RADIUS / SAMPLE_SENSOR_RANGE
 
 
 class Preempted(Exception):
@@ -35,6 +40,7 @@ class SearchResult:
     y: float
     reason: str = ''
     trace: list[tuple[float, float, float]] = field(default_factory=list)
+    gradient: tuple[float, float] | None = None
 
 
 class SampleSearch:
@@ -47,7 +53,7 @@ class SampleSearch:
         budget_ok: Callable[[], bool] = lambda: True,
         signal: float = 0.08,
         target: float = 0.86,
-        found_level: float = 0.7,
+        found_level: float = COLLECTION_SIGNAL_THRESHOLD,
         spiral_points: int = 12,
         step: float = 0.4,
         min_step: float = 0.1,
@@ -150,7 +156,10 @@ class SampleSearch:
         except Preempted as stop:
             if self.trace:
                 best = self._strongest()
-                return SearchResult(False, best[2], best[0], best[1], str(stop), self._plain())
+                return SearchResult(
+                    False, best[2], best[0], best[1], str(stop),
+                    self._plain(), self._gradient(best),
+                )
             pose = self.robot.pose()
             return SearchResult(False, 0.0, pose.x, pose.y, str(stop))
 
@@ -198,4 +207,5 @@ class SampleSearch:
             self.robot.goto(best[0], best[1])
         found = best[2] >= self.found_level
         return SearchResult(found, best[2], best[0], best[1],
-                            '' if found else 'signal too weak', self._plain())
+                            '' if found else 'signal too weak', self._plain(),
+                            self._gradient(best))
