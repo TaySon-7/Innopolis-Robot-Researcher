@@ -1,4 +1,4 @@
-.PHONY: build up ui down restart logs ui-logs shell teleop topics pose scan battery sensor score events goto collect finish auto stop demo dashboard scenario scenario-check plan bench check test test-fast
+.PHONY: build up ui down restart logs ui-logs shell teleop topics pose scan battery sensor score events goto collect finish auto stop demo dashboard scenario scenario-check plan bench check test test-fast llm llm-logs llm-plan llm-journal llm-state llm-status
 
 build:
 	docker compose build
@@ -65,6 +65,37 @@ auto:
 
 stop:
 	docker compose exec sim /did-entrypoint.sh ros2 run did_agent command stop
+
+# --- LLM planner (Николай) -------------------------------------------------
+# Starts the whole stack with the planner on: the LLM publishes /agent/plan and
+# the agent executes it. Without a key in .env the planner notices, says so and
+# hands the episode to the agent's own behaviour, so the demo still runs.
+
+# Usage: make llm SCENARIO=hard@7
+llm:
+	LLM=true docker compose up --detach --wait --build
+	@echo "LLM planner on. Plans: make llm-plan    Log: make llm-logs"
+
+llm-logs:
+	docker compose logs --follow sim
+
+# The last plan the model published, with the reasoning behind it.
+llm-plan:
+	docker compose exec -T sim /did-entrypoint.sh \
+		ros2 topic echo /agent/plan --once
+
+# The planner's decisions and results, as the dashboard reads them.
+llm-journal:
+	docker compose exec -T sim /did-entrypoint.sh \
+		ros2 topic echo /agent/journal --field data
+
+# The state the planner reasons from, one message per second.
+llm-state:
+	docker compose exec sim /did-entrypoint.sh ros2 topic echo /agent/state
+
+# Whether a subgoal succeeded, and why not when it did not.
+llm-status:
+	docker compose exec sim /did-entrypoint.sh ros2 topic echo /agent/status --field data
 
 # Start the complete stack and open the React dashboard.
 demo: ui

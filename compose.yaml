@@ -18,11 +18,18 @@ services:
       - demo.launch.py
       - scenario:=${SCENARIO:-easy}
       - scenario_file:=${SCENARIO_FILE:-none}
+      # LLM planner off by default: the plain demo is the autonomous agent and
+      # needs no API key. LLM=true demo starts the planner instead.
+      - llm:=${LLM:-false}
     ports:
       - "127.0.0.1:9090:9090"
       - "127.0.0.1:${AGENT_API_PORT:-8082}:8080"
     volumes:
       - gz-cache:/root/.gz
+      # The planner reads the API key from a .env in its working directory.
+      # Missing file is fine: without a key the planner hands the episode to
+      # the agent's own behaviour instead of failing.
+      - ./.env:/opt/did_ws/.env:ro
     stop_grace_period: 15s
     restart: unless-stopped
     healthcheck:

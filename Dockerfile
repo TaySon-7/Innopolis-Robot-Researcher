@@ -19,6 +19,12 @@ ENV ROS_DOMAIN_ID=30 \
     TURTLEBOT3_MODEL=burger \
     LIBGL_ALWAYS_SOFTWARE=1
 
+# pydantic 2 validates whatever the model returns before it reaches
+# /agent/plan. Ubuntu 24.04 marks the system Python externally-managed
+# (PEP 668), so the flag is required inside the container; a venv would not be
+# visible to the ROS entrypoint scripts.
+RUN pip3 install --no-cache-dir --break-system-packages "pydantic>=2"
+
 WORKDIR /opt/did_ws
 COPY ros2_ws/src ./src
 

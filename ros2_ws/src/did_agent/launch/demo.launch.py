@@ -14,6 +14,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.actions import IncludeLaunchDescription
 from launch.actions import OpaqueFunction
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -48,10 +49,19 @@ def _simulation(context):
 
 
 def generate_launch_description():
-    """Create the demo launch description."""
+    """Create the demo launch description.
+
+    The LLM planner is off by default, so the plain demo is still the
+    autonomous agent and needs no API key. Turn it on with ``llm:=true``: the
+    planner then publishes plans to /agent/plan instead of the agent running
+    its own policy, and falls back to that policy if the model is unreachable.
+    """
     return LaunchDescription([
         DeclareLaunchArgument('scenario', default_value='easy'),
         DeclareLaunchArgument('scenario_file', default_value=''),
+        DeclareLaunchArgument(
+            'llm', default_value='false',
+            description='Start the LLM planner alongside the agent.'),
         OpaqueFunction(function=_simulation),
         Node(package='did_agent', executable='agent', name='agent', output='screen'),
         Node(package='did_agent', executable='dashboard', name='dashboard', output='screen'),
@@ -61,5 +71,15 @@ def generate_launch_description():
             name='rosbridge_websocket',
             output='screen',
             parameters=[{'port': 9090}],
+        ),
+        Node(
+            package='did_llm',
+            executable='llm_planner',
+            name='llm_planner',
+            output='screen',
+            condition=IfCondition(LaunchConfiguration('llm')),
+            parameters=[os.path.join(
+                get_package_share_directory('did_llm'),
+                'config', 'planner.yaml')],
         ),
     ])
