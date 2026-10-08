@@ -154,6 +154,7 @@ def build_planner_prompt(mission: str, state: dict[str, Any],
                          feedback: str,
                          expensive: list[dict[str, float]] | None = None,
                          budget: dict[str, Any] | None = None,
+                         searched: list[tuple[float, float, float]] | None = None,
                          round_number: int = 0) -> str:
     """Assemble the planner prompt from one state snapshot.
 
@@ -169,6 +170,8 @@ def build_planner_prompt(mission: str, state: dict[str, Any],
         _geometry_block(),
         '',
         _ground_block(expensive),
+        '',
+        _coverage_block(searched),
         '',
         _budget_block(state, budget),
         '',
@@ -204,6 +207,37 @@ def _ground_block(expensive: list[dict[str, float]] | None) -> str:
     lines.append('Через эти точки не ездить и не искать: план с такой точкой '
                  'будет отклонён.')
     return '\n'.join(lines)
+
+
+def _coverage_block(searched: list[tuple[float, float, float]] | None) -> str:
+    """Where the robot has already looked, so it does not look there again.
+
+    The sample sensor reports how close the nearest sample is and nothing about
+    which way it lies, and the samples themselves are not on any map the model
+    can read. So every fresh target it picks is a guess. Left without a record of
+    the guesses that already failed, it walks the same corners repeatedly: an
+    easy run spent nineteen metres of battery on one sample by visiting the north
+    -west and south-east corners three times each, while the agent's own policy
+    covered the same ground in eighteen metres and took all three.
+
+    This is the one thing the planner knows and the model cannot infer, so it is
+    stated plainly rather than left to be guessed from the pose history.
+    """
+    if not searched:
+        return ('ГДЕ УЖЕ ИСКАЛИ: пока ничего — это первая точка плана. '
+                'Образцов на карте нет, выбирай любую свободную точку; '
+                'датчик сам подскажет, когда близко.')
+
+    circles = ', '.join(f'({x:.1f}; {y:.1f}) r={r:.1f}' for x, y, r in searched)
+    return (
+        'ГДЕ УЖЕ ИСКАЛИ (кругими отмечены места, где поиск уже прошёл и '
+        'образцов не оказалось):\n'
+        f'  {circles}\n'
+        '  Не ставь goto или search_around внутрь этих кругов: там уже пусто, '
+        'а батарея расходуется на пути. Ищи в непроверенных местах арены.\n'
+        '  Если датчик молчит, лучше короткий круг на непроверенном участке, '
+        'чем переезд через всю арену к уже проверенному углу.'
+    )
 
 
 def _budget_block(state: dict[str, Any],

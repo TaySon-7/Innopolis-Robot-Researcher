@@ -10,17 +10,26 @@ the planner both slower and less reliable.
 from __future__ import annotations
 
 import json
-from math import hypot
+from math import cos, hypot, radians, sin
 import threading
 from typing import Any
 
 from did_llm.agent_plan import (
-    NOISE_UNTRUSTWORTHY,
+    ARENA,
+    COLLISION_RADIUS_M,
+    PILLAR_KEEPOUT,
+    SEARCH_WORTH_IT,
+    SIGNAL_CLOSE,
     SIGNAL_NEAR,
+    SIGNAL_TAKE,
+    BASE_X,
+    BASE_Y,
     Plan,
     PlanRejected,
     Subgoal,
+    arena_problem,
     check_plan,
+    signal_margin,
     home_plan,
     must_return,
     parse_model_plan,
@@ -71,6 +80,62 @@ STOP_REASON = {
 HOLD_PLAN = {'subgoals': []}
 
 
+#: Search circle used when the reading says a sample is a step away. Tight,
+#: because the point is to close the last half metre, not to sweep the area.
+CLOSE_SEARCH_RADIUS_M = 0.35
+
+#: Reach of the sample sensor in metres, so a reading can be turned back into a
+#: distance. Taken from the scenario the judge runs.
+SENSOR_RANGE_M = 1.5
+
+#: Smallest difference in radius that counts as a wider circle. A hair wider is
+#: not worth throwing away a search that is already running.
+SEARCH_REACH_SLACK_M = 0.05
+
+#: How many swept circles are named in the prompt. Enough to cover an arena of
+#: roughly this size, short enough that the block stays a paragraph rather than
+#: the longest thing in it.
+SEARCH_MEMORY = 12
+
+
+def search_radius(margin: float) -> float:
+    """The circle to sweep for a sample the reading puts ``margin`` above noise.
+
+    A strong reading means a close sample, and a close sample is best closed in
+    on with a tight circle: a wide one walks the robot back out of range it
+    already has. A weak reading means the sample is somewhere in the neighbourhood
+    and the circle has to be wide enough to sense it. The band between the two
+    is where a circle narrower than the distance fails outright — it sweeps
+    ground the sample is not on — so the circle is never allowed below what the
+    reading implies.
+    """
+    if margin >= SIGNAL_CLOSE:
+        base = CLOSE_SEARCH_RADIUS_M
+    else:
+        base = max(CLOSE_SEARCH_RADIUS_M, min(0.9, 1.6 * (1.0 - margin)))
+    # Cover the distance the reading implies, within the slack.
+    reaches = SENSOR_RANGE_M * (1.0 - margin) - SEARCH_REACH_SLACK_M
+    return round(min(0.9, max(base, reaches)), 2)
+
+
+def _nearest_solid(x: float, y: float) -> float:
+    """How much room a point leaves: the gap to the nearest pillar or wall.
+
+    Scored on the same numbers :func:`arena_problem` refuses a plan for, so a
+    point it calls clear scores well and a point just past the limit scores near
+    zero. Used to choose a way out of a stuck spot, where the point being
+    technically legal matters less than the point actually being drivable.
+    """
+    arena = ARENA
+    room = min(
+        x - arena.x_min, arena.x_max - x,
+        y - arena.y_min, arena.y_max - y,
+    )
+    for px, py, radius in arena.pillars:
+        room = min(room, hypot(x - px, y - py) - max(PILLAR_KEEPOUT, radius + 0.2))
+    return room
+
+
 def _with_collect(subgoals: list[Subgoal]) -> list[Subgoal]:
     """Insert a ``collect`` after each ``search_around`` that lacks one."""
     result: list[Subgoal] = []
@@ -97,7 +162,10 @@ class PlannerConfig:
                  handover_after_failures: int = 3,
                  resume_after_sec: float = 20.0,
                  autonomous_fallback: bool = True,
-                 interrupt_pause_sec: float = 12.0) -> None:
+                 interrupt_pause_sec: float = 12.0,
+                 collision_pause_sec: float = 15.0,
+                 collision_avoid_sec: float = 45.0,
+                 collision_radius_m: float = COLLISION_RADIUS_M) -> None:
         self.mission = mission
         self.min_subgoals = min_subgoals
         self.max_subgoals = max_subgoals
@@ -112,6 +180,9 @@ class PlannerConfig:
         #: result to the model.
         self.autonomous_fallback = autonomous_fallback
         self.interrupt_pause_sec = interrupt_pause_sec
+        self.collision_pause_sec = collision_pause_sec
+        self.collision_avoid_sec = collision_avoid_sec
+        self.collision_radius_m = collision_radius_m
 
 
 class Planner:
@@ -155,6 +226,12 @@ class Planner:
         #: When the signal last forced an interruption, to keep the robot from
         #: being sent in circles.
         self.last_interrupt_at = -1e9
+        #: Where the robot last hit something, and when: (x, y, t).
+        self.collisions: list[tuple[float, float, float]] = []
+        #: When the last collision triggered a stop, to debounce.
+        self.last_collision_stop = -1e9
+        #: Search circles already swept, so the model is not sent back to them.
+        self.searched: list[tuple[float, float, float]] = []
         #: A model call in flight, and its result once it lands.
         self.busy = False
         self.busy_since = 0.0
@@ -277,6 +354,7 @@ class Planner:
             self.cfg.mission, self.link.state or {},
             self.link.status, self.feedback,
             expensive=self.link.expensive_ground(), budget=budget,
+            searched=self.searched_circles(),
             round_number=self.round_number,
         )
         self.busy = True
@@ -329,6 +407,7 @@ class Planner:
                     sensor_noise=self.link.noise(),
                     pose=self.link.pose(),
                     battery=budget.get('battery'),
+                    hits=self.recent_hits(),
                 )
                 if problems:
                     # Well-formed but unusable: a point on a pillar, the same
@@ -349,10 +428,14 @@ class Planner:
                 )
                 if attempt >= self.cfg.repair_attempts:
                     # Out of repairs, but the endpoint is alive: the model
-                    # answered, it just answered badly. That is what the
-                    # feedback channel is for, so the reason goes into the
-                    # next prompt instead of handing the episode away.
+                    # answered, it just answered badly. Rather than wait for
+                    # another answer — the robot may be standing in the way of
+                    # its own goal — send a plan of our own and move.
                     self.feedback = f'Прошлый план отклонён: {reason}. Исправь.'
+                    escape = self.escape_plan('сам выбраться из застревания')
+                    if escape is not None:
+                        self._publish(escape, source='escape')
+                        return
                     self.last_plan_at = self.link.now()
                     return
                 try:
@@ -374,25 +457,43 @@ class Planner:
                 self.failures = 0
                 continue
 
-            self._trim(plan)
+            self._trim(plan, budget)
             self._publish(plan, source='llm')
             return
 
-    def _trim(self, plan: Plan) -> None:
+    def _trim(self, plan: Plan, budget: dict[str, float]) -> None:
         """Make the plan executable, then cut it down to a workable size.
 
-        Two things happen here, in this order.
+        Three things happen here, in this order.
 
         First, a ``collect`` is added after every ``search_around`` that is not
         already followed by one. Searching and then not collecting is always a
         mistake — ``search_around`` deliberately ends next to a sample — and
         models omit it often enough that leaving it out silently scores zero.
 
+        Then a premature ``return_to_base`` is dropped.
+
         Then the list is shortened. Trimming keeps the tail, not the head: the
         head is where the plan commits to a direction, and a cut that removes
         it leaves a plan that starts halfway through.
         """
         plan.subgoals = _with_collect(plan.subgoals)
+
+        # A trailing ``return_to_base`` while samples remain ends the episode at
+        # whatever has been collected, so it is refused. Refusing the whole plan
+        # for it is wasteful, though: the searches in front of it are exactly
+        # what the robot should be doing, and cutting the last subgoal off
+        # leaves those. It was the single most common rejection — the model
+        # reaches for it almost every round — and each one cost a repair call
+        # while the robot stood still.
+        if (plan.subgoals and plan.subgoals[-1].type == 'return_to_base'
+                and self.link.remaining_samples()):
+            floor = budget.get('floor')
+            if floor is None or floor > SEARCH_WORTH_IT:
+                plan.subgoals = plan.subgoals[:-1]
+                if plan.explanation:
+                    plan.explanation += (
+                        ' Домой отложил: образцы ещё остались.')
 
         limit = self.cfg.max_subgoals
         if len(plan.subgoals) > limit:
@@ -459,9 +560,125 @@ class Planner:
                                  'сейчас датчик снова указывает на ближайший')
                 self.force_replan = True
                 continue
+            if name == 'collision':
+                self._note_collision()
+                continue
             if name in STOP_EVENTS:
                 self.stop_and_replan(name)
                 return True
+
+    def _note_collision(self) -> bool:
+        """Remember where the robot hit something, and stop once per burst.
+
+        The judge emits a collision at most every two seconds, so a robot that
+        is stuck produces a steady stream of them. Two things follow.
+
+        Only the first of a burst is recorded. A robot pressed against a wall
+        does not move, so every later event carries the same position, and
+        recording them all grows the forbidden area without ever moving the
+        robot out of it.
+
+        Only the first triggers a stop and a new plan. Reacting to each one
+        means a model call every two seconds and a plan aimed at the same
+        obstacle.
+        """
+        if self.link.now() - self.last_collision_stop < self.cfg.collision_pause_sec:
+            return False
+
+        pose = self.link.pose()
+        if pose is not None:
+            self.collisions.append((pose[0], pose[1], self.link.now()))
+            del self.collisions[:-8]
+
+        self.last_collision_stop = self.link.now()
+        self.feedback = STOP_REASON['collision']
+        self.stop_and_replan('collision')
+        return True
+
+    def escape_plan(self, why: str) -> Plan | None:
+        """A plan of our own to get the robot moving again.
+
+        Two things leave the robot stranded: the model keeps proposing targets
+        next to the place it just hit, or its answer breaks a rule and there is
+        nothing to send. Waiting for another answer is what keeps it stuck,
+        because it is standing in the way of its own goal.
+
+        The way out must be a *different* place, not the one it is stuck in.
+        Searching where it already stands does nothing when the problem is that
+        it is standing somewhere impossible — pressed against a pillar, say —
+        which is exactly how it ends up colliding every two seconds.
+
+        Heading for the middle of the arena sounds safe and is not: the base can
+        sit behind the pillar the robot is wedged against, so a fixed direction
+        walks it back into the same obstacle. An earlier version did that and
+        spent five consecutive escapes driving five centimetres, each one long
+        enough to touch the pillar again. So the direction is chosen instead of
+        assumed — the one that leaves the most room from every obstacle, which is
+        the one that can actually be driven.
+
+        The plan is ours, so it skips validation: it exists precisely because
+        nothing the model produced was acceptable.
+        """
+        pose = self.link.pose()
+        if pose is None:
+            return None
+
+        spot = self._clearest_way_out(pose)
+        if spot is None:
+            # Nothing around the robot is clear. A pillar is not a wall: the
+            # robot can push past it, and standing still cannot go anywhere at
+            # all. Refusing to leave here is how a stuck robot burns the rest of
+            # the episode, so the shortest hop out is taken regardless.
+            spot = (pose[0] + 0.6, pose[1])
+            self.link.log.warn('план-замена: вокруг всё занято, иду сквозь')
+
+        self.link.log.warn(f'план-замена: {why} — иду в ({spot[0]:.2f}; {spot[1]:.2f})')
+        return Plan(
+            plan_id=self._next_id(),
+            subgoals=[Subgoal(type='goto', x=round(spot[0], 2), y=round(spot[1], 2)),
+                      Subgoal(type='search_around',
+                              x=round(spot[0], 2), y=round(spot[1], 2),
+                              radius=CLOSE_SEARCH_RADIUS_M),
+                      Subgoal(type='collect')],
+            explanation=why,
+        )
+
+    def _clearest_way_out(self, pose: tuple[float, float],
+                          step: float = 0.9) -> tuple[float, float] | None:
+        """The reachable point around the robot with the most room around it.
+
+        Every direction is tried and scored by how far it leaves the robot from
+        anything solid, rather than by pointing at some fixed place. Ties go to
+        the point nearest the middle, so two equivalent ways out do not send the
+        robot to the same corner twice.
+        """
+        best = None
+        best_score = None
+        for degrees in range(0, 360, 15):
+            angle = radians(degrees)
+            point = (pose[0] + step * cos(angle), pose[1] + step * sin(angle))
+            if arena_problem(*point) is not None:
+                continue
+            clearance = _nearest_solid(*point)
+            # Prefer room; break ties toward the middle of the arena.
+            score = (round(clearance, 2),
+                     -hypot(point[0] - BASE_X, point[1] - BASE_Y))
+            if best_score is None or score > best_score:
+                best, best_score = point, score
+        return best
+
+    def collisions_near(self, x: float, y: float) -> int:
+        """How many recent impacts are near a point."""
+        now = self.link.now()
+        return sum(1 for cx, cy, when in self.collisions
+                   if now - when < self.cfg.collision_avoid_sec
+                   and hypot(x - cx, y - cy) < self.cfg.collision_radius_m)
+
+    def recent_hits(self) -> list[tuple[float, float]]:
+        """Impact points still worth avoiding."""
+        now = self.link.now()
+        return [(x, y) for x, y, when in self.collisions
+                if now - when < self.cfg.collision_avoid_sec]
 
     def _stop_on_anomaly(self) -> bool:
         """Stop on a raised anomaly flag, once per flag.
@@ -515,10 +732,12 @@ class Planner:
         battery than the interruption saves.
         """
         signal = self.link.signal()
-        if signal is None or signal < SIGNAL_NEAR:
-            return False
-        noise = self.link.noise()
-        if noise is not None and noise >= NOISE_UNTRUSTWORTHY:
+        # Judged against the noise, not against it. A noisy reading is weaker
+        # evidence, not useless evidence: the sensor fault in the hard scenario
+        # runs for minutes, and treating every reading during it as void left
+        # the robot driving past samples a few tens of centimetres away.
+        margin = signal_margin(signal, self.link.noise())
+        if margin < SIGNAL_NEAR:
             return False
 
         subgoal = self._current_subgoal()
@@ -528,9 +747,18 @@ class Planner:
         pose = self.link.pose()
         if pose is None:
             return False
-        # Already searching where it stands: let it finish.
+        # A search in progress is normally left alone — interrupting it every
+        # tick would spin the robot in place. But its circle has a fixed radius,
+        # and a circle narrower than the reading calls for searches ground the
+        # sample is not on: a 0.5 m circle centred 0.65 m from the sample spent
+        # its whole budget turning on the spot and then failed, with the sensor
+        # reading 0.57 throughout. So it is replaced only by a *wider* circle,
+        # never by the same one — which also guarantees this ends instead of
+        # interrupting the search with an identical plan every tick.
+        wanted = search_radius(margin)
         if (subgoal.type == 'search_around'
-                and hypot(subgoal.x - pose[0], subgoal.y - pose[1]) < 0.6):
+                and hypot(subgoal.x - pose[0], subgoal.y - pose[1]) < 0.6
+                and subgoal.radius >= wanted - SEARCH_REACH_SLACK_M):
             return False
         # A live signal persists while the robot circles the sample, so without
         # a pause the interrupt would fire every tick and the robot would spin
@@ -538,22 +766,65 @@ class Planner:
         if self.link.now() - self.last_interrupt_at < self.cfg.interrupt_pause_sec:
             return False
 
-        radius = max(0.35, min(0.9, 1.6 * (1.0 - signal)))
+        # Above 0.80 the sample is already within the radius where collect
+        # succeeds, so searching would drive the robot around it and out of that
+        # radius again — the reading that says "take it" is the one moment not to
+        # look for it. Their search calls 0.7 found, which is 0.45 m and still too
+        # far, so the spiral would walk away from a sample the robot could have
+        # taken standing still.
+        if margin >= SIGNAL_TAKE:
+            subgoals = [Subgoal(type='collect')]
+            why = 'сигнал выше 0.80 — образец в пределах сбора, беру сразу'
+        else:
+            radius = wanted
+            subgoals = [Subgoal(type='search_around',
+                                x=round(pose[0], 2), y=round(pose[1], 2),
+                                radius=round(radius, 2)),
+                        Subgoal(type='collect')]
+            why = 'образец рядом, ищу на месте'
+
         plan = Plan(
             plan_id=self._next_id(),
-            subgoals=[Subgoal(type='search_around',
-                              x=round(pose[0], 2), y=round(pose[1], 2),
-                              radius=round(radius, 2)),
-                      Subgoal(type='collect')],
-            explanation=(f'сигнал датчика {signal:.2f}: образец рядом, '
-                         'ищу на месте'),
+            subgoals=subgoals,
+            explanation=(f'сигнал датчика {signal:.2f} при шуме '
+                         f'{(self.link.noise() or 0.0):.2f}: {why}'),
         )
         self.link.log.warn(
-            f'сигнал {signal:.2f}, текущая подцель {subgoal.describe()} — '
+            f'сигнал {signal:.2f} шум {(self.link.noise() or 0.0):.2f} '
+            f'(запас {margin:.2f}), текущая подцель {subgoal.describe()} — '
             'прерываю план, образец рядом')
         self.last_interrupt_at = self.link.now()
         self._publish(plan, source='signal')
+        # Whether the sample was taken or not, the model decides what comes
+        # next. Left to its own schedule it would keep this two-subgoal plan
+        # running and never look at the arena again.
+        self.force_replan = True
         return True
+
+    def _remember_search(self, plan: Plan) -> None:
+        """Note the ground a plan's searches will have covered.
+
+        The sample sensor says how close the nearest sample is and never which
+        way, and no map in the prompt shows where samples are, so the model picks
+        targets blind. The one thing that stops it picking the same blind target
+        twice is being told what it already covered — and that record has to
+        live here, because the model has no memory between rounds and the pose
+        history does not distinguish "searched and empty" from "never went
+        there".
+        """
+        for subgoal in plan.subgoals:
+            if subgoal.type != 'search_around':
+                continue
+            circle = (subgoal.x, subgoal.y, subgoal.radius)
+            if any(hypot(circle[0] - x, circle[1] - y) < 0.05
+                   for x, y, _ in self.searched):
+                continue
+            self.searched.append(circle)
+        del self.searched[:-SEARCH_MEMORY]
+
+    def searched_circles(self) -> list[tuple[float, float, float]]:
+        """The circles the model is told have already been swept."""
+        return list(self.searched)
 
     def _current_subgoal(self) -> Subgoal | None:
         """The subgoal the executor is on, taken from the plan we sent."""
@@ -646,6 +917,7 @@ class Planner:
         self.inflight = plan.plan_id
         self.last_plan_at = self.link.now()
         self.force_replan = False
+        self._remember_search(plan)
         self.sent_subgoals = [(plan.plan_id, index, subgoal)
                               for index, subgoal in enumerate(plan.subgoals)]
         # Any plan that ends at the base is a decision to stop exploring, so
