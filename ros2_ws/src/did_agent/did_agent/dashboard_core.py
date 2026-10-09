@@ -315,6 +315,8 @@ class DashboardData:
         self.plan_text = ''
         self.events: deque[dict[str, Any]] = deque(maxlen=60)
         self.journal: deque[dict[str, Any]] = deque(maxlen=100)
+        #: The planner's hypothesis book: claim, rule, status and evidence.
+        self.hypotheses: list[dict[str, Any]] = []
         self.trail: deque[tuple[float, float]] = deque(maxlen=3000)
         self.collected_at: list[tuple[float, float]] = []
 
@@ -358,6 +360,14 @@ class DashboardData:
     def on_journal(self, entry: dict[str, Any]) -> None:
         with self.lock:
             self.journal.append(entry)
+
+    def on_hypotheses(self, payload: dict[str, Any]) -> None:
+        """Replace the hypothesis book wholesale; each publish is the full set."""
+        items = payload.get('hypotheses')
+        if not isinstance(items, list):
+            return
+        with self.lock:
+            self.hypotheses = [item for item in items if isinstance(item, dict)]
 
     def on_plan(self, text: str) -> None:
         """Remember the last plan and its explanation (shown as a decision)."""
@@ -421,6 +431,7 @@ class DashboardData:
             self.plan_text = ''
             self.events.clear()
             self.journal.clear()
+            self.hypotheses.clear()
             self.trail.clear()
             if self.pose is not None:
                 self.trail.append((self.pose['x'], self.pose['y']))
@@ -436,6 +447,7 @@ class DashboardData:
                 'trail': [list(point) for point in self.trail],
                 'events': list(self.events),
                 'journal': list(self.journal),
+                'hypotheses': list(self.hypotheses),
                 'costmap': self.costmap,
                 'plan': self.plan_text,
                 'collected_at': self.collected_at,

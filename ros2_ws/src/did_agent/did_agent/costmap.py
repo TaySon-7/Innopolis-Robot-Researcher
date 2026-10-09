@@ -11,6 +11,14 @@ from did_agent.grid import GridMap
 from did_agent.grid import load_map
 
 
+# How long a lidar-seen obstacle stays blocked without a fresh sighting: a
+# false positive or a moved object must not poison the map forever.
+OBSTACLE_TTL = 60.0
+# A disk blocked because it hurt the robot is knowledge about the world, not a
+# transient reading, so it outlives obstacle evidence by a factor of three.
+HAZARD_TTL = 180.0
+
+
 def _disk_offsets(radius_cells: float) -> list[tuple[int, int, float]]:
     reach = int(np.ceil(radius_cells))
     return [
@@ -80,6 +88,9 @@ class CostMap:
         self.terrain = np.ones(self.grid.shape, dtype=np.float32)
         self.last_seen = np.full(self.grid.shape, -1e9, dtype=np.float32)  # when evidence last arrived
         self._dynamic = np.zeros(self.grid.shape, dtype=bool)
+        # When the dynamic block on a cell runs out; -inf for "just blocked",
+        # +inf for evidence given without a timestamp (never expires).
+        self._dynamic_until = np.full(self.grid.shape, -np.inf, dtype=np.float32)
         self.blocked = self.static_blocked.copy()
         self.version = 0
 

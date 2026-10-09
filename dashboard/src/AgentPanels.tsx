@@ -10,6 +10,7 @@ import { useMemo, useState } from 'react'
 import { describeSubgoal, parsePlan } from './agentApi'
 import type {
   AgentConnection,
+  AgentHypothesis,
   AgentJournalEntry,
   AgentSnapshot,
   JudgeEvent,
@@ -162,6 +163,78 @@ function eventDetails(event: JudgeEvent) {
 interface AgentJournalProps {
   journal: AgentJournalEntry[]
   events: JudgeEvent[]
+}
+
+interface AgentHypothesisProps {
+  hypotheses: AgentHypothesis[]
+}
+
+const HYPOTHESIS_STATUS: Record<string, string> = {
+  open: 'проверяется',
+  confirmed: 'подтверждена',
+  rejected: 'не подтвердилась',
+}
+
+/**
+ * The experiment's hypotheses, as a table rather than as prose.
+ *
+ * This is the part of the run a judge reads to decide whether the agent was
+ * doing science or driving around. A claim is only worth showing next to the
+ * rule that would settle it and the verdict that came back, so all three are
+ * on the row rather than behind a click — a hypothesis with no verdict is
+ * visibly unfinished, which is what it is.
+ */
+export function AgentHypothesisPanel({ hypotheses }: AgentHypothesisProps) {
+  const counts = useMemo(() => {
+    const tally = { open: 0, confirmed: 0, rejected: 0 }
+    for (const item of hypotheses) {
+      if (item.status === 'confirmed') tally.confirmed += 1
+      else if (item.status === 'rejected') tally.rejected += 1
+      else tally.open += 1
+    }
+    return tally
+  }, [hypotheses])
+
+  return (
+    <section className="panel hypothesis-panel">
+      <div className="panel-header">
+        <div>
+          <span className="eyebrow">НАУЧНЫЙ ЦИКЛ</span>
+          <h2>Гипотезы</h2>
+        </div>
+        <div className="hypothesis-counts">
+          <span>в работе <b>{counts.open}</b></span>
+          <span>подтверждено <b>{counts.confirmed}</b></span>
+          <span>отброшено <b>{counts.rejected}</b></span>
+        </div>
+      </div>
+      <div className="hypothesis-list">
+        {!hypotheses.length && (
+          <p className="hypothesis-empty">
+            Гипотез пока нет. Планировщик формулирует их, когда у данных
+            появляется смысл, который можно опровергнуть измерением.
+          </p>
+        )}
+        {hypotheses.slice().reverse().map((item) => (
+          <article className="hypothesis" key={item.id}>
+            <header>
+              <span className={`hypothesis-status is-${item.status ?? 'open'}`}>
+                {HYPOTHESIS_STATUS[item.status ?? 'open'] ?? item.status}
+              </span>
+              <strong>{item.claim}</strong>
+            </header>
+            <dl>
+              <dt>Проверка</dt>
+              <dd>{item.testable}</dd>
+              <dt>Замер</dt>
+              <dd>{item.measurement}</dd>
+            </dl>
+            {item.verdict && <p className="hypothesis-verdict">{item.verdict}</p>}
+          </article>
+        ))}
+      </div>
+    </section>
+  )
 }
 
 interface AgentPlanProps {

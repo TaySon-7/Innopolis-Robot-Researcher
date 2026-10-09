@@ -86,6 +86,7 @@ class DashboardNode(Node):
         self._json_topic('/agent/status', self.data.on_status)
         self._json_topic('/agent/costmap', self.data.on_costmap)
         self._json_topic('/agent/journal', self.data.on_journal)
+        self._json_topic('/agent/hypotheses', self.data.on_hypotheses)
         self._json_topic('/did/events', self.data.on_event, depth=50)
         self._json_topic('/did/score', self._on_score)
         self.create_subscription(String, '/agent/plan', self._on_plan, 10)

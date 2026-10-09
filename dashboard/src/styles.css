@@ -515,6 +515,24 @@ button:disabled { opacity: .38; cursor: not-allowed; }
 .journal-tag--search { border-color: rgba(37,217,199,.55); color: var(--teal); }
 .journal-tag--collect { border-color: rgba(110,231,168,.55); color: var(--green); }
 
+.hypothesis-panel { display: flex; flex-direction: column; }
+.hypothesis-counts { display: flex; gap: 10px; color: var(--dim); font-size: .65rem; }
+.hypothesis-counts b { color: var(--text); font-family: "JetBrains Mono", monospace; font-weight: 600; }
+.hypothesis-list { max-height: clamp(220px, 26vh, 320px); overflow-y: auto; overscroll-behavior: contain; }
+.hypothesis-empty { padding: 22px 16px; color: var(--dim); font-size: .73rem; line-height: 1.55; text-align: center; }
+.hypothesis { padding: 12px 14px; border-bottom: 1px solid rgba(30,55,64,.72); }
+.hypothesis:last-child { border-bottom: 0; }
+.hypothesis header { display: flex; align-items: baseline; gap: 7px; }
+.hypothesis header strong { color: #cedddb; font-size: .76rem; font-weight: 600; line-height: 1.4; }
+.hypothesis-status { flex: none; padding: 2px 6px; border: 1px solid var(--line-bright); border-radius: 4px; font-size: .54rem; text-transform: uppercase; }
+.hypothesis-status.is-open { border-color: rgba(125,168,255,.55); color: #9bbcff; }
+.hypothesis-status.is-confirmed { border-color: rgba(110,231,168,.5); color: var(--green); }
+.hypothesis-status.is-rejected { border-color: rgba(242,120,120,.5); color: #f28; }
+.hypothesis dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 9px; margin: 8px 0 0; font-size: .67rem; }
+.hypothesis dt { color: var(--dim); }
+.hypothesis dd { margin: 0; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: .64rem; overflow-wrap: anywhere; }
+.hypothesis-verdict { margin: 8px 0 0; padding-left: 8px; border-left: 2px solid var(--line-bright); color: var(--muted); font-size: .68rem; line-height: 1.5; }
+
 .control-heading p { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--muted); font-size: .67rem; }
 .control-heading p svg { color: var(--amber); }
 .control-body { display: grid; grid-template-columns: 190px minmax(260px, 1fr) 136px; gap: 26px; align-items: center; padding: 15px 18px 17px; }

@@ -219,6 +219,38 @@ def _floor_gap(x: float, y: float,
     return best if crosses % 2 else -best
 
 
+def _cheaper_option_exists(
+    pose: tuple[float, float],
+    expensive: list[dict[str, Any]] | None,
+    battery: float,
+) -> bool:
+    """Whether some arena point is both reachable cheaply and worth reaching.
+
+    Sampled on a coarse lattice rather than solved for: the question is only
+    whether the expensive crossing has an alternative, and an answer off by a
+    cell does not change what the planner should do.
+    """
+    step = 0.8
+    reach = max(1.0, battery * LEG_SHARE)
+    y = ARENA.y_min + step / 2
+    while y < ARENA.y_max:
+        x = ARENA.x_min + step / 2
+        while x < ARENA.x_max:
+            point = (x, y)
+            x += step
+            distance = hypot(point[0] - pose[0], point[1] - pose[1])
+            if distance < 1.0 or distance > reach:
+                continue
+            if on_expensive_ground(point[0], point[1], expensive):
+                continue
+            dearest = max((float(patch['cost']) for patch in expensive or ()
+                           if _leg_crosses(pose, point, patch)), default=1.0)
+            if distance * dearest <= LEG_WORTH_COST:
+                return True
+        y += step
+    return False
+
+
 def arena_problem(x: float, y: float) -> str | None:
     """Why a point is unusable, or None when it is free floor.
 
@@ -743,12 +775,24 @@ def check_plan(plan: Plan,
                                            patch)),
                           default=1.0)
             price = distance * dearest
-            if price > LEG_WORTH_COST or price > battery * LEG_SHARE:
-                problems.append(
-                    f'подцель {index}: {distance:.1f} м по грунту цены '
-                    f'×{dearest:.1f} — это {price:.0f} ед. батареи за одну '
-                    'точку. Возьми ближнюю или возвращайся')
-                break
+            if price <= LEG_WORTH_COST or price <= battery * LEG_SHARE:
+                continue
+            # Refuse only while something cheaper is actually on offer. The
+            # absolute cap made the episode impossible on `medium@469`, where a
+            # patch priced x4 sits at (-0.32; -0.47) between the base at
+            # (-2.0; -0.5) and the whole right half of the arena: every route
+            # out crossed it, every plan was refused, and eleven of the
+            # twenty-one refusals in that run were this rule. Paying for the
+            # crossing is the only way to reach anything at all; whether it is
+            # worth it is a question about the battery, which the next rule
+            # already answers.
+            if not _cheaper_option_exists(pose, expensive, battery):
+                continue
+            problems.append(
+                f'подцель {index}: {distance:.1f} м по грунту цены '
+                f'×{dearest:.1f} — это {price:.0f} ед. батареи за одну '
+                'точку. Возьми ближнюю или возвращайся')
+            break
 
     searches = [i for i, s in enumerate(plan.subgoals) if s.type == 'search_around']
     collects = [i for i, s in enumerate(plan.subgoals) if s.type == 'collect']
@@ -765,6 +809,16 @@ def check_plan(plan: Plan,
         before = plan.subgoals[:index]
         if not any(item.type in ('search_around',) for item in before):
             if take_now:
+                continue
+            # A plan that is nothing but "collect" cannot be a plan that forgot
+            # to search: it is "take it", and that is what this planner asks for
+            # when the reading clears the take threshold. It was still being
+            # refused on `medium@469`, three times, because the skill fires on
+            # the reading of the moment and the model answers a few seconds
+            # later — by which time the robot has drifted and the reading has
+            # fallen, so a decision made on the better information was thrown
+            # out on the worse.
+            if len(plan.subgoals) == 1:
                 continue
             problems.append(
                 f'подцель {index}: collect без предшествующего поиска — '

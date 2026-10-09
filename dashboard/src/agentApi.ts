@@ -24,6 +24,19 @@ export interface AgentJournalEntry {
   text?: string
 }
 
+export interface AgentHypothesis {
+  id: string
+  claim: string
+  testable: string
+  measurement: string
+  raised_at?: number
+  status?: 'open' | 'confirmed' | 'rejected' | string
+  verdict?: string
+  resolved_at?: number | null
+  /** How many measurements were taken behind the verdict. */
+  evidence?: number
+}
+
 export interface JudgeEvent {
   t?: number
   event?: string
@@ -95,6 +108,8 @@ export interface AgentSnapshot {
   trail: Array<[number, number]>
   events: JudgeEvent[]
   journal: AgentJournalEntry[]
+  /** The planner's hypothesis book; absent until the planner publishes one. */
+  hypotheses?: AgentHypothesis[]
   costmap: AgentCostmap
   plan: string
   collected_at: Array<[number, number]>
@@ -203,6 +218,7 @@ const EMPTY_SNAPSHOT: AgentSnapshot = {
   trail: [],
   events: [],
   journal: [],
+  hypotheses: [],
   costmap: {
     version: -1,
     knowledge: [],

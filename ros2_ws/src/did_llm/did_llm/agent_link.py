@@ -21,6 +21,9 @@ STATUS_TOPIC = '/agent/status'
 COMMAND_TOPIC = '/agent/command'
 JOURNAL_TOPIC = '/agent/journal'
 
+#: The hypothesis book as a table, published alongside the prose journal.
+HYPOTHESIS_TOPIC = '/agent/hypotheses'
+
 #: The agent's own cost map. It is the only place the expensive ground the
 #: learner has measured actually appears: ``/agent/state`` carries an empty
 #: ``cost_map_updates`` until an analyst pushes something, so a planner that
@@ -57,6 +60,7 @@ class AgentLink:
         self.plan_pub = node.create_publisher(String, PLAN_TOPIC, 10)
         self.command_pub = node.create_publisher(String, COMMAND_TOPIC, 10)
         self.journal_pub = node.create_publisher(String, JOURNAL_TOPIC, 10)
+        self.hypothesis_pub = node.create_publisher(String, HYPOTHESIS_TOPIC, 10)
 
         self.state: dict[str, Any] | None = None
         self.state_at: float | None = None
@@ -294,6 +298,18 @@ class AgentLink:
     def publish_command(self, command: str) -> None:
         self.command_pub.publish(
             String(data=json.dumps({'cmd': command})))
+
+    def publish_hypotheses(self, hypotheses: list[dict[str, Any]]) -> None:
+        """Publish the hypothesis book, for the dashboard's own panel.
+
+        Separate from the journal because the journal is prose and this is the
+        table: every claim with its rule, its status and the evidence behind it.
+        A dashboard that has to reassemble the table out of sentences cannot
+        show a count, and a count is the part a viewer checks first.
+        """
+        self.hypothesis_pub.publish(
+            String(data=json.dumps({'hypotheses': hypotheses},
+                                   ensure_ascii=False)))
 
     def journal(self, kind: str, title: str, text: str = '',
                 status: str = 'open', **extra: Any) -> None:

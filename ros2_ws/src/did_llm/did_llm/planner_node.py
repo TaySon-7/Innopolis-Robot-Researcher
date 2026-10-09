@@ -39,8 +39,11 @@ from did_llm.agent_plan import (
     plan_response_format,
     spendable_budget,
 )
+from did_llm.hypothesis import HypothesisBook
 from did_llm.llm_client import LLMClient, LLMUnavailable
 from did_llm.prompts import (
+    HYPOTHESIS_SYSTEM,
+    build_hypothesis_prompt,
     build_planner_system,
     build_planner_prompt,
 )
@@ -91,6 +94,14 @@ CLOSE_SEARCH_RADIUS_M = 0.35
 #: Reach of the sample sensor in metres, so a reading can be turned back into a
 #: distance. Taken from the scenario the judge runs.
 SENSOR_RANGE_M = 1.5
+
+#: How long the scientific loop waits between model calls for hypotheses.
+#:
+#: Longer than the planning period on purpose. A hypothesis is a question about
+#: the environment, not about the next subgoal, so it becomes worth asking once
+#: the world has had time to answer the previous one — and asking faster spends
+#: the same budget on restatements of a claim already in the book.
+HYPOTHESIS_PERIOD_SEC = 45.0
 
 #: Smallest difference in radius that counts as a wider circle. A hair wider is
 #: not worth throwing away a search that is already running.
@@ -366,6 +377,14 @@ class Planner:
         self.rejections: list[str] = []
         #: Recent plans and their outcomes, so the model does not repeat itself.
         self.plan_history: list[dict[str, Any]] = []
+        #: The experiment's hypotheses and what became of them.
+        self.hypotheses = HypothesisBook()
+        #: When the model was last asked for hypotheses, so a cheap tick cannot
+        #: spend the budget on the same question every second.
+        self.last_hypothesis_at = -1e9
+        #: A model call for hypotheses in flight, and its answer once it lands.
+        self.hypothesis_busy = False
+        self.hypothesis_pending: tuple[str, dict[str, float]] | None = None
 
     # ------------------------------------------------------------- statistics
     def stats(self) -> dict[str, Any]:
@@ -373,6 +392,7 @@ class Planner:
             **self.client.stats(),
             'plans': self.plan_counter,
             'rejections': len(self.rejections),
+            **self.hypotheses.stats(),
         }
 
     # ------------------------------------------------------------------ cycle
@@ -423,6 +443,7 @@ class Planner:
         self.yielded = False
 
         self._trace_reading()
+        self._run_hypothesis_cycle()
 
         outcome = self._last_outcome()
         if outcome is not None:
@@ -996,31 +1017,9 @@ class Planner:
         model or by answering mechanically because the model cannot be asked.
         """
         if self.pending_skill is not None:
-            # The robot has already been stopped for this skill. If the model
-            # has not answered by now, stop waiting: an episode standing still
-            # is the one failure mode nothing recovers from, so the mechanical
-            # answer goes out rather than the robot idling.
-            if (self.link.now() - self.last_skill_at > SKILL_WATCHDOG_SEC
-                    and not self.busy and self.pending is None):
-                skill, why = self.pending_skill
-                self.link.log.warn(
-                    f'модель не ответила на скил «{skill}» за '
-                    f'{SKILL_WATCHDOG_SEC:.0f} с — отвечаю сам, робот стоял')
-                self.pending_skill = None
-                self._publish(escape_plan(self._next_id(),
-                                          'скил без ответа модели'),
-                              source='skill-watchdog')
-            return False
-        if not self.client.cfg.configured:
-            return False
-        if self.busy or self.pending is not None:
-            margin = signal_margin(self.link.signal(), self.link.noise())
-            band_hint, _ = self._signal_skill(margin)
-            if band_hint is not None and band_hint != self._skill_announced:
-                self._skill_announced = band_hint
-                self.link.log.info(
-                    f'скил «{band_hint}» ждёт вызова модели '
-                    f'(busy={self.busy})')
+            # The robot has already been stopped for this skill and is waiting
+            # for the model. Nothing else to do here; the question below cannot
+            # be asked again while this one is outstanding.
             return False
         margin = signal_margin(self.link.signal(), self.link.noise())
         band, is_new = self._signal_skill(margin)
@@ -1242,6 +1241,12 @@ class Planner:
         # Plan history belongs to the previous episode. Kept, it would steer
         # the model away from ground that is now worth searching again.
         self.plan_history.clear()
+        # The same holds for hypotheses: they were claims about the previous
+        # run's samples and its floor, and half of them are about to be settled
+        # against measurements taken in a different run.
+        self.hypotheses.reset()
+        self.hypothesis_pending = None
+        self.hypothesis_busy = False
 
     def _operator_is_driving(self) -> bool:
         """Whether a plan this planner did not write is running on the agent.
@@ -1364,6 +1369,121 @@ class Planner:
                 # home again is the same plan; the agent's own policy is the
                 # thing that can finish what we started.
                 self._go_autonomous('возврат на базу не завершил эпизод')
+
+    # ---------------------------------------------------------------- hypotheses
+    def _hypothesis_measurements(self) -> dict[str, float]:
+        """What the agent currently measures, in the names a rule uses.
+
+        Named after the two comparisons the prompt asks for, so a rule written
+        as "drain_here > 1.3 * drain_mean" settles against the reading the
+        agent already publishes rather than a number invented here.
+        """
+        state = self.link.state or {}
+        sensor = state.get('sensor') if isinstance(state.get('sensor'), dict) else {}
+        readings = [
+            float(value) for value in (
+                sensor.get('value') if isinstance(sensor, dict) else None,
+            )
+            if isinstance(value, (int, float))
+        ]
+        noise = state.get('sensor', {})
+        noise = noise.get('noise_estimate') if isinstance(noise, dict) else None
+        battery = self.link.battery()
+        return {
+            'drain_here': float(sensor.get('value', 0.0)) if isinstance(sensor, dict) else 0.0,
+            'drain_mean': sum(readings) / len(readings) if readings else 1.0,
+            'sd_now': float(noise) if isinstance(noise, (int, float)) else 0.0,
+            'sd_baseline': 0.02,
+            'battery': float(battery) if isinstance(battery, (int, float)) else 0.0,
+        }
+
+    def _ask_model_for_hypotheses(self) -> None:
+        """Put the measurements to the model as a scientific question.
+
+        Run on a thread like the planner call, and for the same reason: the
+        call takes tens of seconds and the tick has to stay responsive, or the
+        robot cannot be interrupted for a signal or an event while it waits.
+        """
+        if self.hypothesis_busy or not self.client.cfg.configured:
+            return
+        measurements = self._hypothesis_measurements()
+        self.hypothesis_busy = True
+        self.last_hypothesis_at = self.link.now()
+        prompt = build_hypothesis_prompt(
+            self.link.state or {}, measurements)
+
+        def work() -> None:
+            try:
+                answer = self.client.complete_json(
+                    HYPOTHESIS_SYSTEM, prompt, tag='hypothesis')
+                self.hypothesis_pending = (prompt, answer)
+            except LLMUnavailable as error:
+                self.link.log.info(f'гипотезы не сгенерированы: {error}')
+                self.hypothesis_busy = False
+            except Exception as error:  # noqa: BLE001 - a thread must not die
+                self.link.log.info(f'гипотезы: {error}')
+                self.hypothesis_busy = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _collect_hypotheses(self) -> None:
+        """Take the model's answer into the book, then settle what is settled."""
+        if self.hypothesis_pending is None:
+            return
+        _prompt, answer = self.hypothesis_pending
+        self.hypothesis_pending = None
+        self.hypothesis_busy = False
+        now = self.link.now()
+
+        raised = self.hypotheses.raise_from_model(answer, now)
+        for hypothesis in raised:
+            self.link.journal(
+                'hypothesis',
+                f'Гипотеза {hypothesis.id}: {hypothesis.claim}',
+                text=f'Проверка: {hypothesis.testable}. Замер: {hypothesis.measurement}',
+                status='open',
+                source='llm_planner',
+            )
+            self.link.log.info(
+                f'гипотеза {hypothesis.id}: {hypothesis.claim} '
+                f'(проверка: {hypothesis.testable})')
+        if raised:
+            self.link.publish_hypotheses(self.hypotheses.to_wire())
+        self._settle_hypotheses(now)
+
+    def _settle_hypotheses(self, now: float) -> None:
+        """Publish the measurements, then resolve what they decide."""
+        for name, value in self._hypothesis_measurements().items():
+            self.hypotheses.publish_measurement(name, value)
+        for hypothesis in self.hypotheses.settle(now):
+            self.link.journal(
+                'result',
+                f'Гипотеза {hypothesis.id}: {hypothesis.claim}',
+                text=hypothesis.verdict,
+                status=hypothesis.status,
+                source='llm_planner',
+            )
+            self.link.log.info(f'гипотеза {hypothesis.id}: {hypothesis.verdict}')
+        self.link.publish_hypotheses(self.hypotheses.to_wire())
+
+    def _run_hypothesis_cycle(self) -> None:
+        """One pass of the scientific loop: measure, ask, settle."""
+        if self.hypothesis_pending is not None:
+            self._collect_hypotheses()
+            return
+        if not self.client.cfg.configured:
+            return
+        # A hypothesis that is already open should first get the chance to be
+        # tested by new data, so the model is only asked again once the book
+        # has something unresolved and enough time has passed for new evidence.
+        if not self.hypotheses.open_claims():
+            return
+        if self.link.now() - self.last_hypothesis_at < HYPOTHESIS_PERIOD_SEC:
+            return
+        self._settle_hypotheses(self.link.now())
+        if not self.hypotheses.open_claims():
+            return
+        self._ask_model_for_hypotheses()
 
     # ------------------------------------------------------------------ reactions
     def _handle_event(self) -> bool:
