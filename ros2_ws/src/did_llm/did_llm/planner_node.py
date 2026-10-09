@@ -17,6 +17,7 @@ from typing import Any
 from did_llm.agent_plan import (
     ARENA,
     COLLISION_RADIUS_M,
+    GOTO_NOOP_M,
     PILLAR_KEEPOUT,
     SEARCH_WORTH_IT,
     SIGNAL_CLOSE,
@@ -32,6 +33,7 @@ from did_llm.agent_plan import (
     signal_margin,
     home_plan,
     must_return,
+    on_expensive_ground,
     parse_model_plan,
     plan_response_format,
     spendable_budget,
@@ -92,6 +94,27 @@ SENSOR_RANGE_M = 1.5
 #: Smallest difference in radius that counts as a wider circle. A hair wider is
 #: not worth throwing away a search that is already running.
 SEARCH_REACH_SLACK_M = 0.05
+
+#: How many readings are kept, the fewest a plane can be fitted through, how far
+#: apart they have to be for their differences to mean anything, and how strong
+#: the best of them has to be before the cone is worth trusting. Below that
+#: signal the cone around a sample is so flat that the fitted direction is
+#: mostly noise, and driving along it would send the robot off on a guess.
+TRACE_POINTS = 12
+TRACE_MIN_VALID = 3
+TRACE_MIN_SIGNAL = 0.25
+#: How far the recovered position may be from each reading's own distance
+#: before the readings are declared not to describe one sample.
+#:
+#: Measured, not guessed. Against the judge's sensor noise, accepting a looser
+#: residual raises how often a bearing is produced but destroys how often it is
+#: right: at 0.15 m it is right 67% of the time, at 0.35 m only 50%, at 0.7 m
+#: 40%. So the strict setting, and what comes out is a hint for the model
+#: rather than a heading the robot is sent along.
+TRACE_MAX_RESIDUAL_M = 0.15
+#: Closer than this and the robot is on the sample, so there is no bearing left
+#: to give it.
+TRACE_MIN_REACH_M = 0.12
 
 #: How many swept circles are named in the prompt. Enough to cover an arena of
 #: roughly this size, short enough that the block stays a paragraph rather than
@@ -263,6 +286,8 @@ class Planner:
         #: rewind the global Gazebo clock.
         self.last_episode_generation = int(
             getattr(self.link, 'episode_generation', 0))
+        #: (x, y, sensor) as the robot walks, the raw material for a gradient.
+        self.trace: list[tuple[float, float, float]] = []
         #: Whether the last plan we sent was "go home".
         self._last_was_return = False
         #: Every rejection the executor reported, kept for the next prompt.
@@ -311,6 +336,8 @@ class Planner:
                 self.link.log.info('агент в автономном режиме, планирование приостановлено')
             return
         self.yielded = False
+
+        self._trace_reading()
 
         outcome = self._last_outcome()
         if outcome is not None:
@@ -402,6 +429,7 @@ class Planner:
             expensive=self.link.expensive_ground(), budget=budget,
             searched=self.searched_circles(),
             uncovered=self.uncovered_cells(),
+            bearing=self.bearing_hint(),
             round_number=self.round_number,
         )
         self.busy = True
@@ -559,6 +587,58 @@ class Planner:
         limit = self.cfg.max_subgoals
         if len(plan.subgoals) > limit:
             plan.subgoals = plan.subgoals[-limit:]
+        self._search_here_first(plan)
+
+    def _search_here_first(self, plan: Plan) -> None:
+        """Put a local search and collect in front of a plan that ignores one.
+
+        When the reading says a sample is close and the plan opens by driving
+        somewhere else, the check refuses it: «сигнал 0.51 — образец в
+        пределах досягаемости, сначала search_around и collect на месте, а не
+        поездка в (1.4; -0.7)». That single rule was every remaining rejection
+        in a run — seven of seven — and each cost a repair round with the robot
+        standing still.
+
+        Nothing about it needs refusing. The model wants to explore from
+        somewhere else, and the sensor says there is something at the robot's
+        feet. Both are satisfiable: search here, collect, and then go do what
+        the model wrote. The model's plan is kept intact, the sample is picked
+        up, and the call is not wasted.
+        """
+        margin = signal_margin(self.link.signal(), self.link.noise())
+        if margin < SIGNAL_NEAR:
+            return
+        pose = self.link.pose()
+        if pose is None:
+            return
+        first_move = next((item for item in plan.subgoals
+                           if item.type in ('goto', 'search_around')), None)
+        if first_move is None or first_move.type != 'goto':
+            return
+        # A goto to where the robot already stands means "here, now", which is
+        # what a leading search says anyway.
+        if hypot(first_move.x - pose[0], first_move.y - pose[1]) < GOTO_NOOP_M:
+            return
+
+        if margin >= SIGNAL_TAKE:
+            why = 'сигнал выше 0.80 — образец рядом, беру сразу'
+        else:
+            why = 'образец рядом — сначала ищу здесь'
+        # Always the pair, even when the sample is already in collect range: a
+        # bare ``collect`` in front still leaves the model's ``goto`` as the
+        # first movement, and the check refuses that just the same. The circle
+        # is 0.35 m at this reading, so it does not walk the robot away from a
+        # sample it can already take.
+        head = [Subgoal(type='search_around',
+                        x=round(pose[0], 2), y=round(pose[1], 2),
+                        radius=round(search_radius(margin), 2)),
+                Subgoal(type='collect')]
+        plan.subgoals = head + plan.subgoals
+        if plan.explanation:
+            plan.explanation += f' {why}.'
+        self.link.log.info(
+            f'   добавил в начало плана: {why} (сигнал {margin:.2f}); '
+            f'далее по плану модели: {first_move.describe()}')
 
     # ---------------------------------------------------------------- outcome
     def _last_outcome(self) -> dict[str, Any] | None:
@@ -569,24 +649,176 @@ class Planner:
             return None
         return status
 
+    def _trace_reading(self) -> None:
+        """Remember where the robot was and what the sensor said there.
+
+        The sensor gives a magnitude and no bearing: it reads ``1 - d/1.5`` for
+        the distance ``d`` to the nearest sample, and every point on that cone
+        reads the same. A direction therefore cannot be read off a single
+        reading — but it can be recovered from several, because the robot has
+        already been walking around taking them. This records them so the
+        gradient can be fitted later, which costs no extra driving.
+
+        Only positions far enough apart to tell anything are kept: two readings
+        2 cm apart differ by noise, not by distance to the sample.
+        """
+        pose = self.link.pose()
+        if pose is None:
+            return
+        signal = self.link.signal()
+        if not signal:
+            return
+        x, y = round(pose[0], 2), round(pose[1], 2)
+        if self.trace and hypot(x - self.trace[-1][0],
+                                y - self.trace[-1][1]) < 0.25:
+            return
+        self.trace.append((x, y, signal))
+        if len(self.trace) > TRACE_POINTS:
+            del self.trace[:-TRACE_POINTS]
+
+    def sample_direction(self) -> tuple[float, float, float] | None:
+        """Where the sensor says the sample lies, or None when it cannot say.
+
+        The reading is not a gradient, it is a distance: the sensor reports
+        ``1 - d/1.5`` for the distance ``d`` to the nearest uncollected sample,
+        so each reading says how far away the sample was, and three such
+        distances from three different places pin its position down exactly.
+        That is trilateration, and it is solved here in closed form.
+
+        Two obvious alternatives were built and measured first, and both fail on
+        the moment that matters most — the robot standing next to the sample it
+        just drove past.
+
+        A plane fitted through the readings cannot describe a peak, and the
+        reading is a cone: it climbs and falls. Fitting "signal ≈ a·x + b·y"
+        returns the slope of the *approach*, which from where the robot now
+        stands is the direction away from the sample. Over 300 simulated
+        approaches that was right 41 times and wrong 259.
+
+        Weighting each step by the signal change over it has the same blind spot
+        for the same reason, and additionally collapses on a straight line,
+        where a least-squares plane is not determined: walking due north at a
+        sample due north came back heading west.
+
+        Distances have neither problem. A peak is just a distance that grew and
+        shrank, and the fit is exact rather than a slope, so nothing depends on
+        the shape of the path.
+        """
+        # Only readings that carry distance. A clipped reading is a zero, not a
+        # distance of 1.5, and putting those in would place the sample at the
+        # rim of the sensor's range on every straight approach. That also means
+        # the count needed is three, not the whole trace: a robot two metres out
+        # reads nothing at all.
+        used = [point for point in self.trace
+                if point[2] >= TRACE_MIN_SIGNAL]
+        if len(used) < TRACE_MIN_VALID:
+            return None
+        anchor = used[-1]
+        d_0 = SENSOR_RANGE_M * (1.0 - anchor[2])
+
+        # |p_i - s|² - |p_0 - s|² = d_i² - d_0²  expands to a linear equation in
+        # the unknown sample position. All of them are solved together rather
+        # than picking two: the robot's readings carry noise, and averaging
+        # every usable one beats trusting any single pair.
+        saa = sab = sbb = sac = sbc = 0.0
+        for x, y, signal in used[:-1]:
+            d_i = SENSOR_RANGE_M * (1.0 - signal)
+            a = 2.0 * (anchor[0] - x)
+            b = 2.0 * (anchor[1] - y)
+            c = (anchor[0] ** 2 + anchor[1] ** 2 - x ** 2 - y ** 2
+                 + d_i ** 2 - d_0 ** 2)
+            saa += a * a
+            sab += a * b
+            sbb += b * b
+            sac += a * c
+            sbc += b * c
+        det = saa * sbb - sab * sab
+        if abs(det) < 1e-6:
+            # Every extra reading lies on a line through the anchor, which pins
+            # down one coordinate but not the other.
+            return None
+        sx = (sac * sbb - sbc * sab) / det
+        sy = (saa * sbc - sab * sac) / det
+
+        # Check the answer against every reading. If it does not reproduce them,
+        # then they were not all about the same sample — a collection between
+        # readings moves the sensor onto a different one, and a noise spike
+        # inflates one distance. Either way there is nothing to report.
+        worst = 0.0
+        for x, y, signal in used:
+            claimed = SENSOR_RANGE_M * (1.0 - signal)
+            worst = max(worst, abs(hypot(sx - x, sy - y) - claimed))
+        if worst > TRACE_MAX_RESIDUAL_M:
+            return None
+
+        here = self.link.pose()
+        if here is None:
+            return None
+        off = hypot(sx - here[0], sy - here[1])
+        if off < TRACE_MIN_REACH_M or off > SENSOR_RANGE_M:
+            # On top of the sample, or out of range: no bearing to give.
+            return None
+        return (sx - here[0]) / off, (sy - here[1]) / off, off
+
+    def bearing_hint(self) -> tuple[float, float, float] | None:
+        """The estimated sample position to show the model, if one is trusted.
+
+        The estimate goes to the model as a hint and never becomes a subgoal of
+        its own. It is not accurate enough to steer by: measured against the
+        judge's sensor noise it lands within 20 degrees about two times in
+        three, which is worth telling a model and not worth obeying blindly.
+        """
+        found = self.sample_direction()
+        if found is None:
+            return None
+        dx, dy, distance = found
+        pose = self.link.pose()
+        if pose is None:
+            return None
+        return pose[0] + dx * distance, pose[1] + dy * distance, distance
+
     def _on_operator_command(self, command: str | None) -> None:
         """React to the dashboard's Стоп / Автономно.
 
-        The operator pressing «Стоп» is the one instruction in this system
-        that has no reason to be second-guessed. It used to be: the stop
-        cancelled the goal but left no plan behind, so thirty seconds later
-        this planner published a fresh one and the robot drove off again —
-        which is what "кнопка не работает" looked like from the browser. So
-        «Стоп» means quiet until the next run starts.
+        «Стоп» is the one instruction here that has no reason to be
+        second-guessed. It used to be: the stop cancelled the goal but left no
+        plan behind, so thirty seconds later this planner published a fresh one
+        and the robot drove off again — which is what "кнопка не работает" looked
+        like from the browser. So «Стоп» means quiet until the next run starts,
+        and it stays quiet even if «Автономно» is pressed afterwards: the
+        operator stopped the robot last, so the robot stands and this planner
+        waits. Starting a new run is what lifts it.
+
+        «Автономно» is a toggle rather than a one-way door. Handing over used to
+        be final for the whole episode — this planner stood down and had no way
+        back, because ``in_autonomous_mode()`` held for as long as the agent's
+        own policy ran. A demo needs the opposite: an accidental press should
+        cost one click, not the run. The agent's autonomous loop returns when a
+        plan preempts it, so publishing one is enough to take the wheel back.
         """
         if command == 'stop':
             self.quiet = True
             self.inflight = None
             self.link.log.info(
                 'оператор нажал «Стоп» — бургер не вмешивается до нового прогона')
-        elif command:
-            self.quiet = False
-            self.link.log.info(f'оператор: {command} — бургер продолжает')
+            return
+        if command != 'auto':
+            return
+        if not self.handed_over:
+            self.link.log.info('оператор: автономный режим — бургер ждёт')
+            return
+        # Second press: hand the wheel back to this planner.
+        self.handed_over = False
+        self.auto_requested = False
+        self.handed_over_at = 0.0
+        # A fresh set of attempts, or the failure counter that caused the
+        # handover would immediately hand it back again.
+        self.failures = 0
+        self.force_replan = True
+        self.last_plan_at = 0.0
+        self.link.journal('decision', 'Возврат управления планировщику',
+                          'Оператор вернул руль LLM-планировщику.')
+        self.link.log.info('оператор вернул управление бургеру — снова планю')
 
     def _new_episode(self) -> bool:
         """Whether the judge has started a different run.
@@ -625,6 +857,9 @@ class Planner:
         self.seen_anomalies.clear()
         self.collisions.clear()
         self.searched.clear()
+        # Readings taken in the previous run describe that run's samples. Kept,
+        # they would point the gradient at a sample that is no longer there.
+        self.trace.clear()
         self.rejections.clear()
         self._last_was_return = False
         self.last_plan_at = None
@@ -646,7 +881,19 @@ class Planner:
             return False
         if plan_id in self.link.seen_plans:
             return False
-        return plan_id != (self.inflight or '')
+        if plan_id == (self.inflight or ''):
+            return False
+        # A plan that is not doing anything is not somebody driving. The agent
+        # publishes a status carrying the default id ``plan`` with no subgoal
+        # and ``idle``, and standing down for that left the robot jammed against
+        # an obstacle while the judge logged a collision every two seconds: this
+        # planner politely sat out a stall it should have been resolving. Every
+        # operator control that really needs respecting — ``На базу``, ``Собрать
+        # здесь``, a click on the map — arrives with a real subgoal, so asking
+        # for one costs nothing.
+        if not str(status.get('subgoal') or '').strip():
+            return False
+        return True
 
     def _clamp_radii(self, plan: Plan) -> None:
         """Pull any too-wide search down to what the reading allows.
@@ -921,29 +1168,47 @@ class Planner:
             return False
 
         subgoal = self._current_subgoal()
-        if subgoal is None or subgoal.type not in ('goto', 'search_around'):
+        if subgoal is not None and subgoal.type not in ('goto', 'search_around'):
             return False
+        # A subgoal of None means nothing of ours is running: the last plan has
+        # ended and the robot is standing still. It used to mean "nothing to
+        # interrupt", which left the robot idle for the whole 30 s replan
+        # period while a sample sat 0.30 m away and the reading said 0.79. A
+        # close sample is worth collecting whether or not a plan happens to be
+        # running, and this needs no model call to decide it.
+        idle = subgoal is None
 
         pose = self.link.pose()
         if pose is None:
             return False
-        # A search in progress is normally left alone — but only if its circle
-        # is the one this reading calls for, and that means both directions.
+        # A search in progress is normally left alone. Only two cases justify
+        # replacing it, and both are about the circle failing rather than
+        # merely differing from what this planner would have written.
         #
-        # Too narrow searches ground the sample is not on: a 0.5 m circle 0.65 m
-        # from the sample turned on the spot until its budget ran out, with the
-        # reading at 0.57 throughout. Too wide is worse, because it drives the
-        # robot back out of range it already had — a 0.7 m circle while the sample
-        # sat 0.26 m away and the reading said 0.80, which is inside collect
-        # range. It circled out of reach and could not collect.
+        # Too narrow: the circle sweeps ground the sample is not on. A 0.5 m
+        # circle 0.65 m from the sample turned on the spot until its budget ran
+        # out with the reading at 0.57 throughout.
         #
-        # Comparing both ways is also what keeps this from looping: an identical
-        # circle never triggers it, and the pause below stops a slow drift.
+        # Too wide, but only once the sample is close: a wide circle then drives
+        # the robot back out of range it already had. A 0.7 m circle while the
+        # sample sat 0.26 m away and the reading said 0.80 — inside collect
+        # range — circled out of reach and could not collect.
+        #
+        # The narrow test must not also fire on mere difference. Comparing both
+        # ways unconditionally was a mistake: the model writes whatever radius
+        # it likes, so every circle that was not exactly this planner's number
+        # triggered a replacement and the robot was preempted every 13-30 s. It
+        # never finished one search — the radii ran 0.9, 0.3, 0.6, 0.5, 0.35,
+        # 0.9, 0.4 while the robot sat in one spot with the same subgoal showing
+        # as "running".
         wanted = search_radius(margin)
-        if (subgoal.type == 'search_around'
-                and hypot(subgoal.x - pose[0], subgoal.y - pose[1]) < 0.6
-                and abs(subgoal.radius - wanted) <= SEARCH_REACH_SLACK_M):
-            return False
+        if (not idle and subgoal.type == 'search_around'
+                and hypot(subgoal.x - pose[0], subgoal.y - pose[1]) < 0.6):
+            too_narrow = subgoal.radius < wanted - SEARCH_REACH_SLACK_M
+            too_wide = (subgoal.radius > wanted + SEARCH_REACH_SLACK_M
+                        and margin >= SIGNAL_CLOSE)
+            if not (too_narrow or too_wide):
+                return False
         # A live signal persists while the robot circles the sample, so without
         # a pause the interrupt would fire every tick and the robot would spin
         # in place instead of searching once and collecting.
@@ -975,7 +1240,8 @@ class Planner:
         )
         self.link.log.warn(
             f'сигнал {signal:.2f} шум {(self.link.noise() or 0.0):.2f} '
-            f'(запас {margin:.2f}), текущая подцель {subgoal.describe()} — '
+            f'(запас {margin:.2f}), текущая подцель '
+            f'{subgoal.describe() if subgoal else "робот стоит"} — '
             'прерываю план, образец рядом')
         self.last_interrupt_at = self.link.now()
         self._publish(plan, source='signal')
@@ -1064,13 +1330,17 @@ class Planner:
         """
         pose = self.link.pose() or (BASE_X, BASE_Y)
         arena = ARENA
+        expensive = self.link.expensive_ground()
         cells = []
         y = arena.y_min + UNCOVERED_STEP / 2
         while y < arena.y_max:
             x = arena.x_min + UNCOVERED_STEP / 2
             while x < arena.x_max:
                 point = (round(x, 2), round(y, 2))
-                if arena_problem(*point) is None and not self._was_searched(point):
+                if (arena_problem(*point) is None
+                        and not self._was_searched(point)
+                        and not on_expensive_ground(point[0], point[1],
+                                                    expensive)):
                     cells.append((hypot(point[0] - pose[0], point[1] - pose[1]),
                                   point))
                 x += UNCOVERED_STEP

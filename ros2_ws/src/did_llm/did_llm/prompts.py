@@ -188,6 +188,33 @@ HYPOTHESIS_SYSTEM = """\
 """
 
 
+def _bearing_block(bearing: tuple[float, float, float] | None) -> str:
+    """Where the sensor says the nearest sample is, as an estimate.
+
+    The reading is a distance, not a bearing: it says how far away the nearest
+    uncollected sample was from each place the robot stood. Three such
+    distances pin the sample down, which is how this block exists at all.
+
+    It is offered as a hint and never as an order, because it is not good
+    enough to be one. Measured against the judge's sensor noise, the recovered
+    position is within 20 degrees of the truth about two thirds of the time.
+    Saying so plainly is the point: a model told "roughly, and not always
+    right" weighs it against the rest of what it knows, and one told a
+    confident number obeys it.
+    """
+    if bearing is None:
+        return ''
+    x, y, distance = bearing
+    return ('КУДА ПРИМЕРНО ЛЕЖИТ ОБРАЗЕЦ (оценка по замерам датчика, '
+            'может ошибаться на десятки градусов — это подсказка, '
+            'не приказ):\n'
+            f'  ориентир: ({x:.2f}; {y:.2f}), примерно {distance:.2f} м '
+            f'от робота.\n'
+            '  Если датчик при этом заметен, поиск в этом направлении '
+            'обычно выгоднее круга на месте. Но проверь: цель должна быть '
+            'проходима, без столбов, и в пределах разумного пути.')
+
+
 def build_planner_prompt(mission: str, state: dict[str, Any],
                          status: dict[str, Any] | None,
                          feedback: str,
@@ -195,6 +222,7 @@ def build_planner_prompt(mission: str, state: dict[str, Any],
                          budget: dict[str, Any] | None = None,
                          searched: list[tuple[float, float, float]] | None = None,
                          uncovered: list[tuple[float, float]] | None = None,
+                         bearing: tuple[float, float, float] | None = None,
                          round_number: int = 0) -> str:
     """Assemble the planner prompt from one state snapshot.
 
@@ -214,6 +242,8 @@ def build_planner_prompt(mission: str, state: dict[str, Any],
         _ground_block(expensive),
         '',
         _coverage_block(searched, uncovered),
+        '',
+        _bearing_block(bearing),
         '',
         _budget_block(state, budget),
         '',

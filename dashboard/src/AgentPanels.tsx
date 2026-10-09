@@ -46,6 +46,9 @@ export function AgentPanel({
 }: AgentPanelProps) {
   const state = snapshot.state
   const status = snapshot.status
+  // The agent's own policy reports plan_id "auto". The button is a toggle, so
+  // it has to say which way it will move.
+  const autonomous = state?.current?.plan_id === 'auto'
   const navigation = state.navigation ?? {}
   const runState = status.state ?? 'idle'
   const anomalies = [
@@ -95,8 +98,15 @@ export function AgentPanel({
         </div>
 
         <div className="agent-actions">
-          <button className="agent-primary" disabled={busy || connection !== 'connected'} onClick={onAuto}>
-            <Play size={15} />Автономно
+          <button
+            className="agent-primary"
+            disabled={busy || connection !== 'connected'}
+            onClick={onAuto}
+            title={autonomous
+              ? 'Вернуть управление LLM-планировщику'
+              : 'Передать управление автономной политике агента'}
+          >
+            <Play size={15} />{autonomous ? 'Вернуть LLM' : 'Автономно'}
           </button>
           <button className="agent-stop" disabled={busy || connection !== 'connected'} onClick={onStop}>
             <Square size={14} />Стоп
