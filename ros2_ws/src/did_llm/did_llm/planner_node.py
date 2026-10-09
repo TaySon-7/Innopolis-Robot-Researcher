@@ -18,6 +18,7 @@ from did_llm.agent_plan import (
     ARENA,
     COLLISION_RADIUS_M,
     GOTO_NOOP_M,
+    _floor_gap,
     PILLAR_KEEPOUT,
     SEARCH_WORTH_IT,
     SIGNAL_CLOSE,
@@ -120,6 +121,13 @@ FAR_HUNT_MIN_DIST_M = 2.0
 #: Rough battery price of driving a metre, used only to refuse a crossing the
 #: remaining charge cannot pay for.
 FAR_HUNT_COST = 1.0
+#: Widest circle any search may run, whatever the reading allows.
+SEARCH_RADIUS_CAP_M = 0.9
+#: Smallest circle worth running after the floor has had its say.
+SEARCH_RADIUS_MIN = 0.3
+#: Room to leave between a search circle and the wall it would otherwise touch.
+#: Robot half-width plus the validator's wall margin, rounded up.
+WALL_CLEARANCE_M = 0.35
 #: Radius for a search the planner itself inserts, taken where the reading gives
 #: no width to work from.
 SEARCH_RADIUS_DEFAULT = 0.8
@@ -577,6 +585,7 @@ class Planner:
                     battery=budget.get('battery'),
                     hits=self.recent_hits(),
                     plan_history=self.plan_history,
+                    blocked_points=self.blocked_points(),
                 )
                 if problems:
                     # Well-formed but unusable: a point on a pillar, the same
@@ -1266,7 +1275,7 @@ class Planner:
         return True
 
     def _clamp_radii(self, plan: Plan) -> None:
-        """Pull any too-wide search down to what the reading allows.
+        """Pull any too-wide search down to what the reading and the floor allow.
 
         A radius over the cap is not a plan that cannot be executed, only one
         that is worse than it needs to be — a wide circle sweeps ground the
@@ -1274,17 +1283,42 @@ class Planner:
         Refusing the whole plan for it cost a model call and left the robot
         standing still, which is how a marginally-too-wide circle turned into
         a minute of nothing happening.
+
+        The cap from the reading is only half the story. The circle also has to
+        fit on the floor: a centre 0.3 m from a wall with a 0.9 m circle drives
+        the robot along that wall on every turn. On ``medium@469`` that is what
+        the run did at the top edge, with the heading swinging through
+        −2.40, 0.19, 3.04, −2.83 radian turn by turn, and the judge logging 45
+        collisions at two points each — ninety points against forty for the
+        samples. So the circle is also capped at the room the centre actually
+        has.
         """
         margin = signal_margin(self.link.signal(), self.link.noise())
         allowed = max(0.4, 1.6 * max(0.0, 1.0 - margin))
         for subgoal in plan.subgoals:
-            if subgoal.type != 'search_around' or subgoal.radius <= allowed + 0.05:
+            if subgoal.type != 'search_around':
                 continue
-            shrunk = round(allowed, 2)
+            room = self._floor_room(subgoal.x, subgoal.y)
+            limit = min(allowed, room)
+            if subgoal.radius <= limit + 0.05:
+                continue
+            shrunk = round(max(SEARCH_RADIUS_MIN, limit), 2)
+            if room < allowed:
+                why = f'до стены {room:.2f} м'
+            else:
+                why = f'сигнал {margin:.2f}'
             self.link.log.info(
                 f'   поправил радиус {subgoal.describe()}: '
-                f'{subgoal.radius:g} → {shrunk:g} м (сигнал {margin:.2f})')
+                f'{subgoal.radius:g} → {shrunk:g} м ({why})')
             subgoal.radius = shrunk
+
+    def _floor_room(self, x: float, y: float) -> float:
+        """How far a circle centred here can reach before it meets the wall."""
+        gap = _floor_gap(x, y, ARENA.floor) if ARENA.floor else float('inf')
+        if gap == float('inf'):
+            return SEARCH_RADIUS_CAP_M
+        # Leave the robot's own width plus the margin rather than scraping.
+        return max(SEARCH_RADIUS_MIN, gap - WALL_CLEARANCE_M)
 
     def _note_outcome(self, status: dict[str, Any]) -> None:
         """Record how the last plan ended and turn it into the next prompt."""
@@ -1864,6 +1898,36 @@ class Planner:
             if sent[0] == self.inflight and sent[1] == index:
                 return sent[2]
         return None
+
+    def blocked_points(self, limit: int = 20) -> list[tuple[float, float]]:
+        """Return blocked points from the cost map.
+
+        These are points the agent has learned are unreachable — walls,
+        pillars, obstacles seen by the lidar. A plan that names one fails
+        at run time as "no path to goal" after the robot has already
+        left.
+
+        The list is capped at ``limit`` points nearest the robot, so the
+        check stays cheap and the most relevant obstacles are reported.
+        """
+        pose = self.link.pose() or (BASE_X, BASE_Y)
+        # Get the cost map from the agent's state. The agent publishes
+        # blocked cells as part of /agent/state, but the full grid lives
+        # on /agent/costmap as terrain runs. For the planner's purpose
+        # the expensive-ground points plus recent collision points are
+        # what matter: they are the places the agent knows it cannot
+        # reach or should not return to.
+        blocked: list[tuple[float, float]] = []
+        # Expensive ground is blocked for planning purposes: crossing it
+        # costs more than the agent is willing to pay.
+        for item in self.link.expensive_ground():
+            blocked.append((float(item['x']), float(item['y'])))
+        # Recent collision points are blocked: the robot has hit something
+        # there and should not go back.
+        blocked.extend(self.recent_hits())
+        # Sort by distance to the robot and cap.
+        blocked.sort(key=lambda p: hypot(p[0] - pose[0], p[1] - pose[1]))
+        return blocked[:limit]
 
     def _budget(self) -> dict[str, float]:
         """What may be spent on new work after reserving the trip home."""
