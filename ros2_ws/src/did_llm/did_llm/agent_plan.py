@@ -502,6 +502,24 @@ def parse_model_plan(raw: str | dict[str, Any],
                 explanation=generated.explanation)
 
 
+def on_expensive_ground(x: float, y: float,
+                        expensive: list[dict[str, Any]] | None) -> bool:
+    """Whether a point sits inside ground the agent has measured as dear.
+
+    One predicate for two callers, deliberately. The planner uses it to keep
+    expensive cells out of the targets it offers, and the check uses it to
+    refuse a plan that drives onto one. Written separately they disagreed: the
+    planner offered cells it knew were expensive, the model picked them because
+    they were the nearest offered, and the plan came straight back rejected.
+    The refusal rate was this planner's own doing.
+    """
+    for patch in expensive or ():
+        reach = float(patch.get('reach', 0.0))
+        if hypot(x - float(patch['x']), y - float(patch['y'])) <= reach:
+            return True
+    return False
+
+
 def check_plan(plan: Plan,
                expensive: list[dict[str, float]] | None = None,
                *,
@@ -580,6 +598,8 @@ def check_plan(plan: Plan,
                     f'дорогом грунте цены ×{patch.get("cost", 1):.1f} — '
                     'объедь его стороной')
                 break
+        if problems:
+            break
 
     # Value against price. A long leg to a guessed search point is only worth
     # making when the floor between here and there is ordinary. Without this
