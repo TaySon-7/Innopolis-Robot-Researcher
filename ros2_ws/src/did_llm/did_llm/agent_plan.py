@@ -615,12 +615,19 @@ def check_plan(plan: Plan,
                pose: tuple[float, float] | None = None,
                battery: float | None = None,
                hits: list[tuple[float, float]] | None = None,
+               plan_history: list[dict[str, Any]] | None = None,
+               blocked_points: list[tuple[float, float]] | None = None,
                cost_per_search: float = 1.2) -> list[str]:
     """Everything wrong with an otherwise well-formed plan.
 
     Returns a list of messages rather than the first one: telling the model
     about all the bad points at once costs one call instead of one per point.
     Empty means the plan is worth publishing.
+
+    ``plan_history`` carries recent plans with their outcomes. A point that
+    already failed with "no path to goal" is refused: without this the model
+    picks the same unreachable target again, and the robot spends a leg of
+    battery driving at a wall.
     """
     problems: list[str] = []
     visited: list[tuple[str, float, float]] = []
@@ -630,6 +637,37 @@ def check_plan(plan: Plan,
             issue = arena_problem(subgoal.x, subgoal.y)
             if issue:
                 problems.append(f'подцель {index}: {issue}')
+            # Refuse points that already failed in recent plans. The model has
+            # no memory between rounds, so a target that ended "no path to
+            # goal" last time is simply picked again unless the record says
+            # what happened.
+            if plan_history:
+                for entry in reversed(plan_history[-5:]):
+                    if entry.get('outcome') != 'failed':
+                        continue
+                    for past in entry.get('subgoals', []):
+                        if past.get('type') not in ('goto', 'search_around'):
+                            continue
+                        if hypot(float(past['x']) - subgoal.x,
+                                 float(past['y']) - subgoal.y) < 0.5:
+                            problems.append(
+                                f'подцель {index}: ({subgoal.x:g}; {subgoal.y:g}) '
+                                'уже была в неудачном плане '
+                                f'{entry.get("plan_id", "?")} — туда не доехать')
+                            break
+                    if problems:
+                        break
+            # Refuse points that are blocked on the cost map: a point inside
+            # a wall, a pillar, or an obstacle the lidar has seen cannot be
+            # driven to, and a plan that names it fails at run time as
+            # "no path to goal" after the robot has already left.
+            if blocked_points:
+                for bx, by in blocked_points:
+                    if hypot(bx - subgoal.x, by - subgoal.y) < 0.35:
+                        problems.append(
+                            f'подцель {index}: ({subgoal.x:g}; {subgoal.y:g}) '
+                            f'заблокирована — рядом ({bx:g}; {by:g})')
+                        break
             # Only travelling to somewhere already visited is wasted motion.
             # A search in the spot you have just arrived at is the intended
             # pattern, and rejecting it would refuse most good plans.

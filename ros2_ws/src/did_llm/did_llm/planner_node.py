@@ -576,6 +576,7 @@ class Planner:
                     pose=self.link.pose(),
                     battery=budget.get('battery'),
                     hits=self.recent_hits(),
+                    plan_history=self.plan_history,
                 )
                 if problems:
                     # Well-formed but unusable: a point on a pillar, the same
@@ -1316,9 +1317,14 @@ class Planner:
             self.feedback = ''
 
         if state == 'done':
-            # A finished plan means the robot stood still for the whole
-            # segment; going out again immediately would waste a call.
-            self.last_plan_at = self.link.now()
+            # Deliberately not resetting the clock here. This used to hold the
+            # planner off for a full period after every completed plan, on the
+            # reasoning that the robot had been standing still anyway — which is
+            # backwards. It had just finished working; idling for thirty seconds
+            # afterwards is what made it stand still. The replan period already
+            # measures from when the plan was sent, so a plan that ran longer than
+            # the period is replaced at once, and only a plan that finished early
+            # waits out what is left of its period.
             if self._last_was_return:
                 # We got home and the judge has not ended the episode. Going
                 # home again is the same plan; the agent's own policy is the
@@ -1427,7 +1433,16 @@ class Planner:
         if pose is None:
             return None
 
-        spot = self._clearest_way_out(pose)
+        # Collect points that already failed in recent plans so the escape
+        # does not send the robot back to a place it could not reach.
+        failed_points: list[tuple[float, float]] = []
+        for entry in self.plan_history[-5:]:
+            if entry.get('outcome') == 'failed':
+                for sg in entry.get('subgoals', []):
+                    if sg.get('type') in ('goto', 'search_around'):
+                        failed_points.append((float(sg['x']), float(sg['y'])))
+
+        spot = self._clearest_way_out(pose, exclude=failed_points)
         if spot is None:
             # Nothing around the robot is clear. A pillar is not a wall: the
             # robot can push past it, and standing still cannot go anywhere at
@@ -1448,13 +1463,19 @@ class Planner:
         )
 
     def _clearest_way_out(self, pose: tuple[float, float],
-                          step: float = 0.9) -> tuple[float, float] | None:
+                          step: float = 0.9,
+                          exclude: list[tuple[float, float]] | None = None
+                          ) -> tuple[float, float] | None:
         """The reachable point around the robot with the most room around it.
 
         Every direction is tried and scored by how far it leaves the robot from
         anything solid, rather than by pointing at some fixed place. Ties go to
         the point nearest the middle, so two equivalent ways out do not send the
         robot to the same corner twice.
+
+        ``exclude`` lists points that already failed in recent plans. They are
+        skipped so the escape does not send the robot back to a place it could
+        not reach.
         """
         best = None
         best_score = None
@@ -1462,6 +1483,9 @@ class Planner:
             angle = radians(degrees)
             point = (pose[0] + step * cos(angle), pose[1] + step * sin(angle))
             if arena_problem(*point) is not None:
+                continue
+            if exclude and any(hypot(point[0] - ex, point[1] - ey) < 0.5
+                               for ex, ey in exclude):
                 continue
             clearance = _nearest_solid(*point)
             # Prefer room; break ties toward the middle of the arena.
