@@ -18,6 +18,7 @@ from std_srvs.srv import Trigger
 
 from did_judge.judge_model import JudgeModel
 from did_judge.judge_model import scan_clearance
+from did_judge.judge_model import score_payload
 from did_judge.scenario import load_scenario
 from did_judge.scenario import scenario_path
 
@@ -179,36 +180,7 @@ class JudgeNode(Node):
         model = self._model
         score = String()
         score.data = json.dumps(
-            {
-                'scenario': model.scenario.name,
-                'scenario_file': self._scenario_file,
-                't': round(model.time, 2),
-                'battery': round(model.battery, 3),
-                'collected': model.collected_count,
-                'samples_total': len(model.samples),
-                'distance_travelled': round(model.distance_travelled, 3),
-                'collisions': model.collisions,
-                'false_collects': model.false_collects,
-                'hazard_hits': model.hazard_hits,
-                'score': round(model.score, 2),
-                'finished': model.finished,
-                'base_pose': {
-                    'x': model.base_x,
-                    'y': model.base_y,
-                },
-                'world_pose': {
-                    'x': round(model.world_x, 3),
-                    'y': round(model.world_y, 3),
-                },
-                'samples': [
-                    {
-                        'x': item.sample.x,
-                        'y': item.sample.y,
-                        'collected': item.collected,
-                    }
-                    for item in model.samples
-                ],
-            },
+            score_payload(model, self._scenario_file),
             sort_keys=True,
         )
         self._score_publisher.publish(score)

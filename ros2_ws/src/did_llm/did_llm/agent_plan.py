@@ -91,6 +91,18 @@ class Arena:
     x_max: float = ARENA_X_MAX
     y_min: float = ARENA_Y_MIN
     y_max: float = ARENA_Y_MAX
+    #: The walkable floor as a polygon, from the scene. Empty means "fall back
+    #: to the rectangle above".
+    #:
+    #: The arena is a hexagon, and a rectangle around it is not the same shape:
+    #: at y = 1.7 the left wall sits at x = -1.95 while the rectangle's edge is
+    #: at -2.8. Every check that used the rectangle therefore accepted points
+    #: that are 25 cm outside the wall — including the first column of the
+    #: planner's own target grid, which put the robot into a corner to search
+    #: and left it grinding along the wall with "no path to goal". The
+    #: repository asks for exactly this: one source of geometry, constants only
+    #: as a fallback.
+    floor: tuple[tuple[float, float], ...] = ()
     pillars: tuple[tuple[float, float, float], ...] = tuple(
         (px, py, PILLAR_RADIUS)
         for px in PILLAR_GRID for py in PILLAR_GRID
@@ -124,6 +136,22 @@ class Arena:
             )
         except (KeyError, TypeError, ValueError):
             return False
+
+        # The floor polygon is the walkable area itself, which is what the
+        # bounds are not: ``bounds`` is the extent of the outer wall. This is
+        # the part that was missing, and it is the part that mattered.
+        floor = payload.get('floor')
+        if isinstance(floor, list) and len(floor) >= 3:
+            try:
+                points = tuple((float(item[0]), float(item[1])) for item in floor)
+            except (IndexError, TypeError, ValueError):
+                points = ()
+            if len(points) >= 3:
+                self.floor = points
+                xs = [px for px, _ in points]
+                ys = [py for _, py in points]
+                self.x_min, self.x_max = min(xs), max(xs)
+                self.y_min, self.y_max = min(ys), max(ys)
         self.from_scene = True
         return True
 
@@ -154,6 +182,43 @@ def load_geometry(base_url: str = 'http://127.0.0.1:8080',
     return ARENA.update(payload if isinstance(payload, dict) else {})
 
 
+def _floor_gap(x: float, y: float,
+               floor: tuple[tuple[float, float], ...]) -> float:
+    """Signed distance from (x, y) to the nearest edge of the floor.
+
+    Positive inside, negative outside. For a convex polygon the distance to the
+    nearest edge decides everything: a point more than the margin inside can be
+    driven to, and one outside cannot, whatever the rectangle says about it.
+    """
+    best = float('inf')
+    count = len(floor)
+    for index in range(count):
+        ax, ay = floor[index]
+        bx, by = floor[(index + 1) % count]
+        edge_x, edge_y = bx - ax, by - ay
+        length = hypot(edge_x, edge_y)
+        if length <= 1e-9:
+            continue
+        # Point-to-segment distance, not to the infinite line: the floor is a
+        # closed shape and a point off the end of an edge is inside it.
+        t = ((x - ax) * edge_x + (y - ay) * edge_y) / (length * length)
+        t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        gap = hypot(x - (ax + t * edge_x), y - (ay + t * edge_y))
+        if gap < best:
+            best = gap
+    if best == float('inf'):
+        return -1.0
+    crosses = 0
+    for index in range(count):
+        ax, ay = floor[index]
+        bx, by = floor[(index + 1) % count]
+        if (ay > y) != (by > y):
+            x_hit = ax + (y - ay) * (bx - ax) / (by - ay)
+            if x < x_hit:
+                crosses += 1
+    return best if crosses % 2 else -best
+
+
 def arena_problem(x: float, y: float) -> str | None:
     """Why a point is unusable, or None when it is free floor.
 
@@ -166,14 +231,24 @@ def arena_problem(x: float, y: float) -> str | None:
     with a reason the model can act on next time.
     """
     arena = ARENA
-    lo_x, hi_x = arena.x_min + WALL_MARGIN, arena.x_max - WALL_MARGIN
-    lo_y, hi_y = arena.y_min + WALL_MARGIN, arena.y_max - WALL_MARGIN
-    if not lo_x <= x <= hi_x:
-        return (f'точка ({x:g}; {y:g}) вне арены: x должен быть между '
-                f'{lo_x:.2f} и {hi_x:.2f}')
-    if not lo_y <= y <= hi_y:
-        return (f'точка ({x:g}; {y:g}) вне арены: y должен быть между '
-                f'{lo_y:.2f} и {hi_y:.2f}')
+    if arena.floor:
+        # Distance to the nearest edge, measured against the wall margin. For a
+        # convex floor this is the inward-offset test: a point inside by more
+        # than the margin is one the robot can stand on, and a point outside is
+        # one that fails later as "no path to goal" after the trip is spent.
+        gap = _floor_gap(x, y, arena.floor)
+        if gap < WALL_MARGIN:
+            return (f'точка ({x:g}; {y:g}) вне пола арены или вплотную к стене: '
+                    f'до грани {gap:.2f} м при минимуме {WALL_MARGIN:g} м')
+    else:
+        lo_x, hi_x = arena.x_min + WALL_MARGIN, arena.x_max - WALL_MARGIN
+        lo_y, hi_y = arena.y_min + WALL_MARGIN, arena.y_max - WALL_MARGIN
+        if not lo_x <= x <= hi_x:
+            return (f'точка ({x:g}; {y:g}) вне арены: x должен быть между '
+                    f'{lo_x:.2f} и {hi_x:.2f}')
+        if not lo_y <= y <= hi_y:
+            return (f'точка ({x:g}; {y:g}) вне арены: y должен быть между '
+                    f'{lo_y:.2f} и {hi_y:.2f}')
     for px, py, radius in arena.pillars:
         if hypot(x - px, y - py) < max(PILLAR_KEEPOUT, radius + 0.2):
             return (f'точка ({x:g}; {y:g}) попадает на столб у ({px:g}; {py:g}); '
@@ -213,9 +288,19 @@ SPENDABLE_FRACTION = 0.5
 #: going home becomes the right answer again.
 SEARCH_WORTH_IT = 5.0
 
-#: Sensor reading above which a sample is treated as within reach. Same number
-#: the agent's autonomous policy uses, so both agree on what "near" means.
-SIGNAL_NEAR = 0.08
+#: Sensor reading above which a sample is treated as close enough to act on.
+#:
+#: Derived, not chosen. The sensor reads ``max(0, 1 - d/1.5)``, and the widest
+#: circle a search can usefully run is capped at 0.9 m. A reading only justifies
+#: stopping and searching locally once the circle can still reach the sample it
+#: points at: ``1.5 * (1 - margin) <= 0.9``, that is ``margin >= 0.4``.
+#:
+#: At 0.08 the planner chased readings it had no way to act on. A reading of
+#: 0.15 means the sample is 1.29 m away and the best circle reaches 0.9, so the
+#: robot spun a full circle with nothing to find; anything below 0.40 is
+#: information without a response. Below this, keep sweeping the arena — the
+#: systematic sweep is what actually finds things.
+SIGNAL_NEAR = 0.40
 
 #: Reading above which the sample is a step away rather than merely nearby.
 #:
@@ -582,10 +667,14 @@ def check_plan(plan: Plan,
             problems.append(
                 f'подцель {index}: ({subgoal.x:g}; {subgoal.y:g}) — там уже '
                 'было столкновение, не отправляй робота туда снова')
-            break
 
     # Expensive ground is refused outright. The mission says to avoid it, and
     # a plan that crosses it burns the battery the next sector needs.
+    # Every offending subgoal gets its own message — the check collects all
+    # problems at once (see the docstring), so it must not stop at the first
+    # one, and in particular not because an earlier check already found
+    # something: that version silently skipped the ground check for every
+    # subgoal after the first.
     for index, subgoal in enumerate(plan.subgoals):
         if subgoal.type not in ('goto', 'search_around'):
             continue
@@ -598,8 +687,6 @@ def check_plan(plan: Plan,
                     f'дорогом грунте цены ×{patch.get("cost", 1):.1f} — '
                     'объедь его стороной')
                 break
-        if problems:
-            break
 
     # Value against price. A long leg to a guessed search point is only worth
     # making when the floor between here and there is ordinary. Without this

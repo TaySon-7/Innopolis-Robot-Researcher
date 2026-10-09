@@ -392,6 +392,18 @@ function App() {
           setScenarioSeed(String(value[0] % 2_147_483_648))
         }}
         onStart={() => void startScenario()}
+        onJoin={() => {
+          // Just look at the episode that is already running. Selecting a
+          // difficulty must not be the price of watching it.
+          setView('dashboard')
+        }}
+        onAbort={() => {
+          void runAgentAction(
+            () => sendCommand('stop'),
+            'Прогон прерван: робот и планировщик остановлены',
+          )
+          setView('dashboard')
+        }}
       />
     )
   }

@@ -489,9 +489,11 @@ class RosbridgeClient {
     if (typeof message.data !== 'string') return
     try {
       const data = object(JSON.parse(message.data))
-      const incomingSamples = Array.isArray(data.samples) ? data.samples : []
-      const samples = incomingSamples.length
-        ? incomingSamples.map((value) => {
+      // The judge lists only collected samples (uncollected positions are
+      // hidden truth, see did_judge.score_payload); an empty list is still
+      // authoritative and clears the markers of a finished episode.
+      const samples = Array.isArray(data.samples)
+        ? data.samples.map((value) => {
             const sample = object(value)
             return {
               x: number(sample.x),

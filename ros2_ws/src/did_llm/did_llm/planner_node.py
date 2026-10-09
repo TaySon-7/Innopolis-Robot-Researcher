@@ -10,7 +10,7 @@ the planner both slower and less reliable.
 from __future__ import annotations
 
 import json
-from math import cos, hypot, radians, sin
+from math import atan2, cos, hypot, radians, sin
 import threading
 from typing import Any
 
@@ -94,6 +94,52 @@ SENSOR_RANGE_M = 1.5
 #: Smallest difference in radius that counts as a wider circle. A hair wider is
 #: not worth throwing away a search that is already running.
 SEARCH_REACH_SLACK_M = 0.05
+
+#: How long a «Стоп» is given to prove it was not part of a scenario restart.
+#: The agent sends one on every scenario start and the new episode lands within a
+#: second or two, so anything still unpaired after this is the operator.
+STOP_GRACE_SEC = 8.0
+
+#: While the reading places the sample inside this margin, a measured bearing is
+#: worth stepping along. Below it the cone is too shallow for the direction to
+#: mean much, and sweeping is the better use of the battery.
+BEARING_STEP_MIN = 0.5
+#: How far to step along the bearing. Short on purpose: each step is followed by
+#: a fresh reading taken from closer in, so a bearing that was wrong by 30
+#: degrees is corrected on the next one instead of compounding.
+BEARING_STEP_MAX_M = 0.55
+
+#: Below this margin the reading carries no usable information, and the plan is
+#: sent somewhere unsearched instead of around the robot. Set above the noise
+#: rather than at zero so a live sensor cannot trip it by twitching.
+FAR_HUNT_MIN = 0.12
+#: How far is far enough that it counts as leaving. Roughly the arena's own
+#: scale, so the robot crosses ground it has not seen instead of re-walking the
+#: cell it is standing next to.
+FAR_HUNT_MIN_DIST_M = 2.0
+#: Rough battery price of driving a metre, used only to refuse a crossing the
+#: remaining charge cannot pay for.
+FAR_HUNT_COST = 1.0
+#: Radius for a search the planner itself inserts, taken where the reading gives
+#: no width to work from.
+SEARCH_RADIUS_DEFAULT = 0.8
+
+#: The three signal readings the mission turns on, and the cases they name.
+#: Below the low one the arena is simply unmeasured from here; above the middle
+#: a sample is close and worth closing on; above the high one it is inside the
+#: radius where collecting works at all.
+SIGNAL_SKILL_LOW = 0.12
+SIGNAL_SKILL_MID = 0.5
+SIGNAL_SKILL_HIGH = 0.8
+#: How far a reading has to move past a boundary before the case changes. A robot
+#: circling a sample sits on the boundary and would otherwise re-fire every tick.
+SKILL_HYSTERESIS = 0.05
+#: Minimum gap between two skill handovers, so one crossing costs one call and
+#: not one per tick while the reading settles.
+SKILL_COOLDOWN_SEC = 20.0
+#: How long the robot may stand still waiting for the model's answer before the
+#: planner answers the case itself.
+SKILL_WATCHDOG_SEC = 15.0
 
 #: How many readings are kept, the fewest a plane can be fitted through, how far
 #: apart they have to be for their differences to mean anything, and how strong
@@ -279,6 +325,11 @@ class Planner:
         self.yielded = False
         #: The operator pressed «Стоп»: stay quiet until the next run.
         self.quiet = False
+        #: A «Стоп» seen but not yet acted on, with the time it arrived. The
+        #: agent sends one of these when a scenario is started, so the planner
+        #: waits to see whether a new episode follows before believing it.
+        self.stop_pending = False
+        self.stop_at = 0.0
         #: The judge's clock, watched only to notice it jumping back to zero.
         self.last_sim_t = 0.0
         #: Explicit /agent/state episode generation observed through AgentLink.
@@ -288,10 +339,25 @@ class Planner:
             getattr(self.link, 'episode_generation', 0))
         #: (x, y, sensor) as the robot walks, the raw material for a gradient.
         self.trace: list[tuple[float, float, float]] = []
+        #: Searches that finished, and searches that were cut short. Separate
+        #: lists because only the first was actually swept.
+        self.attempted: list[tuple[float, float, float]] = []
+        #: Subgoal reports already accounted for, so a completed search is
+        #: recorded once.
+        self._noted_status: set[tuple[str, Any, str]] = set()
+        #: The signal case we are in, and the one waiting to be put to the model.
+        self._skill_band: str | None = None
+        #: The band last written about in the log, so a blocked skill says which
+        #: guard is holding it instead of going quiet.
+        self._skill_announced: str | None = None
+        self.pending_skill: tuple[str, str] | None = None
+        self.last_skill_at = 0.0
         #: Whether the last plan we sent was "go home".
         self._last_was_return = False
         #: Every rejection the executor reported, kept for the next prompt.
         self.rejections: list[str] = []
+        #: Recent plans and their outcomes, so the model does not repeat itself.
+        self.plan_history: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------- statistics
     def stats(self) -> dict[str, Any]:
@@ -319,8 +385,19 @@ class Planner:
         if self.link.command_pending:
             self.link.command_pending = False
             self._on_operator_command(self.link.command)
+        self._note_completed_search()
+        if self._handle_signal_skill():
+            return
         if self._new_episode():
             self._reset_for_new_episode()
+        if self.stop_pending and self.link.now() - self.stop_at >= STOP_GRACE_SEC:
+            # The stop was not part of a scenario restart, so it was the
+            # operator. Silence until the next run, as asked for.
+            self.stop_pending = False
+            self.quiet = True
+            self.inflight = None
+            self.link.log.info(
+                'оператор нажал «Стоп» — бургер не вмешивается до нового прогона')
         if self.quiet:
             return
         if self.link.finished():
@@ -428,9 +505,13 @@ class Planner:
             self.link.status, self.feedback,
             expensive=self.link.expensive_ground(), budget=budget,
             searched=self.searched_circles(),
+            attempted=self.attempted_circles(),
             uncovered=self.uncovered_cells(),
             bearing=self.bearing_hint(),
+            bearing_step=self.bearing_step(),
+            skill=self.pending_skill,
             round_number=self.round_number,
+            plan_history=self.plan_history,
         )
         self.busy = True
         self.busy_since = self.link.now()
@@ -587,7 +668,69 @@ class Planner:
         limit = self.cfg.max_subgoals
         if len(plan.subgoals) > limit:
             plan.subgoals = plan.subgoals[-limit:]
-        self._search_here_first(plan)
+        if self.pending_skill is None:
+            # Only when the model was not asked. A skill handover means the model
+            # has just been given this exact decision, and rewriting its answer
+            # with a rule of this planner's own would make the handover pointless:
+            # the "датчик молчит" substitution fired eleven times in ninety-six
+            # seconds and all but crowded the model out of its own plan.
+            self._search_here_first(plan)
+            self._send_far_when_silent(plan)
+
+    def _send_far_when_silent(self, plan: Plan) -> None:
+        """Replace a local search with a crossing, when the reading is dead.
+
+        The robot sat on the base searching a circle it had no reason to search:
+        the reading was 0.008 against a noise floor of 0.006, and the model, left
+        to its own devices, kept handing back ``goto(-2.2, -0.7)`` — the cell at
+        the base, again, for the third episode running.
+
+        A reading that low is not a missed sample. The sensor reads nothing past
+        its range, so near zero means the arena is simply unmeasured from here and
+        the only way to learn anything is to move to ground that has not been
+        swept. So the first move is sent to an unsearched cell far away, and the
+        rest of the model's plan follows it.
+        """
+        margin = signal_margin(self.link.signal(), self.link.noise())
+        if margin >= FAR_HUNT_MIN:
+            return
+        pose = self.link.pose()
+        if pose is None:
+            return
+        first_move = next((item for item in plan.subgoals
+                           if item.type in ('goto', 'search_around')), None)
+        if first_move is None:
+            return
+        if hypot(first_move.x - pose[0], first_move.y - pose[1]) >= FAR_HUNT_MIN_DIST_M:
+            return  # the model already means to go somewhere else
+        target = self.far_uncovered_cell(FAR_HUNT_MIN_DIST_M)
+        if target is None:
+            return  # nothing far enough, or nothing the battery can pay for
+        # Drop the local search being replaced together with its own collect.
+        # Keeping them sent the robot out to the far cell and then straight back
+        # to the base circle, which is the loop this is meant to end.
+        tail: list[Subgoal] = []
+        dropped_collect = False
+        for item in plan.subgoals[plan.subgoals.index(first_move) + 1:]:
+            if not dropped_collect:
+                if item.type == 'collect':
+                    dropped_collect = True
+                continue
+            tail.append(item)
+        plan.subgoals = [
+            Subgoal(type='goto', x=target[0], y=target[1]),
+            Subgoal(type='search_around', x=target[0], y=target[1],
+                    radius=SEARCH_RADIUS_DEFAULT),
+            Subgoal(type='collect'),
+            *tail,
+        ]
+        if plan.explanation:
+            plan.explanation += (' Датчик молчит, поэтому иду в неосмотренную '
+                                 'часть арены, а не кругу рядом.')
+        self.link.log.info(
+            f'   датчик молчит (запас {margin:.2f}) — вместо поиска рядом '
+            f'иду в неосмотренную точку ({target[0]:g}; {target[1]:g}), '
+            f'{hypot(target[0] - pose[0], target[1] - pose[1]):.1f} м отсюда')
 
     def _search_here_first(self, plan: Plan) -> None:
         """Put a local search and collect in front of a plan that ignores one.
@@ -760,6 +903,211 @@ class Planner:
             return None
         return (sx - here[0]) / off, (sy - here[1]) / off, off
 
+    def bearing_step(self) -> tuple[float, float, float] | None:
+        """A point to try next, along the measured bearing, if one is clear.
+
+        The estimate is right about two times in three, so on its own it is too
+        weak to send a robot after. What makes it usable is that a wrong bearing
+        is only wrong by degrees: stepping a short way along it keeps the robot
+        near the sample either way, and the next reading is taken from closer in
+        and therefore better. So the step is deliberately short and repeated,
+        which turns an unreliable heading into a converging walk.
+
+        Computed here rather than asked of the model on purpose. "Head within
+        30 degrees of the rising signal" is not something to hand to something
+        that reasons in coordinates; the point is worked out, checked against the
+        pillars, and offered as a number.
+        """
+        found = self.sample_direction()
+        if found is None:
+            return None
+        dx, dy, distance = found
+        pose = self.link.pose()
+        if pose is None:
+            return None
+        # Only worth a directed step while the reading places the sample inside
+        # the range where the cone is steep enough to mean anything.
+        if signal_margin(self.link.signal(), self.link.noise()) < BEARING_STEP_MIN:
+            return None
+        step = min(distance, BEARING_STEP_MAX_M)
+        # Turn the beam rather than give up: a pillar between here and there is
+        # a reason to try a neighbouring bearing, not to stand still.
+        for turn in (0.0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05):
+            angle = atan2(dy, dx) + turn
+            ux, uy = cos(angle), sin(angle)
+            point = (round(pose[0] + ux * step, 2), round(pose[1] + uy * step, 2))
+            if arena_problem(*point) is None:
+                return point[0], point[1], step
+        return None
+
+    def far_uncovered_cell(self, min_distance: float) -> tuple[float, float] | None:
+        """An unsearched cell worth crossing the arena for.
+
+        Used when the reading says there is nothing within reach. Searching the
+        ground the robot already stands on then costs battery and buys nothing:
+        the sensor falls off to nothing past its range, so a reading near zero is
+        not a sample nearby that was missed, it is the absence of information
+        about the whole arena. The way out is to go and look somewhere else.
+        """
+        pose = self.link.pose()
+        if pose is None:
+            return None
+        expensive = self.link.expensive_ground()
+        battery = self.link.battery()
+        budget = max(0.0, (battery or 0.0) - self.link.return_cost()) if battery else None
+
+        arena = ARENA
+        best: tuple[float, tuple[float, float]] | None = None
+        y = arena.y_min + UNCOVERED_STEP / 2
+        while y < arena.y_max:
+            x = arena.x_min + UNCOVERED_STEP / 2
+            while x < arena.x_max:
+                point = (round(x, 2), round(y, 2))
+                x += UNCOVERED_STEP
+                if (arena_problem(*point) is not None
+                        or self._was_searched(point)
+                        or on_expensive_ground(point[0], point[1], expensive)):
+                    continue
+                distance = hypot(point[0] - pose[0], point[1] - pose[1])
+                if distance < min_distance:
+                    continue
+                # Never further than the battery can pay for and still get home.
+                if budget is not None and distance * 2 > budget * FAR_HUNT_COST:
+                    continue
+                if best is None or distance > best[0]:
+                    best = (distance, point)
+            y += UNCOVERED_STEP
+        return best[1] if best else None
+
+    def _handle_signal_skill(self) -> bool:
+        """Act on a crossing of one of the three signal boundaries.
+
+        Returns True when it handled the tick, either by stopping to ask the
+        model or by answering mechanically because the model cannot be asked.
+        """
+        if self.pending_skill is not None:
+            # The robot has already been stopped for this skill. If the model
+            # has not answered by now, stop waiting: an episode standing still
+            # is the one failure mode nothing recovers from, so the mechanical
+            # answer goes out rather than the robot idling.
+            if (self.link.now() - self.last_skill_at > SKILL_WATCHDOG_SEC
+                    and not self.busy and self.pending is None):
+                skill, why = self.pending_skill
+                self.link.log.warn(
+                    f'модель не ответила на скил «{skill}» за '
+                    f'{SKILL_WATCHDOG_SEC:.0f} с — отвечаю сам, робот стоял')
+                self.pending_skill = None
+                self._publish(escape_plan(self._next_id(),
+                                          'скил без ответа модели'),
+                              source='skill-watchdog')
+            return False
+        if not self.client.cfg.configured:
+            return False
+        if self.busy or self.pending is not None:
+            margin = signal_margin(self.link.signal(), self.link.noise())
+            band_hint, _ = self._signal_skill(margin)
+            if band_hint is not None and band_hint != self._skill_announced:
+                self._skill_announced = band_hint
+                self.link.log.info(
+                    f'скил «{band_hint}» ждёт вызова модели '
+                    f'(busy={self.busy})')
+            return False
+        margin = signal_margin(self.link.signal(), self.link.noise())
+        band, is_new = self._signal_skill(margin)
+        if not is_new:
+            if self._skill_announced is not None and band != self._skill_announced:
+                self._skill_announced = band
+                self.link.log.info(
+                    f'скил не вызывается: полоса «{band}» уже была '
+                    f'({self._skill_band}), сигнал {margin:.2f}')
+            return False
+        self._skill_announced = band
+        wait = SKILL_COOLDOWN_SEC - (self.link.now() - self.last_skill_at)
+        if wait > 0:
+            # Not yet, and say so: a crossing that is merely waiting must look
+            # different in the log from one that is being ignored, because the
+            # two fail in the same silent way.
+            self.link.log.info(
+                f'скил «{band}» ждёт {wait:.0f} с (запас {margin:.2f})')
+            return False
+        self._skill_band = band
+
+        why = (f'сигнал {self.link.signal():.2f} при шуме '
+               f'{self.link.noise() or 0.0:.2f} (запас {margin:.2f})')
+        if self._ask_model_for_skill(band, why):
+            return True
+        return self._interrupt_for_sample()
+
+    def _signal_skill(self, margin: float) -> tuple[str | None, bool]:
+        """Which of the three signal cases we are in, and whether it is new.
+
+        The bands are the three readings the mission turns on: below 0.12 there
+        is nothing in reach, above 0.5 a sample is close, above 0.8 it is inside
+        the radius where collecting works. Between 0.12 and 0.5 the reading says
+        nothing actionable, so no case applies and the plan is left alone.
+
+        Hysteresis on each band, because a robot circling a sample sits right on
+        a boundary and a plain comparison would fire the same case every tick.
+        """
+        previous = self._skill_band
+        # Escalation first, so rising from "close" to "in hand" is never
+        # swallowed by the band we were already in — that is the transition that
+        # matters, the sample is collectable now and not a moment later. The
+        # hysteresis only ever holds a band open while the reading sits near its
+        # lower edge, which is where a robot circling a sample would otherwise
+        # chatter. Firing is on the band changing, never on the reading moving.
+        if margin >= SIGNAL_SKILL_HIGH:
+            band = 'take'
+        elif previous == 'take' and margin >= SIGNAL_SKILL_HIGH - SKILL_HYSTERESIS:
+            band = 'take'
+        elif margin >= SIGNAL_SKILL_MID:
+            band = 'approach'
+        elif previous == 'approach' and margin >= SIGNAL_SKILL_MID - SKILL_HYSTERESIS:
+            band = 'approach'
+        elif margin < SIGNAL_SKILL_LOW:
+            band = 'far'
+        elif previous == 'far' and margin < SIGNAL_SKILL_LOW + SKILL_HYSTERESIS:
+            band = 'far'
+        else:
+            band = None
+        return band, band is not None and band != previous
+
+    def _ask_model_for_skill(self, skill: str, why: str) -> bool:
+        """Stop the robot and put the case to the model as a named skill.
+
+        The three signal cases are decisions, not arithmetic: whether to close
+        the last half metre, walk to a spot that was a moment ago empty, or cross
+        the arena for ground nobody has swept are all judgement calls about
+        battery and time. So the robot stops and the model is told which case it
+        is in, rather than this planner deciding on its own.
+
+        The mechanical answers are kept for when the model cannot be asked — no
+        key, a dead endpoint, a call already in flight — because a stopped robot
+        in a live episode is worse than either option.
+        """
+        self.pending_skill = (skill, why)
+        self.force_replan = True
+        self.last_skill_at = self.link.now()
+        self.inflight = None
+        # Written as the wire object rather than through Plan. An empty plan is
+        # the stop, and Plan will not hold one — it requires at least one
+        # subgoal — so building it here raised a validation error that escaped
+        # the tick and was swallowed with no trace. Every skill handover was
+        # dying on this one line: nothing was ever stopped, nothing was ever
+        # asked, and the log showed nothing at all.
+        self.link.publish_plan({
+            'plan_id': self._next_id(),
+            'subgoals': [],
+            'explanation': f'остановка: скил «{skill}»',
+        })
+        self.link.log.warn(
+            f'стоп перед скилом «{skill}»: {why} — спрашиваю модель')
+        # Ask now, in this same tick. Leaving it to the next one left a window
+        # in which the robot was stopped and nobody was going to move it: the
+        # agent took the empty plan, went idle, and the run simply stood there.
+        self._plan_with_model()
+        return True
+
     def bearing_hint(self) -> tuple[float, float, float] | None:
         """The estimated sample position to show the model, if one is trusted.
 
@@ -797,15 +1145,30 @@ class Planner:
         plan preempts it, so publishing one is enough to take the wheel back.
         """
         if command == 'stop':
-            self.quiet = True
-            self.inflight = None
-            self.link.log.info(
-                'оператор нажал «Стоп» — бургер не вмешивается до нового прогона')
+            # Not applied at once. The agent sends ``stop`` as part of starting
+            # a scenario too, and treating that as the operator halting the run
+            # silenced the planner for good whenever the restart then failed to
+            # complete: the robot stood against a wall for six minutes taking a
+            # collision every two seconds and scoring minus 332, because no plan
+            # ever arrived. The two cases are told apart by what follows — a
+            # scenario restart brings a new episode within a second or two.
+            self.stop_at = self.link.now()
+            self.stop_pending = True
             return
         if command != 'auto':
             return
         if not self.handed_over:
-            self.link.log.info('оператор: автономный режим — бургер ждёт')
+            # The operator handed the robot to the agent's own policy. Record
+            # it as our own handover state too, or the button cannot be a
+            # toggle: the second press found handed_over still False, logged
+            # "waiting", and left the agent driving for the rest of the episode.
+            self.handed_over = True
+            self.auto_requested = True
+            self.handed_over_at = self.link.now()
+            self.inflight = None
+            self.link.log.info(
+                'оператор отдал автономный режим — бургер ждёт. '
+                'Повторное нажатие вернёт управление планировщику.')
             return
         # Second press: hand the wheel back to this planner.
         self.handed_over = False
@@ -846,6 +1209,7 @@ class Planner:
     def _reset_for_new_episode(self) -> None:
         """Drop planning memory that belongs to the previous judge run."""
         self.quiet = False
+        self.stop_pending = False
         self.inflight = None
         self.sent_subgoals.clear()
         self.feedback = ''
@@ -860,9 +1224,14 @@ class Planner:
         # Readings taken in the previous run describe that run's samples. Kept,
         # they would point the gradient at a sample that is no longer there.
         self.trace.clear()
+        self.attempted.clear()
+        self._noted_status.clear()
         self.rejections.clear()
         self._last_was_return = False
         self.last_plan_at = None
+        # Plan history belongs to the previous episode. Kept, it would steer
+        # the model away from ground that is now worth searching again.
+        self.plan_history.clear()
 
     def _operator_is_driving(self) -> bool:
         """Whether a plan this planner did not write is running on the agent.
@@ -929,6 +1298,14 @@ class Planner:
             status='confirmed' if state == 'done' else 'rejected',
             source='llm_planner',
         )
+
+        # Update the plan history with the outcome.
+        plan_id = str(status.get('plan_id') or '')
+        for entry in reversed(self.plan_history):
+            if entry.get('plan_id') == plan_id:
+                entry['outcome'] = state or 'unknown'
+                entry['reason'] = reason
+                break
 
         if state == 'failed' and reason:
             # Their handbook asks for exactly this: the executor's reason goes
@@ -1201,14 +1578,24 @@ class Planner:
         # never finished one search — the radii ran 0.9, 0.3, 0.6, 0.5, 0.35,
         # 0.9, 0.4 while the robot sat in one spot with the same subgoal showing
         # as "running".
+        #
+        # Comparing the running circle against a radius derived from the reading
+        # does not work either, because that target moves with the reading. The
+        # signal breathes between 0.32 and 0.60 while the robot circles a sample
+        # it is closing on, the wanted radius swings between 0.45 and 0.9 with
+        # it, and every swing is a reason to replace the circle that is about to
+        # finish. The centres ran 1.01, 1.98, 1.85, 2.07, 1.93, 1.89 and the
+        # sample stood still the whole time.
+        #
+        # So a search under way is not replaced for being the wrong size. The
+        # reading still gets its two decisive sayings: take the sample when it is
+        # within collecting distance, and go somewhere else when the circle is
+        # nowhere near the robot.
         wanted = search_radius(margin)
         if (not idle and subgoal.type == 'search_around'
-                and hypot(subgoal.x - pose[0], subgoal.y - pose[1]) < 0.6):
-            too_narrow = subgoal.radius < wanted - SEARCH_REACH_SLACK_M
-            too_wide = (subgoal.radius > wanted + SEARCH_REACH_SLACK_M
-                        and margin >= SIGNAL_CLOSE)
-            if not (too_narrow or too_wide):
-                return False
+                and hypot(subgoal.x - pose[0], subgoal.y - pose[1]) < 0.6
+                and margin < SIGNAL_TAKE):
+            return False
         # A live signal persists while the robot circles the sample, so without
         # a pause the interrupt would fire every tick and the robot would spin
         # in place instead of searching once and collecting.
@@ -1245,10 +1632,14 @@ class Planner:
             'прерываю план, образец рядом')
         self.last_interrupt_at = self.link.now()
         self._publish(plan, source='signal')
-        # Whether the sample was taken or not, the model decides what comes
-        # next. Left to its own schedule it would keep this two-subgoal plan
-        # running and never look at the arena again.
-        self.force_replan = True
+        # Not forcing a replan here. The model used to be told to take over
+        # immediately, and it did: this planner published "search here, then
+        # collect" and the model answered with a six-subgoal plan of its own
+        # within zero seconds, preempting it. The two-subgoal plan never ran, so
+        # the robot kept changing course mid-search — the interrupt fired on a
+        # 0.49 reading, the model answered, eleven seconds later another
+        # interrupt, and no search was ever allowed to finish. The next plan is
+        # due when this one ends, which is what _due() already arranges.
         return True
 
     def _collect_when_close(self) -> bool:
@@ -1291,8 +1682,8 @@ class Planner:
         self.force_replan = True
         return True
 
-    def _remember_search(self, plan: Plan) -> None:
-        """Note the ground a plan's searches will have covered.
+    def _remember_search(self, subgoals: list[Subgoal]) -> None:
+        """Note ground that a search has actually finished sweeping.
 
         The sample sensor says how close the nearest sample is and never which
         way, and no map in the prompt shows where samples are, so the model picks
@@ -1301,8 +1692,13 @@ class Planner:
         live here, because the model has no memory between rounds and the pose
         history does not distinguish "searched and empty" from "never went
         there".
+
+        Only completed searches are recorded. Marking them when the plan was
+        published meant a circle the robot never reached — the plan was
+        preempted first — was still reported to the model as "searched, empty",
+        so the prompt steered it away from ground nobody had looked at.
         """
-        for subgoal in plan.subgoals:
+        for subgoal in subgoals:
             if subgoal.type != 'search_around':
                 continue
             circle = (subgoal.x, subgoal.y, subgoal.radius)
@@ -1312,9 +1708,66 @@ class Planner:
             self.searched.append(circle)
         del self.searched[:-SEARCH_MEMORY]
 
+    def _remember_attempt(self, subgoals: list[Subgoal]) -> None:
+        """Note a search that was cut short, kept apart from the swept ones.
+
+        The circle was not covered, so it must not be reported as covered. But
+        the robot stood there and left with nothing, and that is exactly what the
+        model needs to stop choosing it again.
+        """
+        for subgoal in subgoals:
+            if subgoal.type != 'search_around':
+                continue
+            circle = (subgoal.x, subgoal.y, subgoal.radius)
+            if any(hypot(circle[0] - x, circle[1] - y) < 0.05
+                   for x, y, _ in self.attempted):
+                continue
+            self.attempted.append(circle)
+        del self.attempted[:-SEARCH_MEMORY]
+
+    def _note_completed_search(self) -> None:
+        """Record a search the agent has just reported as done.
+
+        The agent publishes one status per subgoal, so this is the only place
+        that knows a circle was really swept. Reading it off the terminal status
+        of the subgoal in flight keeps the coverage record honest: it says what
+        happened rather than what was intended.
+        """
+        status = self.link.status
+        if not status:
+            return
+        marker = (str(status.get('plan_id') or ''), status.get('index'),
+                  str(status.get('state') or ''))
+        if marker in self._noted_status or marker[2] != 'done':
+            return
+        if marker[0] != (self.inflight or '') or marker[1] is None:
+            return
+        self._noted_status.add(marker)
+        if len(self._noted_status) > 512:
+            self._noted_status.clear()
+        try:
+            index = int(marker[1])
+        except (TypeError, ValueError):
+            return
+        state = str(status.get('state') or '')
+        for plan_id, position, subgoal in self.sent_subgoals:
+            if plan_id != marker[0] or position != index:
+                continue
+            if subgoal.type != 'search_around':
+                return
+            if state == 'done':
+                self._remember_search([subgoal])
+            elif state in ('preempted', 'failed'):
+                self._remember_attempt([subgoal])
+            return
+
     def searched_circles(self) -> list[tuple[float, float, float]]:
         """The circles the model is told have already been swept."""
         return list(self.searched)
+
+    def attempted_circles(self) -> list[tuple[float, float, float]]:
+        """Circles a search was cut short in, so the model stops choosing them."""
+        return list(self.attempted)
 
     def uncovered_cells(self, limit: int = UNCOVERED_HINTS
                         ) -> list[tuple[float, float]]:
@@ -1331,6 +1784,13 @@ class Planner:
         pose = self.link.pose() or (BASE_X, BASE_Y)
         arena = ARENA
         expensive = self.link.expensive_ground()
+        # Under the «искать дальше» skill the nearest cells are the wrong
+        # answer: the reading says there is nothing here, and the nearest
+        # unsearched ground is the ground the robot is already standing on. The
+        # two halves of the prompt were contradicting each other — the skill
+        # said "cross the arena" while the target list handed over the cell at
+        # the base — and the model believed the list.
+        go_far = self.pending_skill is not None and self.pending_skill[0] == 'far'
         cells = []
         y = arena.y_min + UNCOVERED_STEP / 2
         while y < arena.y_max:
@@ -1345,11 +1805,24 @@ class Planner:
                                   point))
                 x += UNCOVERED_STEP
             y += UNCOVERED_STEP
-        cells.sort(key=lambda item: item[0])
+        if go_far:
+            cells.sort(key=lambda item: -item[0])
+        else:
+            cells.sort(key=lambda item: item[0])
         return [point for _, point in cells[:limit]]
 
     def _was_searched(self, point: tuple[float, float]) -> bool:
-        return any(hypot(point[0] - x, point[1] - y) <= r for x, y, r in self.searched)
+        """Whether this spot has been dealt with, one way or another.
+
+        An interrupted search counts. Its circle was never swept, so calling it
+        "searched, empty" in the prompt would be a lie — which is why they are
+        kept apart — but the robot did go there and did come away with
+        nothing, so sending the model back is how it looped. The model was
+        repeatedly handed (-2.2; 1.7) again, having no way to know the robot had
+        already tried and been pulled away.
+        """
+        return any(hypot(point[0] - x, point[1] - y) <= r
+                   for x, y, r in self.searched + self.attempted)
 
     def _current_subgoal(self) -> Subgoal | None:
         """The subgoal the executor is on, taken from the plan we sent."""
@@ -1390,6 +1863,7 @@ class Planner:
         prompt = build_planner_prompt(
             self.cfg.mission, self.link.state or {},
             self.link.status, 'сеть отвечает снова, продолжим планирование',
+            plan_history=self.plan_history,
         )
         try:
             self.client.complete_json(
@@ -1414,7 +1888,30 @@ class Planner:
             return False
         if self.last_plan_at is None:
             return True
-        return self.link.now() - self.last_plan_at >= self.cfg.replan_period_sec
+        if not self._search_in_progress():
+            return self.link.now() - self.last_plan_at >= self.cfg.replan_period_sec
+        # A search that is already under way is left to finish. It was not: the
+        # period expired mid-circle, a fresh plan arrived, and every search in
+        # every run ended the same way — "preempted: replaced by a new plan".
+        # Nothing was ever covered, the robot drove between the same two cells
+        # for minutes, and it collected one sample a minute and then stood in
+        # circles near the last one. Only the sensor has a reason to cut a
+        # search short, and _interrupt_for_sample() is that reason.
+        return False
+
+    def _search_in_progress(self) -> bool:
+        """Whether the agent is running a search right now.
+
+        The state matters as much as the type. A status left at "preempted"
+        still names its subgoal, and reading the type alone would count that as
+        a search in progress for the rest of the episode — the planner would
+        wait for a circle that was already cancelled and never send another.
+        """
+        status = self.link.status or {}
+        if str(status.get('state') or '') != 'running':
+            return False
+        subgoal = self._current_subgoal()
+        return subgoal is not None and subgoal.type == 'search_around'
 
     def _go_autonomous(self, why: str = 'модель недоступна') -> None:
         """Hand over to the agent's own behaviour, once.
@@ -1441,6 +1938,7 @@ class Planner:
         self.link.log.warn(f'передача в автономный режим: {why}')
 
     def _publish(self, plan: Plan, *, source: str) -> None:
+        self.pending_skill = None
         # Read the clock before updating ``last_plan_at`` so the log reports
         # the real interval. The first locally generated plan has no previous
         # timestamp and therefore reports zero seconds.
@@ -1452,7 +1950,9 @@ class Planner:
         self.inflight = plan.plan_id
         self.last_plan_at = now
         self.force_replan = False
-        self._remember_search(plan)
+        # Coverage is not recorded here. A circle only counts once the agent
+        # reports its search done, which _note_completed_search() watches for;
+        # recording it on publication would claim ground the robot never reached.
         self.sent_subgoals = [(plan.plan_id, index, subgoal)
                               for index, subgoal in enumerate(plan.subgoals)]
         # Any plan that ends at the base is a decision to stop exploring, so
@@ -1460,6 +1960,8 @@ class Planner:
         # against, whether the model wrote it or the budget forced it.
         self._last_was_return = bool(
             plan.subgoals and plan.subgoals[-1].type == 'return_to_base')
+        # Record the plan in history so the model can see what was already tried.
+        self._record_plan(plan, source)
         if not plan.subgoals:
             self.link.log.warn(
                 f'БУРГЕР → АГЕНТ   план {plan.plan_id} ({source}) ПУСТОЙ '
@@ -1483,6 +1985,37 @@ class Planner:
         # No journal entry here on purpose: the agent's dashboard already turns
         # a plan's "explanation" into a `decision` entry, so writing one too
         # would show every plan twice in the feed.
+
+    def _record_plan(self, plan: Plan, source: str) -> None:
+        """Record a plan in history so the model can see what was already tried.
+
+        The model has no memory between rounds. Without a record of what was
+        already tried, it picks the same targets again: a plan that failed with
+        "no path to goal" is followed by an identical plan, and a search that
+        found nothing is repeated at the same coordinates. The history is the
+        only thing that stops it.
+
+        Each entry carries the plan's subgoals and the source (llm, budget,
+        signal, etc.), so the model can see not just what was tried but why.
+        The outcome is added later by _note_outcome when the plan finishes.
+        """
+        self.plan_history.append({
+            'plan_id': plan.plan_id,
+            'subgoals': [
+                {
+                    'type': sg.type,
+                    'x': round(sg.x, 2),
+                    'y': round(sg.y, 2),
+                    'radius': round(sg.radius, 2),
+                }
+                for sg in plan.subgoals
+            ],
+            'source': source,
+            'outcome': 'pending',
+            'reason': '',
+        })
+        # Keep only the last 10 plans to avoid unbounded growth.
+        del self.plan_history[:-10]
 
     def _next_id(self) -> str:
         self.plan_counter += 1

@@ -306,6 +306,15 @@ button:focus-visible, input:focus-visible {
 .scenario-start { display: grid; grid-template-columns: 20px 1fr 20px; align-items: center; gap: 7px; min-height: 44px; margin-top: auto; padding: 9px 12px; border: 1px solid #3af0dd; border-radius: 10px; color: #031716; background: linear-gradient(135deg, #25d9c7, #56eadb); font-size: .7rem; font-weight: 750; cursor: pointer; box-shadow: 0 8px 24px rgba(37,217,199,.13); }
 .scenario-start:hover:not(:disabled) { background: #62eee0; transform: translateY(-1px); }
 .scenario-start:disabled { border-color: var(--line-bright); color: var(--dim); background: var(--surface-2); box-shadow: none; }
+
+/* Two ways into a run that already exists, beside the button that makes one:
+   watch it, or end it. Without them the only route to the live view was
+   through starting a new scenario, which restarted the episode. */
+.scenario-alt-actions { display: flex; gap: 7px; margin-top: 8px; }
+.scenario-alt { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; min-height: 38px; padding: 7px 9px; border: 1px solid var(--line-bright); border-radius: 9px; color: var(--text-dim); background: var(--surface-2); font-size: .64rem; font-weight: 650; line-height: 1.25; text-align: center; cursor: pointer; }
+.scenario-alt:hover:not(:disabled) { border-color: #3af0dd; color: var(--text); }
+.scenario-alt:disabled { color: var(--dim); cursor: not-allowed; }
+.scenario-alt.is-danger:hover:not(:disabled) { border-color: #ff6b7a; color: #ff9aa5; }
 .scenario-start svg:last-child { justify-self: end; }
 .is-spinning { animation: setup-spin .8s linear infinite; }
 @keyframes setup-spin { to { transform: rotate(360deg); } }

@@ -92,3 +92,76 @@ def test_unknown_ground_is_not_described_as_known_cheap_ground():
 
     assert 'не измерил ни одной дорогой зоны' in prompt
     assert 'все точки стоят 1.0' not in prompt
+
+
+def test_plan_history_shows_recent_plans_and_outcomes():
+    """The model sees what was already tried, so it does not repeat itself."""
+    prompt = build_planner_prompt(
+        'Собрать образцы',
+        {'scenario': 'easy', 'samples_total': 3, 'collected': 0, 'battery': 60.0},
+        None,
+        '',
+        plan_history=[
+            {
+                'plan_id': 'llm-001',
+                'subgoals': [
+                    {'type': 'goto', 'x': 0.5, 'y': 0.5},
+                    {'type': 'search_around', 'x': 0.5, 'y': 0.5, 'radius': 0.8},
+                    {'type': 'collect'},
+                ],
+                'source': 'llm',
+                'outcome': 'failed',
+                'reason': 'no path to goal',
+            },
+            {
+                'plan_id': 'llm-002',
+                'subgoals': [
+                    {'type': 'search_around', 'x': -0.5, 'y': -0.5, 'radius': 0.8},
+                    {'type': 'collect'},
+                ],
+                'source': 'llm',
+                'outcome': 'done',
+                'reason': '',
+            },
+        ],
+    )
+
+    assert 'ИСТОРИЯ ПЛАНОВ' in prompt
+    assert 'llm-001' in prompt
+    assert 'llm-002' in prompt
+    assert 'no path to goal' in prompt
+    assert 'Не повторяй планы' in prompt
+
+
+def test_plan_history_is_empty_when_no_plans():
+    """No history block when there are no plans yet."""
+    prompt = build_planner_prompt(
+        'Собрать образцы',
+        {'scenario': 'easy', 'samples_total': 3, 'collected': 0, 'battery': 60.0},
+        None,
+        '',
+        plan_history=[],
+    )
+
+    assert 'ИСТОРИЯ ПЛАНОВ' not in prompt
+
+
+def test_expensive_ground_is_shown_in_prompt():
+    """The model sees the cost map, so it can route around expensive zones."""
+    prompt = build_planner_prompt(
+        'Собрать образцы',
+        {'scenario': 'medium', 'samples_total': 5, 'collected': 0, 'battery': 50.0},
+        None,
+        '',
+        expensive=[
+            {'x': 1.0, 'y': 1.0, 'reach': 0.5, 'cost': 2.5},
+            {'x': -1.0, 'y': -1.0, 'reach': 0.3, 'cost': 3.0},
+        ],
+    )
+
+    assert 'ДОРОГОЙ ГРУНТ' in prompt
+    assert '(1.00; 1.00)' in prompt
+    assert '×2.5' in prompt
+    assert '(-1.00; -1.00)' in prompt
+    assert '×3.0' in prompt
+    assert 'Через эти точки не ездить' in prompt

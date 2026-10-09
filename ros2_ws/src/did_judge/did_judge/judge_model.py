@@ -248,3 +248,43 @@ class JudgeModel:
             return False
         self.finished = True
         return True
+
+
+def score_payload(model: JudgeModel, scenario_file: str) -> dict[str, Any]:
+    """Build the public ``/did/score`` message.
+
+    The topic is read by the dashboard and subscribed to by the LLM planner's
+    agent link, so it carries only progress and penalties. ``samples`` lists
+    the collected ones — having been picked up, they are no longer hidden —
+    while the coordinates of the samples still lying on the arena and the
+    judge's world pose stay out: the agent has to find those with its own
+    sensor, and ground truth belongs to ``/api/truth``, which only the
+    operator UI reads.
+    """
+    return {
+        'scenario': model.scenario.name,
+        'scenario_file': scenario_file,
+        't': round(model.time, 2),
+        'battery': round(model.battery, 3),
+        'collected': model.collected_count,
+        'samples_total': len(model.samples),
+        'distance_travelled': round(model.distance_travelled, 3),
+        'collisions': model.collisions,
+        'false_collects': model.false_collects,
+        'hazard_hits': model.hazard_hits,
+        'score': round(model.score, 2),
+        'finished': model.finished,
+        'base_pose': {
+            'x': model.base_x,
+            'y': model.base_y,
+        },
+        'samples': [
+            {
+                'x': item.sample.x,
+                'y': item.sample.y,
+                'collected': True,
+            }
+            for item in model.samples
+            if item.collected
+        ],
+    }

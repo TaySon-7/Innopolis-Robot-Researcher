@@ -263,6 +263,8 @@ class FakeAgent(Node):
         self.state_pub.publish(String(data=json.dumps(state)))
 
         # The judge's score topic, which is where "finished" is published.
+        # Like the real judge it never carries uncollected sample positions
+        # or a world pose: those are hidden truth (see did_judge.score_payload).
         self.score_pub.publish(String(data=json.dumps({
             'scenario': 'easy',
             'battery': round(self.battery, 3),
@@ -270,8 +272,6 @@ class FakeAgent(Node):
             'samples_total': len(SAMPLES),
             'distance_travelled': self.distance,
             'finished': self.finished,
-            'world_pose': {'x': round(self.pose['x'], 3),
-                           'y': round(self.pose['y'], 3)},
         }, sort_keys=True)))
 
         if self.current.get('state') == 'running':

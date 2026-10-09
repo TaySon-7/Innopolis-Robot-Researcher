@@ -10,6 +10,7 @@ import {
   Radio,
   RefreshCw,
   Sparkles,
+  Square,
 } from 'lucide-react'
 import type {
   AgentConnection,
@@ -90,6 +91,10 @@ interface ScenarioSetupProps {
   onSeedChange: (seed: string) => void
   onRandomSeed: () => void
   onStart: () => void
+  /** Open the live view without touching the episode that is running. */
+  onJoin: () => void
+  /** Stop the robot and the planner, leaving the episode itself open. */
+  onAbort: () => void
 }
 
 function normalizeScenario(value: string | null): Difficulty | null {
@@ -335,6 +340,8 @@ export function ScenarioSetup({
   onSeedChange,
   onRandomSeed,
   onStart,
+  onJoin,
+  onAbort,
 }: ScenarioSetupProps) {
   const active = normalizeScenario(activeScenario)
   const chosen = DIFFICULTIES.find((item) => item.id === selected) ?? DIFFICULTIES[0]
@@ -533,6 +540,32 @@ export function ScenarioSetup({
               {!connected && !error && <small>Кнопка станет доступна после подключения Agent API</small>}
               {connected && previewBusy && <small>Сначала дождитесь точного предпросмотра</small>}
               {connected && !previewBusy && preview && <small><MapPinned size={12} /> Запустится именно показанная раскладка</small>}
+
+              <div className="scenario-alt-actions">
+                <button
+                  className="scenario-alt"
+                  type="button"
+                  disabled={!connected || busy}
+                  onClick={onJoin}
+                  title="Открыть живой экран, не трогая текущий прогон"
+                >
+                  <Radio size={15} />
+                  <span>Подключиться к текущему прогону</span>
+                </button>
+                <button
+                  className="scenario-alt is-danger"
+                  type="button"
+                  disabled={!connected || busy}
+                  onClick={onAbort}
+                  title="Остановить робота и планировщик, прогон остаётся открытым"
+                >
+                  <Square size={14} />
+                  <span>Прервать текущий прогон</span>
+                </button>
+              </div>
+              {activeScenario && (
+                <small>Идёт прогон: <b>{activeScenario}</b>. «Подключиться» его не прерывает.</small>
+              )}
             </aside>
           </div>
         </section>

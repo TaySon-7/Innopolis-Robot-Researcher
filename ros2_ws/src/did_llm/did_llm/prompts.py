@@ -188,12 +188,13 @@ HYPOTHESIS_SYSTEM = """\
 """
 
 
-def _bearing_block(bearing: tuple[float, float, float] | None) -> str:
+def _bearing_block(bearing: tuple[float, float, float] | None,
+                   bearing_step: tuple[float, float, float] | None) -> str:
     """Where the sensor says the nearest sample is, as an estimate.
 
     The reading is a distance, not a bearing: it says how far away the nearest
-    uncollected sample was from each place the robot stood. Three such
-    distances pin the sample down, which is how this block exists at all.
+    uncollected sample was from each place the robot stood. Three such distances
+    pin the sample down, which is how this block exists at all.
 
     It is offered as a hint and never as an order, because it is not good
     enough to be one. Measured against the judge's sensor noise, the recovered
@@ -205,14 +206,58 @@ def _bearing_block(bearing: tuple[float, float, float] | None) -> str:
     if bearing is None:
         return ''
     x, y, distance = bearing
-    return ('КУДА ПРИМЕРНО ЛЕЖИТ ОБРАЗЕЦ (оценка по замерам датчика, '
-            'может ошибаться на десятки градусов — это подсказка, '
-            'не приказ):\n'
-            f'  ориентир: ({x:.2f}; {y:.2f}), примерно {distance:.2f} м '
-            f'от робота.\n'
-            '  Если датчик при этом заметен, поиск в этом направлении '
-            'обычно выгоднее круга на месте. Но проверь: цель должна быть '
-            'проходима, без столбов, и в пределах разумного пути.')
+    lines = ['КУДА ПРИМЕРНО ЛЕЖИТ ОБРАЗЕЦ (оценка по замерам датчика, '
+             'может ошибаться на десятки градусов — это подсказка, '
+             'не приказ):',
+             f'  ориентир: ({x:.2f}; {y:.2f}), примерно {distance:.2f} м '
+             'от робота.']
+    if bearing_step is not None:
+        step_x, step_y, step = bearing_step
+        lines.append(
+            f'  Ближайшая точка в этом направлении, уже проверенная на '
+            f'столбы: ({step_x:.2f}; {step_y:.2f}) — {step:.2f} м от робота.\n'
+            '  Дальше по этому курсу не ехать: после шага замер будет новым, '
+            'с более близкой точки, и курс уточнится. Ориентир бывает ошибочным, '
+            'поэтому каждый такой заход — это проверка, а не приказ идти до конца.')
+    lines.append('  Если датчик при этом заметен, движение в этом направлении '
+                 'обычно выгоднее круга на месте. Но проверь: цель должна быть '
+                 'проходима, без столбов, и в пределах разумного пути.')
+    return '\n'.join(lines)
+
+
+SKILL_BRIEFS = {
+    'take': (
+        'СКИЛ «ВЗЯТЬ»: сигнал не меньше {high} — образец уже в пределах '
+        'сбора. Собери его: collect на месте или после очень короткого поиска. '
+        'Уезжать сейчас нельзя — образец останется на полу.'),
+    'approach': (
+        'СКИЛ «ПОДОЙТИ»: сигнал между {low} и {high} — образец близко, но ещё '
+        'не в руках. Двигайся к нему короткими шагами, поиск делай небольшим, '
+        'и collect сразу после. Дальше {distance} ехать не имеет смысла.'),
+    'far': (
+        'СКИЛ «ИСКАТЬ ДАЛЬШЕ»: сигнал меньше {low} — рядом ничего нет, датчик '
+        'дальше своей дальности просто молчит. Кружить на месте бессмысленно: '
+        'это тратит время и батарею. Иди в часть арены, которую ещё не '
+        'смотрели, и там уже ищи.'),
+}
+
+#: The same three numbers, written out for the model, so the brief and the code
+#: cannot quietly disagree about where the boundaries are.
+SIGNAL_LOW_TEXT = '0.12'
+SIGNAL_HIGH_TEXT = '0.8'
+
+
+def _skill_block(skill: tuple[str, str] | None) -> str:
+    """State the signal case the robot has walked into, as a named skill."""
+    if not skill:
+        return ''
+    name, why = skill
+    brief = SKILL_BRIEFS.get(name)
+    if not brief:
+        return ''
+    return (brief.format(low=SIGNAL_LOW_TEXT, high=SIGNAL_HIGH_TEXT,
+                         distance='1.5 м')
+            + f'\nПочему сработало: {why}')
 
 
 def build_planner_prompt(mission: str, state: dict[str, Any],
@@ -222,12 +267,23 @@ def build_planner_prompt(mission: str, state: dict[str, Any],
                          budget: dict[str, Any] | None = None,
                          searched: list[tuple[float, float, float]] | None = None,
                          uncovered: list[tuple[float, float]] | None = None,
+                         attempted: list[tuple[float, float, float]] | None = None,
                          bearing: tuple[float, float, float] | None = None,
-                         round_number: int = 0) -> str:
+                         bearing_step: tuple[float, float, float] | None = None,
+                         skill: tuple[str, str] | None = None,
+                         round_number: int = 0,
+                         plan_history: list[dict[str, Any]] | None = None) -> str:
     """Assemble the planner prompt from one state snapshot.
 
     ``round_number`` rotates the strategy directive, which both defeats the
     endpoint's prompt cache and gives the model a genuinely different angle.
+
+    ``skill`` names the signal case the robot has just walked into. The three
+    cases are decisions about battery and time rather than arithmetic, so the
+    model is asked instead of this planner answering on its own.
+
+    ``plan_history`` carries the last N plans with their outcomes, so the
+    model can see what has already been tried and avoid repeating it.
     """
     parts = [
         f'МИССИЯ: {mission}',
@@ -241,15 +297,19 @@ def build_planner_prompt(mission: str, state: dict[str, Any],
         '',
         _ground_block(expensive),
         '',
-        _coverage_block(searched, uncovered),
+        _coverage_block(searched, uncovered, attempted),
         '',
-        _bearing_block(bearing),
+        _bearing_block(bearing, bearing_step),
+        '',
+        _skill_block(skill),
         '',
         _budget_block(state, budget),
         '',
         'СОСТОЯНИЕ:',
         _json(state),
     ]
+    if plan_history:
+        parts += ['', _history_block(plan_history)]
     if status:
         parts += ['', 'ПОСЛЕДНИЙ РЕЗУЛЬТАТ ПОДЦЕЛИ:', _json(status)]
     if feedback:
@@ -342,7 +402,9 @@ def _ground_block(expensive: list[dict[str, float]] | None) -> str:
 
 
 def _coverage_block(searched: list[tuple[float, float, float]] | None,
-                    uncovered: list[tuple[float, float]] | None = None) -> str:
+                    uncovered: list[tuple[float, float]] | None = None,
+                    attempted: list[tuple[float, float, float]] | None = None
+                    ) -> str:
     """Where the robot has already looked, and what is left worth looking at.
 
     The sample sensor reports how close the nearest sample is and nothing about
@@ -371,6 +433,14 @@ def _coverage_block(searched: list[tuple[float, float, float]] | None,
         )
     else:
         parts.append('ГДЕ УЖЕ ИСКАЛИ: пока ничего — это первая точка плана.')
+    if attempted:
+        circles = ', '.join(f'({x:.1f}; {y:.1f})' for x, y, _ in attempted)
+        parts.append(
+            'ГДЕ ПОИСК ПРЕРВАЛИ (робот там стоял, но круг не дошёл до конца):\n'
+            f'  {circles}\n'
+            '  Туда больше не ходи: пути туда уже потрачены, а результата не '
+            'получено. Выбери другую точку.'
+        )
 
     if uncovered:
         cells = ', '.join(f'({x:.1f}; {y:.1f})' for x, y in uncovered)
@@ -409,6 +479,38 @@ def _budget_block(state: dict[str, Any],
     parts.append('  Если батареи не хватает на круг — сокращай круг, '
                  'а не едь дальше.')
     return '\n'.join(parts)
+
+
+def _history_block(plan_history: list[dict[str, Any]]) -> str:
+    """Recent plans and their outcomes, so the model does not repeat itself.
+
+    The model has no memory between rounds. Without a record of what was
+    already tried, it picks the same targets again: a plan that failed with
+    "no path to goal" is followed by an identical plan, and a search that
+    found nothing is repeated at the same coordinates. The history is the
+    only thing that stops it.
+
+    Each entry carries the plan's subgoals and the outcome of the last one,
+    which is all the model needs: it can see what was tried, where it failed,
+    and choose a different approach.
+    """
+    lines = ['ИСТОРИЯ ПЛАНОВ (что уже пробовали и чем закончилось):']
+    for entry in plan_history[-5:]:
+        plan_id = entry.get('plan_id', '?')
+        subgoals = entry.get('subgoals', [])
+        outcome = entry.get('outcome', '?')
+        reason = entry.get('reason', '')
+        summary = ', '.join(
+            f"{sg.get('type', '?')}({sg.get('x', 0):.1f}, {sg.get('y', 0):.1f})"
+            if sg.get('type') in ('goto', 'search_around')
+            else sg.get('type', '?')
+            for sg in subgoals
+        )
+        lines.append(f'  план {plan_id}: {summary} → {outcome}')
+        if reason:
+            lines.append(f'    причина: {reason}')
+    lines.append('Не повторяй планы, которые уже закончились неудачей.')
+    return '\n'.join(lines)
 
 
 def _geometry_block() -> str:

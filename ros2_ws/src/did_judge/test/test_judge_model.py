@@ -149,6 +149,28 @@ def test_score_combines_rewards_and_penalties():
     assert model.score == pytest.approx(10.0 - 1.0)
 
 
+def test_score_payload_keeps_hidden_truth_off_the_topic():
+    from did_judge.judge_model import score_payload
+    model = make_model()
+    model.update_odometry(0.25, 0.0)
+    model.collect()  # collects s1 at (-1.5; -0.5), s2 stays on the arena
+
+    payload = score_payload(model, '/tmp/scenarios/test.yaml')
+
+    # The judge's world pose and the remaining sample's position are hidden
+    # truth: the topic is public and the LLM planner subscribes to it.
+    assert 'world_pose' not in payload
+    assert payload['samples'] == [
+        {'x': -1.5, 'y': -0.5, 'collected': True},
+    ]
+    # Everything the dashboard needs for progress stays available.
+    assert payload['scenario'] == 'test'
+    assert payload['scenario_file'] == '/tmp/scenarios/test.yaml'
+    assert payload['collected'] == 1 and payload['samples_total'] == 2
+    assert payload['finished'] is False
+    assert payload['score'] == pytest.approx(10.0)
+
+
 def test_same_seed_gives_same_noise():
     first = make_model(sensor={'range': 1.5, 'noise_stddev': 0.05})
     second = make_model(sensor={'range': 1.5, 'noise_stddev': 0.05})
