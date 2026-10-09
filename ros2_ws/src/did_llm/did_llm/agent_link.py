@@ -49,8 +49,9 @@ class AgentLink:
     rosout logger between them and make the logs misleading.
     """
 
-    def __init__(self, node: Node) -> None:
+    def __init__(self, node: Node, *, observed_only: bool = False) -> None:
         self.node = node
+        self.observed_only = observed_only
         #: Optional: the owner node's logger, for transport-level notes.
         self.log = node.get_logger()
 
@@ -87,9 +88,12 @@ class AgentLink:
 
         node.create_subscription(String, STATE_TOPIC, self._on_state, 10)
         node.create_subscription(String, STATUS_TOPIC, self._on_status, 10)
-        node.create_subscription(String, SCORE_TOPIC, self._on_score, 10)
-        node.create_subscription(String, EVENTS_TOPIC, self._on_event, 50)
-        node.create_subscription(String, COSTMAP_TOPIC, self._on_costmap, 10)
+        if not observed_only:
+            # Compatibility with the legacy planner. The math planner consumes
+            # only the agent's published observations and candidate contract.
+            node.create_subscription(String, SCORE_TOPIC, self._on_score, 10)
+            node.create_subscription(String, EVENTS_TOPIC, self._on_event, 50)
+            node.create_subscription(String, COSTMAP_TOPIC, self._on_costmap, 10)
         node.create_subscription(String, COMMAND_TOPIC, self._on_command, 10)
 
     # ------------------------------------------------------------------ input
@@ -143,6 +147,8 @@ class AgentLink:
             self._agent_episode_id = episode_id
         self.state = payload
         self.state_at = self.now()
+        if getattr(self, 'observed_only', False):
+            self.episode_finished = payload.get('finished') is True
 
     def _on_status(self, message: String) -> None:
         """Every subgoal report arrives here: the agent's side of the wire.

@@ -67,6 +67,10 @@ class Navigator(Node):
         )
         self.declare_parameter('base_x', BASE_X)
         self.declare_parameter('base_y', BASE_Y)
+        self.declare_parameter('navigation_backend', 'custom')
+        self.navigation_backend = self.get_parameter('navigation_backend').value
+        if self.navigation_backend not in ('custom', 'nav2'):
+            raise ValueError('navigation_backend must be custom or nav2')
         self.base_x = float(self.get_parameter('base_x').value)
         self.base_y = float(self.get_parameter('base_y').value)
         self.costmap = CostMap()
@@ -81,11 +85,17 @@ class Navigator(Node):
             self._on_scan,
             qos_profile_sensor_data,
         )
+        # Imported here so pure navigation modules remain usable without ROS
+        # Nav2 packages on a prepared host.
+        from did_agent.nav2_adapter import Nav2Adapter
+        self._nav2 = Nav2Adapter(self)
 
     def _on_world_pose(self, message: PoseStamped) -> bool:
         if not world_pose_fresh(message, self.now()):
             return False
         self.world_pose = message
+        if getattr(self, '_nav2', None) is not None:
+            self._nav2.on_pose(message)
         return True
 
     def clear_world_pose(self) -> None:
@@ -102,13 +112,21 @@ class Navigator(Node):
             stamp=message.header.stamp.sec + message.header.stamp.nanosec * 1e-9,
             x_offset=LIDAR_X_OFFSET,
         )
+        if getattr(self, '_nav2', None) is not None:
+            self._nav2.on_scan(message)
 
     def now(self) -> float:
         """Return simulation time in seconds."""
         return self.get_clock().now().nanoseconds * 1e-9
 
     def pose(self) -> Pose | None:
-        """Return Burger's physical Gazebo pose in world coordinates."""
+        """Return the last known physical pose for read-only calculations."""
+        if self.world_pose is None:
+            return None
+        return pose_from_world_message(self.world_pose)
+
+    def fresh_pose(self) -> Pose | None:
+        """Return a physical pose only while it is fresh enough for motion."""
         if not world_pose_fresh(self.world_pose, self.now()):
             return None
         return pose_from_world_message(self.world_pose)
@@ -123,7 +141,20 @@ class Navigator(Node):
 
     def stop(self) -> None:
         """Command zero velocity."""
+        if getattr(self, '_nav2', None) is not None:
+            self._nav2.cancel()
         self.publish(Command())
+
+    def navigation_state(self) -> dict[str, object]:
+        """Common dashboard contract for the selected navigation implementation."""
+        if self.navigation_backend == 'nav2':
+            state = self._nav2.snapshot()
+        else:
+            state = {'status': self.core.status, 'replans': self.core.replans,
+                     'waypoints': self.core.waypoints[:80] if self.core.status == 'running' else [],
+                     'ready': self.ready(), 'reason': self.core.reason}
+        state.update(backend=self.navigation_backend, available_backends=['custom', 'nav2'])
+        return state
 
     def preempted(self) -> bool:
         """Return True when the current drive must be abandoned (override)."""
@@ -150,10 +181,14 @@ class Navigator(Node):
         guard=None,
     ) -> dict[str, object]:
         """Drive to a world point; block until done, failed or timed out."""
+        if getattr(self, 'navigation_backend', 'custom') == 'nav2':
+            return self._nav2.goto(x, y, timeout, guard)
+        if not self.ready():
+            self.stop()
         if not self.wait_for_sensors():
             self.stop()
             return {'status': FAILED, 'reason': 'no physical world pose or scan'}
-        pose = self.pose()
+        pose = self.fresh_pose()
         if pose is None:
             self.stop()
             return {'status': FAILED, 'reason': 'physical world pose unavailable'}
@@ -170,7 +205,7 @@ class Navigator(Node):
                 self.core.cancel()
                 self.stop()
                 return {**self._result(pose), 'status': FAILED, 'reason': 'preempted'}
-            current_pose = self.pose()
+            current_pose = self.fresh_pose()
             if current_pose is None:
                 self.core.cancel()
                 self.stop()
@@ -206,25 +241,10 @@ class Navigator(Node):
 
 
 def main(args=None) -> None:
-    """Drive the robot to a world point: ``ros2 run did_agent goto --x 1 --y 0``."""
-    parser = argparse.ArgumentParser(description='Drive the robot to a world point.')
-    parser.add_argument('--x', type=float, required=True)
-    parser.add_argument('--y', type=float, required=True)
-    parser.add_argument('--timeout', type=float, default=180.0)
-    options = parser.parse_args(remove_ros_args(args if args is not None else sys.argv)[1:])
+    """Send goto through the agent, preserving its selected navigation backend."""
+    from did_agent.navigation_cli import main as client_main
 
-    rclpy.init(args=args)
-    node = Navigator('goto')
-    exit_code = 1
-    try:
-        result = node.goto(options.x, options.y, options.timeout)
-        print(json.dumps(result, sort_keys=True))
-        exit_code = 0 if result['status'] == DONE else 1
-    finally:
-        node.stop()
-        node.destroy_node()
-        rclpy.shutdown()
-    raise SystemExit(exit_code)
+    client_main(args)
 
 
 if __name__ == '__main__':

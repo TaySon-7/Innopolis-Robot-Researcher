@@ -323,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
                         help='Also run the autonomous agent on the same scenarios.')
     parser.add_argument('--max-plans', type=int, default=12)
     parser.add_argument('--base-url', default='https://api-ai.mai.ru/v1')
-    parser.add_argument('--model', default='DeepSeek-V4-Flash')
+    parser.add_argument('--model', default='deepseek-v4.1-flash')
     args = parser.parse_args(argv)
 
     client = LLMClient(LLMConfig(base_url=args.base_url,

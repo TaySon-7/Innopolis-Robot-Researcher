@@ -52,6 +52,30 @@ def test_navigation_rejects_a_stale_or_implausibly_future_world_pose():
     assert not world_pose_fresh(message, 9.899)
 
 
+def test_stale_pose_remains_readable_but_cannot_drive_navigation():
+    message = PoseStamped()
+    message.header.stamp.sec = 10
+    message.pose.position.x = 0.75
+    message.pose.position.y = -1.25
+    message.pose.orientation.w = 1.0
+    inputs = SimpleNamespace(world_pose=message, now=lambda: 11.0)
+
+    pose = Navigator.pose(inputs)
+
+    assert (pose.x, pose.y) == pytest.approx((0.75, -1.25))
+    assert Navigator.fresh_pose(inputs) is None
+
+
+def test_stale_world_pose_callback_is_rejected_before_agent_adaptation():
+    previous = PoseStamped()
+    inputs = SimpleNamespace(world_pose=previous, now=lambda: 11.0, _nav2=None)
+    stale = PoseStamped()
+    stale.header.stamp.sec = 10
+
+    assert Navigator._on_world_pose(inputs, stale) is False
+    assert inputs.world_pose is previous
+
+
 def test_navigation_callback_does_not_store_an_invalid_world_pose():
     stale = PoseStamped()
     stale.header.stamp.sec = 10

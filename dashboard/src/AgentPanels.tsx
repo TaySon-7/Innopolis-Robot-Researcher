@@ -10,9 +10,11 @@ import { useMemo, useState } from 'react'
 import { describeSubgoal, parsePlan } from './agentApi'
 import type {
   AgentConnection,
+  AgentControlMode,
   AgentJournalEntry,
   AgentSnapshot,
   JudgeEvent,
+  NavigationBackend,
 } from './agentApi'
 
 interface AgentPanelProps {
@@ -21,9 +23,11 @@ interface AgentPanelProps {
   error: string | null
   busy: boolean
   onAuto: () => void
+  onLLM: () => void
   onStop: () => void
   onCollect: () => void
   onHome: () => void
+  onNavigationBackend: (backend: NavigationBackend) => void
 }
 
 const RUN_LABEL: Record<string, string> = {
@@ -34,22 +38,39 @@ const RUN_LABEL: Record<string, string> = {
   preempted: 'Остановлен',
 }
 
+const CONTROL_LABEL: Record<AgentControlMode, string> = {
+  llm: 'LLM-планировщик',
+  fallback: 'Резервный алгоритм',
+  autonomous: 'Автономная политика',
+  manual: 'Ручное управление',
+  stopped: 'Остановлен',
+}
+
 export function AgentPanel({
   snapshot,
   connection,
   error,
   busy,
   onAuto,
+  onLLM,
   onStop,
   onCollect,
   onHome,
+  onNavigationBackend,
 }: AgentPanelProps) {
   const state = snapshot.state
   const status = snapshot.status
-  // The agent's own policy reports plan_id "auto". The button is a toggle, so
-  // it has to say which way it will move.
-  const autonomous = state?.current?.plan_id === 'auto'
+  const autonomous = state.control_mode === 'autonomous'
+    || (!state.control_mode && state.current?.plan_id === 'auto')
+  const controlLabel = state.finished ? 'Эпизод завершён'
+    : state.control_mode ? CONTROL_LABEL[state.control_mode]
+      : autonomous ? CONTROL_LABEL.autonomous : 'Режим не сообщён'
   const navigation = state.navigation ?? {}
+  const navigationReady = connection === 'connected' && navigation.ready === true
+  const navigationMessage = connection !== 'connected'
+    ? 'Agent API недоступен — состояние навигации не подтверждено'
+    : navigation.reason || (navigation.ready === true ? 'Готова к движению'
+      : navigation.ready === false ? 'Навигация не готова' : 'Ожидание состояния навигации')
   const runState = status.state ?? 'idle'
   const anomalies = [
     ['battery_deviation', 'Расход вне прогноза'],
@@ -72,6 +93,7 @@ export function AgentPanel({
         <div className="agent-now">
           <BrainCircuit size={18} />
           <div>
+            <strong>Управление: {controlLabel}</strong>
             <strong>{status.subgoal || state.current?.type || 'Ожидает команду'}</strong>
             <span>
               {error ?? status.reason ?? (
@@ -81,6 +103,28 @@ export function AgentPanel({
               )}
             </span>
           </div>
+        </div>
+
+        <div className="agent-navigation">
+          <label htmlFor="navigation-backend">Навигация</label>
+          <select
+            id="navigation-backend"
+            value={navigation.backend ?? ''}
+            disabled={busy || connection !== 'connected' || !navigation.available_backends?.length}
+            aria-describedby="navigation-status navigation-switch-hint"
+            onChange={(event) => {
+              const backend = event.target.value
+              if (backend === 'custom' || backend === 'nav2') onNavigationBackend(backend)
+            }}
+          >
+            {!navigation.backend && <option value="" disabled>Ожидание данных</option>}
+            <option value="custom" disabled={!navigation.available_backends?.includes('custom')}>Наша (A*)</option>
+            <option value="nav2" disabled={!navigation.available_backends?.includes('nav2')}>Nav2</option>
+          </select>
+          <span id="navigation-status" role="status" className={navigationReady ? 'is-ready' : 'is-warning'}>
+            {navigationMessage}
+          </span>
+          <small id="navigation-switch-hint">Смена навигации останавливает текущий план. Сценарий сохраняется.</small>
         </div>
 
         <div className="agent-metrics">
@@ -101,13 +145,19 @@ export function AgentPanel({
           <button
             className="agent-primary"
             disabled={busy || connection !== 'connected'}
-            onClick={onAuto}
+            onClick={autonomous ? onLLM : onAuto}
             title={autonomous
               ? 'Вернуть управление LLM-планировщику'
               : 'Передать управление автономной политике агента'}
           >
             <Play size={15} />{autonomous ? 'Вернуть LLM' : 'Автономно'}
           </button>
+          {!autonomous && state.control_mode !== 'llm' && (
+            <button disabled={busy || connection !== 'connected'} onClick={onLLM}
+              title="Передать управление LLM-планировщику">
+              <BrainCircuit size={15} />LLM
+            </button>
+          )}
           <button className="agent-stop" disabled={busy || connection !== 'connected'} onClick={onStop}>
             <Square size={14} />Стоп
           </button>
@@ -168,10 +218,13 @@ interface AgentPlanProps {
   raw: string
   /** The plan the executor says it is actually running right now. */
   runningPlanId: string
+  controlMode?: AgentControlMode
+  runState?: string
+  finished?: boolean
 }
 
 /**
- * The plan the LLM last published, as it is on the wire.
+ * The last published plan, as it is on the wire.
  *
  * Shown verbatim on purpose. During a demo the interesting part is not that a
  * plan exists but which subgoals it names and why, and that reasoning is the
@@ -183,19 +236,27 @@ interface AgentPlanProps {
  * something else entirely. Without the check the screen claims the model is
  * driving when it is not.
  */
-export function AgentPlanPanel({ raw, runningPlanId }: AgentPlanProps) {
+export function AgentPlanPanel({ raw, runningPlanId, controlMode, runState, finished }: AgentPlanProps) {
   const plan = useMemo(() => parsePlan(raw), [raw])
   const [open, setOpen] = useState(true)
 
-  const autonomous = runningPlanId === 'auto'
-  const stale = !autonomous && !!plan && !!runningPlanId
-    && runningPlanId !== plan.plan_id
+  const active = !!plan && !!runningPlanId && runningPlanId === plan.plan_id
+    && runState === 'running' && !finished && controlMode !== 'stopped'
+    && controlMode !== 'autonomous'
+  const source = plan?.source ?? 'unknown'
+  const sourceLabel: Record<string, string> = {
+    llm: 'LLM', fallback: 'резервный алгоритм', budget: 'контроль запаса энергии',
+    manual: 'ручная команда', signal: 'алгоритм по сигналу',
+    auto_collect: 'автоматический сбор', unknown: 'не указан',
+  }
+  const decision = plan?.decision
+  const formatEnergy = (value: number | null | undefined) => value == null ? '—' : value.toFixed(1)
 
   return (
     <section className="panel plan-panel">
       <div className="panel-header">
         <div>
-          <span className="eyebrow">ПЛАН LLM</span>
+          <span className="eyebrow">ПЛАН ДЕЙСТВИЙ</span>
           <h2>{plan?.plan_id ?? 'плана нет'}</h2>
         </div>
         <button
@@ -208,27 +269,33 @@ export function AgentPlanPanel({ raw, runningPlanId }: AgentPlanProps) {
         </button>
       </div>
 
-      {autonomous && (
-        <p className="plan-stale is-live">
-          Исполняет автономный режим — LLM сейчас не управляет. План ниже
-          последний, что он опубликовал.
-        </p>
-      )}
-      {stale && (
-        <p className="plan-stale">
-          Устарело: исполнитель выполняет {runningPlanId}.
+      {plan && (
+        <p className={`plan-stale${active ? ' is-live' : ''}`}>
+          {active ? 'Выполняется' : 'Последний опубликованный план'}.
+          {' '}Источник: {sourceLabel[source] ?? source}.
+          {controlMode && <> Управление: {CONTROL_LABEL[controlMode]}.</>}
         </p>
       )}
 
       {!plan && (
         <p className="plan-empty">
-          Исполнитель работает по своей политике. Планировщик либо не запущен,
-          либо ещё не опубликовал план.
+          План ещё не опубликован.
+          {controlMode && <> Управление: {CONTROL_LABEL[controlMode]}.</>}
         </p>
       )}
 
       {plan && open && (
         <>
+          {plan.goal_selection && (
+            <p className="plan-why">Цель: {plan.goal_selection.goal_id}.
+              {decision && <> Требуется по оценке: {formatEnergy(decision.required_battery)},
+                {' '}батарея при выборе: {formatEnergy(decision.battery)}.
+                {' '}Движение: {formatEnergy(decision.energy_to_goal)},
+                {' '}поиск: {formatEnergy(decision.energy_search)},
+                {' '}возврат: {formatEnergy(decision.energy_home)}.
+                {' '}Итог включает запас; это оценка, а не гарантия возврата.</>}
+            </p>
+          )}
           <ol className="plan-subgoals">
             {plan.subgoals?.map((subgoal, index) => (
               <li key={index}>

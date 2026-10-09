@@ -12,6 +12,14 @@ from did_agent.robot import Robot
 from did_agent.search import SampleSearch
 
 
+ENERGY_RISK_FLAGS = ('battery_deviation', 'penalties_burst')
+
+
+def energy_risk(flags: dict[str, bool]) -> bool:
+    """Whether observations make the return-energy forecast less trustworthy."""
+    return any(flags.get(name, False) for name in ENERGY_RISK_FLAGS)
+
+
 @dataclass
 class SkillResult:
     """Outcome of a skill: success flag, reason for the planner, extra data."""
@@ -37,10 +45,16 @@ class Skills:
         self.return_factor = return_factor
         self.pessimism = pessimism
 
-    def goto(self, x: float, y: float, guarded: bool = False) -> SkillResult:
-        """Drive to a point. When guarded, give up as soon as the way home is no longer covered."""
+    def goto(
+        self,
+        x: float,
+        y: float,
+        guarded: bool = False,
+        stop_on_signal: bool = False,
+    ) -> SkillResult:
+        """Drive to a point, optionally yielding to battery or sample evidence."""
         guard = (lambda: not self.battery_allows_more()) if guarded else None
-        result = self.robot.goto(x, y, guard=guard)
+        result = self.robot.goto(x, y, guard=guard, stop_on_signal=stop_on_signal)
         data = {'distance_to_goal': result.distance_to_goal, 'replans': result.replans}
         if result.ok:
             return SkillResult(True, data=data)
@@ -63,7 +77,10 @@ class Skills:
         the forecast is less trustworthy, so the margin grows and we head home earlier.
         """
         factor, reserve = self.return_factor, self.reserve
-        if any(self.robot.anomaly().values()):
+        # Sensor noise changes how many readings search takes, not the energy
+        # per metre.  Treating it as an energy anomaly sent hard missions home
+        # early even when the return-cost model remained accurate.
+        if energy_risk(self.robot.anomaly()):
             factor, reserve = factor * 1.15, reserve + 2.0
         return self.robot.battery() > self.return_cost_estimate() * factor + reserve
 

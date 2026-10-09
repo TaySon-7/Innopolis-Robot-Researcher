@@ -37,7 +37,7 @@ test('interpolates yaw through the pi boundary instead of rotating backwards', (
   close(Math.abs(pose.yaw), Math.PI)
 })
 
-test('waits for odometry newer than the scan', () => {
+test('waits for a world pose newer than the scan', () => {
   assert.equal(interpolateTimedPose([
     { stamp: 3, x: 0, y: 0, yaw: 0 },
   ], 3.1), null)
@@ -50,7 +50,7 @@ test('does not project a scan from an earlier simulation epoch', () => {
   ], 0.2), null)
 })
 
-test('drops stale odometry when simulation time resets', () => {
+test('drops stale world poses when simulation time resets', () => {
   assert.equal(rosClockReset(100, 0.2), true)
   const history = appendTimedPose([
     { stamp: 100, x: 2, y: 2, yaw: 1 },

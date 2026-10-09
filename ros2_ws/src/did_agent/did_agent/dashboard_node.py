@@ -57,6 +57,7 @@ class DashboardNode(Node):
         )
         self._plan_pub = self.create_publisher(String, '/agent/plan', 10)
         self._command_pub = self.create_publisher(String, '/agent/command', 10)
+        self._navigation_pub = self.create_publisher(String, '/agent/navigation_backend', 10)
         self._scenario_pub = self.create_publisher(String, '/did/scenario/select', 10)
         self._delete_entity = self.create_client(
             DeleteEntity,
@@ -73,6 +74,7 @@ class DashboardNode(Node):
         self.server = DashboardServer(
             self.data, geometry, self._send_plan, self._send_command,
             self._send_scenario, self._preview_scenario,
+            set_navigation_backend=self._set_navigation_backend,
             port=int(self.get_parameter('port').value),
             log=self.get_logger().info,
         )
@@ -143,6 +145,9 @@ class DashboardNode(Node):
 
     def _send_command(self, command: str) -> None:
         self._command_pub.publish(String(data=json.dumps({'cmd': command})))
+
+    def _set_navigation_backend(self, backend: str) -> None:
+        self._navigation_pub.publish(String(data=backend))
 
     def _load_named_scenario(self, name: str):
         """Load once so the preview and launched episode share the exact object."""

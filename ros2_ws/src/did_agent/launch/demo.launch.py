@@ -5,6 +5,7 @@ Arguments:
                  a new scenario on the fly (default easy)
   scenario_file  absolute path to a custom scenario YAML (overrides scenario);
                  'none' or empty means: use `scenario`
+  navigation     custom | nav2; both backends can be selected at runtime
 """
 
 import os
@@ -60,9 +61,19 @@ def generate_launch_description():
         DeclareLaunchArgument('scenario', default_value='easy'),
         DeclareLaunchArgument('scenario_file', default_value=''),
         DeclareLaunchArgument(
+            'navigation', default_value='custom', choices=['custom', 'nav2'],
+            description='Initial low-level navigation backend.'),
+        DeclareLaunchArgument(
             'llm', default_value='true',
             description='Start the LLM planner alongside the agent.'),
         OpaqueFunction(function=_simulation),
+        # Nav2 stays available even when custom navigation is selected. It
+        # publishes only private commands; the agent owns the /cmd_vel gate.
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(os.path.join(
+                get_package_share_directory('did_agent'),
+                'launch', 'nav2.launch.py')),
+        ),
         Node(
             package='ros_gz_bridge',
             executable='parameter_bridge',
@@ -73,7 +84,10 @@ def generate_launch_description():
                 '/world/default/create/blocking@ros_gz_interfaces/srv/SpawnEntity',
             ],
         ),
-        Node(package='did_agent', executable='agent', name='agent', output='screen'),
+        Node(
+            package='did_agent', executable='agent', name='agent', output='screen',
+            parameters=[{'navigation_backend': LaunchConfiguration('navigation')}],
+        ),
         Node(package='did_agent', executable='dashboard', name='dashboard', output='screen'),
         Node(
             package='rosbridge_server',

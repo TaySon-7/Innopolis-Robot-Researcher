@@ -21,6 +21,8 @@ from did_agent.costmap import CostMap
 from did_agent.dashboard_core import costmap_layers
 from did_agent.dashboard_core import valid_scenario_name
 from did_agent.executor import PlanExecutor
+from did_agent.experimental_goals import BudgetPolicy, GoalValidationError, Observation
+from did_agent.goal_offers import GoalOffers
 from did_agent.adaptation import Adaptation
 from did_agent.nav_node import Navigator
 from did_agent.navigator_core import NavigatorCore
@@ -28,10 +30,12 @@ from did_agent.plan import Plan
 from did_agent.plan import PlanError
 from did_agent.plan import parse_plan
 from did_agent.planner import plan_waypoints
-from did_agent.robot import NavResult
+from did_agent.robot import BASE, NavResult
 from did_agent.robot import Reading
+from did_agent.robot import sample_signal_near
 from did_agent.search import SAMPLE_SENSOR_RANGE
 from did_agent.skills import Skills
+from did_agent.skills import energy_risk
 
 INITIAL_BATTERY = 60.0
 MAX_JOURNAL_READINGS = 12
@@ -47,11 +51,17 @@ class AgentNode(Navigator):
         self._sensor_count = 0
         self._score: dict[str, Any] = {}
         self._pending: Plan | None = None
+        self._pending_selection: dict[str, Any] | None = None
+        self._pending_guarded = False
+        self._executing = False
+        self._control_mode = 'llm'
+        self._decision_source = ''
         self._preempt = False
         self._current: dict[str, Any] = {}
         self.cost_log: list[dict[str, Any]] = []
         self._command: str | None = None
         self._scenario_reset: str | None = None
+        self._navigation_switch: str | None = None
         # Monotonic within this node's lifetime. The LLM uses it to distinguish
         # a fresh run from another state update, including a restart of the
         # same scenario while Gazebo's global clock keeps advancing.
@@ -65,6 +75,7 @@ class AgentNode(Navigator):
         self.monitor = self.adaptation.monitor
         self.skills = Skills(self)
         self.plan_executor = PlanExecutor(self.skills, self._publish_status)
+        self.goal_offers = GoalOffers(self.costmap, BASE, self._budget_policy())
 
         self._status_pub = self.create_publisher(String, '/agent/status', 10)
         self._state_pub = self.create_publisher(String, '/agent/state', 10)
@@ -78,6 +89,7 @@ class AgentNode(Navigator):
         self.create_subscription(String, '/agent/plan', self._on_plan, 10)
         self.create_subscription(String, '/agent/cost_update', self._on_cost_update, 10)
         self.create_subscription(String, '/agent/command', self._on_command, 10)
+        self.create_subscription(String, '/agent/navigation_backend', self._on_navigation_backend, 10)
         self.create_subscription(String, '/did/scenario/select', self._on_scenario_select, 10)
         self._collect = self.create_client(Trigger, '/did/collect')
         self._finish = self.create_client(Trigger, '/did/finish')
@@ -118,11 +130,31 @@ class AgentNode(Navigator):
 
     def _on_plan(self, message: String) -> None:
         try:
+            envelope = json.loads(message.data)
+        except (TypeError, ValueError):
+            envelope = None
+        if isinstance(envelope, dict) and 'goal_selection' in envelope:
+            if self._control_mode not in ('llm', 'fallback'):
+                self._reject_selection(envelope, 'LLM control is disabled; resume with command llm')
+            elif self._executing or self._pending is not None or self._pending_selection is not None:
+                self._reject_selection(envelope, 'plan already active; wait for whole-plan completion')
+            elif self._score.get('finished') or self._scenario_reset is not None:
+                self._reject_selection(envelope, 'episode is finished or resetting')
+            else:
+                # Route computation belongs to the idle main loop, not this ROS
+                # callback. A late selection can never preempt local searching.
+                self._pending_selection = envelope
+            return
+        if isinstance(envelope, dict) and envelope.get('source') in ('llm', 'fallback', 'budget'):
+            self._reject_selection(envelope, 'model plans require a backend goal_selection')
+            return
+        try:
             plan = parse_plan(message.data)
         except PlanError as error:
             self.get_logger().warning(f'rejected plan: {error}')
             self._publish_status({
-                'plan_id': '', 'index': 0, 'type': '', 'subgoal': '',
+                'plan_id': str(envelope.get('plan_id', '')) if isinstance(envelope, dict) else '',
+                'index': 0, 'type': '', 'subgoal': '',
                 'state': 'failed', 'reason': f'invalid plan: {error}', 'data': {},
             })
             return
@@ -130,25 +162,57 @@ class AgentNode(Navigator):
             f'plan {plan.plan_id}: {[s.describe() for s in plan.subgoals]}'
         )
         self._pending = plan
+        self._pending_guarded = False
+        self._pending_selection = None
+        self.goal_offers.invalidate(interrupt=True)
+        self._control_mode = 'manual'
+        self._decision_source = 'manual'
         self._command = None
         self._preempt = True
+        self.core.cancel()
+        self.stop()
+
+    def _reject_selection(self, envelope: dict[str, Any], reason: str) -> None:
+        """Return a failed request without corrupting the active plan status."""
+        selection = envelope.get('goal_selection')
+        offer = self.goal_offers.offer
+        if (not self.goal_offers.active and offer is not None
+                and isinstance(selection, dict)
+                and selection.get('snapshot_id') == offer['snapshot_id']):
+            # The model attempts each token once. Give a rejected idle request
+            # a new offer, while preserving an unrelated running plan.
+            self.goal_offers.invalidate()
+        status = {
+            'plan_id': str(envelope.get('plan_id', '')), 'index': 0,
+            'type': '', 'subgoal': '', 'state': 'failed', 'reason': reason,
+            'plan_complete': True, 'subgoal_count': 0, 'data': {'accepted': False},
+        }
+        self.get_logger().warning(f'rejected selection {status["plan_id"]}: {reason}')
+        self._status_pub.publish(String(data=json.dumps(status)))
 
     def _on_command(self, message: String) -> None:
         try:
             command = json.loads(message.data).get('cmd')
         except (ValueError, AttributeError):
             command = None
-        if command not in ('auto', 'stop'):
+        if command not in ('auto', 'stop', 'llm'):
             self.get_logger().warning(f'unknown command {message.data!r}')
             return
         self.get_logger().info(f'command: {command}')
         self._preempt = True  # interrupt whatever is running
         self._pending = None
+        self._pending_selection = None
+        self._pending_guarded = False
+        self.goal_offers.invalidate(interrupt=True)
+        self._control_mode = {'auto': 'autonomous', 'stop': 'stopped', 'llm': 'llm'}[command]
+        self._decision_source = ''
         self._command = command if command == 'auto' else None
+        self.core.cancel()
+        self.stop()
         if command == 'stop':
-            self.core.cancel()
-            self.stop()
             self.journal('decision', 'Остановка по команде оператора')
+        elif command == 'llm':
+            self.journal('decision', 'Включён LLM-планировщик с проверкой бюджета')
 
     def _on_scenario_select(self, message: String) -> None:
         """Preempt the current episode; its learned state is reset in the main loop."""
@@ -166,9 +230,38 @@ class AgentNode(Navigator):
         self._scenario_reset = name
         self._preempt = True
         self._pending = None
+        self._pending_selection = None
+        self.goal_offers.invalidate(interrupt=True)
         self._command = None
         self.core.cancel()
         self.stop()
+
+    def _on_navigation_backend(self, message: String) -> None:
+        backend = message.data
+        if backend not in ('custom', 'nav2'):
+            self.get_logger().warning('navigation backend must be custom or nav2')
+            return
+        if backend == self.navigation_backend and self._navigation_switch is None:
+            return
+        # The running skill first unwinds through its ordinary preemption
+        # path. Only the idle main loop confirms a new backend to the UI.
+        self._on_command(String(data='{"cmd":"stop"}'))
+        self._navigation_switch = backend
+
+    def _apply_navigation_backend(self) -> None:
+        backend, self._navigation_switch = self._navigation_switch, None
+        if backend is None:
+            return
+        self.stop()
+        self.navigation_backend = backend
+        self.core.cancel()
+        self._preempt = False
+        # The request already stopped the previous owner. A later manual plan
+        # or explicit auto/LLM command may have arrived while it unwound; keep
+        # that new owner's mode rather than execute it while reporting stopped.
+        self.journal('decision', 'Навигация переключена',
+                     'Nav2' if backend == 'nav2' else 'Наша навигация (A*)')
+        self._publish_state()
 
     def _reset_for_scenario(self, name: str) -> None:
         """Forget knowledge from the previous episode after execution has stopped."""
@@ -178,6 +271,8 @@ class AgentNode(Navigator):
         self._episode_id += 1
         self.costmap = CostMap()
         self.core = NavigatorCore(self.costmap)
+        if getattr(self, '_nav2', None) is not None:
+            self._nav2.reset()
         self.cost_log.clear()
         self._battery = INITIAL_BATTERY
         self._sensor = 0.0
@@ -185,6 +280,11 @@ class AgentNode(Navigator):
         self._score = {}
         self._current = {}
         self._pending = None
+        self._pending_selection = None
+        self._pending_guarded = False
+        self._executing = False
+        self._control_mode = 'llm'
+        self._decision_source = ''
         self._command = None
         self._preempt = False
         self._scenario_reset = None
@@ -196,6 +296,7 @@ class AgentNode(Navigator):
         self.monitor = self.adaptation.monitor
         self.skills = Skills(self)
         self.plan_executor = PlanExecutor(self.skills, self._publish_status)
+        self.goal_offers = GoalOffers(self.costmap, BASE, self._budget_policy())
         self._publish_status({
             'plan_id': '', 'index': 0, 'type': '', 'subgoal': '',
             'state': 'idle', 'reason': f'scenario {name} selected', 'data': {},
@@ -232,11 +333,28 @@ class AgentNode(Navigator):
         y: float,
         timeout: float = 180.0,
         guard=None,
+        stop_on_signal: bool = False,
     ) -> NavResult:
-        result = super().goto(x, y, timeout, guard)
+        signal_interrupted = False
+
+        def combined_guard() -> bool:
+            nonlocal signal_interrupted
+            if guard is not None and guard():
+                return True
+            signal_interrupted = stop_on_signal and sample_signal_near(
+                self._sensor, self.monitor.noise_estimate)
+            return signal_interrupted
+
+        result = super().goto(
+            x, y, timeout,
+            combined_guard if guard is not None or stop_on_signal else None,
+        )
+        reason = str(result.get('reason', ''))
+        if signal_interrupted and reason == 'battery reserve reached':
+            reason = 'sample signal nearby'
         return NavResult(
             str(result.get('status', 'failed')),
-            str(result.get('reason', '')),
+            reason,
             float(result.get('distance_to_goal', 0.0)),
             int(result.get('replans', 0)),
         )
@@ -273,7 +391,10 @@ class AgentNode(Navigator):
         return ok, message
 
     def finish(self) -> tuple[bool, str]:
-        return self._call(self._finish)
+        ok, message = self._call(self._finish)
+        if ok:
+            self._score['finished'] = True
+        return ok, message
 
     def noise_level(self) -> float:
         return self.adaptation.noise_level()
@@ -289,6 +410,50 @@ class AgentNode(Navigator):
 
     def collected(self) -> int:
         return int(self._score.get('collected', 0))
+
+    def _budget_policy(self) -> BudgetPolicy:
+        factor, reserve = self.skills.return_factor, self.skills.reserve
+        if energy_risk(self.anomaly()):
+            factor, reserve = factor * 1.15, reserve + 2.0
+        return BudgetPolicy(return_factor=factor, reserve=reserve,
+                            pessimism=self.skills.pessimism)
+
+    def _goal_observation(self) -> Observation:
+        pose = self.pose()
+        return Observation(str(self._episode_id), 0, (pose.x, pose.y),
+                           max(0.0, self._battery), time=self.now(),
+                           collected=self.collected(), samples_total=self.samples_total())
+
+    def _prepare_offer(self) -> None:
+        if (self._control_mode != 'llm' or self._executing or self._pending is not None
+                or not self.ready() or self._score.get('finished')):
+            return
+        try:
+            self.goal_offers.policy = self._budget_policy()
+            self.goal_offers.build(self._goal_observation(), sensor=self._sensor,
+                                   noise=self.monitor.noise_estimate)
+        except (GoalValidationError, ValueError) as error:
+            self.get_logger().warning(f'cannot prepare goal offer: {error}')
+
+    def _accept_selection(self) -> None:
+        envelope, self._pending_selection = self._pending_selection, None
+        if envelope is None:
+            return
+        try:
+            if self._control_mode != 'llm' or not self.ready() or self._score.get('finished'):
+                raise GoalValidationError('agent is not ready for an LLM selection')
+            self.goal_offers.policy = self._budget_policy()
+            compiled = self.goal_offers.accept(envelope, self._goal_observation())
+            self._pending = parse_plan(json.dumps(compiled))
+        except (GoalValidationError, PlanError, ValueError) as error:
+            self._reject_selection(envelope, str(error))
+            return
+        self._pending_guarded = True
+        self._preempt = False
+        self._decision_source = compiled['source']
+        self._control_mode = 'fallback' if compiled['source'] == 'fallback' else 'llm'
+        self.journal('decision', 'Выбрана цель с проверкой бюджета',
+                     f'{compiled["source"]}: {compiled["goal_selection"]["goal_id"]}')
 
     # --- publishing -------------------------------------------------------------------------
 
@@ -481,6 +646,10 @@ class AgentNode(Navigator):
             'collected': self.collected(),
             'samples_total': self.samples_total(),
             'score': self._score.get('score'),
+            'finished': bool(self._score.get('finished', False)),
+            'control_mode': self._control_mode,
+            'decision_source': self._decision_source,
+            'goal_offer': self.goal_offers.offer,
             'sensor': {
                 'value': round(self._sensor, 3),
                 'noise_estimate': round(self.monitor.noise_estimate, 4),
@@ -490,17 +659,14 @@ class AgentNode(Navigator):
                 'index': self._current.get('index', 0),
                 'type': self._current.get('type', ''),
                 'state': self._current.get('state', 'idle'),
+                'plan_complete': self._current.get('plan_complete', False),
+                'subgoal_count': self._current.get('subgoal_count', 0),
             },
             'recent_events': self.monitor.recent_events(),
             'return_cost_estimate': None if return_cost != return_cost else round(return_cost, 2),
             'anomaly': self.monitor.anomaly(t),
             'cost_map_updates': self.cost_log,
-            'navigation': {
-                'status': self.core.status,
-                'replans': self.core.replans,
-                'waypoints': [[round(x, 2), round(y, 2)] for x, y in self.core.waypoints[:40]]
-                if self.core.status == 'running' else [],
-            },
+            'navigation': self.navigation_state(),
         }
         self._state_pub.publish(String(data=json.dumps(state)))
         self._publish_costmap()
@@ -514,14 +680,33 @@ class AgentNode(Navigator):
             rclpy.spin_once(self, timeout_sec=0.1)
             if self._scenario_reset is not None:
                 self._reset_for_scenario(self._scenario_reset)
+            elif self._navigation_switch is not None:
+                self._apply_navigation_backend()
             elif self._command == 'auto':
                 self._command, self._preempt = None, False
-                self._run_auto_with_status()
+                self._executing = True
+                try:
+                    self._run_auto_with_status()
+                finally:
+                    self._executing = False
+            elif self._pending_selection is not None:
+                self._accept_selection()
             elif self._pending is not None:
                 plan, self._pending, self._preempt = self._pending, None, False
+                guarded, self._pending_guarded = self._pending_guarded, False
+                self._executing = True
                 if not self.ready():
                     self.wait_for_sensors()
-                self.plan_executor.run(plan)
+                try:
+                    final = self.plan_executor.run(plan, guarded=guarded)
+                    self.goal_offers.complete(final)
+                finally:
+                    self._executing = False
+                    self.stop()
+                    if self._control_mode == 'fallback':
+                        self._control_mode = 'llm'
+            else:
+                self._prepare_offer()
 
     def _run_auto_with_status(self) -> None:
         status = {'plan_id': 'auto', 'index': 0, 'type': 'auto',
@@ -544,7 +729,8 @@ class AgentNode(Navigator):
         # Publish the final status last: scenario reset waits on it as the
         # barrier proving that no old-run journal or finish call remains.
         self._publish_status({**status, 'state': state,
-                              'reason': summary.get('reason', ''), 'data': summary})
+                              'reason': summary.get('reason', ''), 'data': summary,
+                              'plan_complete': True, 'subgoal_count': 1})
 
     def run_autonomous(self) -> dict[str, Any]:
         """Run the fallback planner without an LLM and return its summary."""
@@ -635,9 +821,9 @@ def main_send_plan(args=None) -> None:
 
 
 def main_command(args=None) -> None:
-    """``ros2 run did_agent command auto|stop [--wait]``: send a command to the agent."""
+    """``ros2 run did_agent command auto|stop|llm [--wait]``: send an agent command."""
     parser = argparse.ArgumentParser(description='Send a command to /agent/command.')
-    parser.add_argument('cmd', choices=['auto', 'stop'])
+    parser.add_argument('cmd', choices=['auto', 'stop', 'llm'])
     parser.add_argument('--wait', action='store_true', help='wait for the autonomous run to end')
     parser.add_argument('--timeout', type=float, default=900.0)
     options = parser.parse_args(remove_ros_args(args if args is not None else sys.argv)[1:])

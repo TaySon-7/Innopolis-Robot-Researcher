@@ -1,28 +1,26 @@
 """Entry point: the LLM planner as a ROS node.
 
     ros2 run did_llm llm_planner
-    ros2 run did_llm llm_planner --ros-args -p mission:='собери образцы'
 
 The node publishes plans and nothing else. It never touches /cmd_vel, never
 publishes to a judge topic and never reads the judge's internals: its inputs
-are /agent/state and /agent/status, its outputs are /agent/plan and, only when
-the model is unreachable, /agent/command.
+are /agent/state, /agent/status and operator commands. It publishes a verified
+goal selection on /agent/plan and a source-labelled explanation to the journal.
 """
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
 
 from did_llm.agent_link import AgentLink
 from did_llm.journal import Journal, JournalConfig
-from did_llm.agent_plan import ARENA, load_geometry
 from did_llm.llm_client import LLMClient, LLMConfig, load_api_key
-from did_llm.planner_node import Planner, PlannerConfig
-
-DEFAULT_MISSION = 'Собрать образцы, избегать дорогих зон, вернуться на базу'
+from did_llm.math_planner import MathPlanner
 
 
 class LLMPlanner(Node):
@@ -31,42 +29,32 @@ class LLMPlanner(Node):
     def __init__(self) -> None:
         super().__init__('llm_planner')
 
-        self.declare_parameter('mission', DEFAULT_MISSION)
+        self.declare_parameter('planner_mode', 'math_goals')
+        self.declare_parameter('selection_policy', 'llm')
         self.declare_parameter('base_url', 'https://api-ai.mai.ru/v1')
-        self.declare_parameter('model', 'DeepSeek-V4-Flash')
+        self.declare_parameter('model', 'deepseek-v4.1-flash')
         self.declare_parameter('reasoning_effort', 'none')
         self.declare_parameter('max_calls_per_minute', 20)
         self.declare_parameter('max_calls_total', 400)
         self.declare_parameter('min_interval_sec', 4.0)
-        self.declare_parameter('timeout_sec', 180.0)
-        self.declare_parameter('replan_period_sec', 30.0)
-        self.declare_parameter('min_subgoals', 3)
-        self.declare_parameter('max_subgoals', 6)
-        self.declare_parameter('repair_attempts', 1)
-        self.declare_parameter('autonomous_fallback', True)
+        self.declare_parameter('timeout_sec', 30.0)
+        self.declare_parameter('max_retries', 0)
         self.declare_parameter('exchanges_path', 'logs/did_session.jsonl')
+        self.declare_parameter('metrics_path', '')
         self.declare_parameter('tick_period_sec', 1.0)
 
         def param(name, caster=None):
             value = self.get_parameter(name).value
             return caster(value) if caster else value
 
-        self.link = AgentLink(self)
+        mode = param('planner_mode')
+        if mode != 'math_goals':
+            raise ValueError('the live backend requires planner_mode=math_goals')
+        selection_policy = param('selection_policy')
+        if selection_policy not in ('llm', 'budget'):
+            raise ValueError('selection_policy must be llm or budget')
+        self.link = AgentLink(self, observed_only=True)
         self.link.log = self.get_logger()
-        # Adopt the arena the agent measured, so plans are validated against
-        # the geometry in the scene rather than against documented constants.
-        # The dashboard answers late: it starts with the planner and only
-        # settles once Gazebo has answered its own query, so the fetch is
-        # retried until it works rather than tried once and forgotten.
-        self.declare_parameter('agent_api_url', 'http://127.0.0.1:8080')
-        self._api_url = param('agent_api_url')
-        self._geometry_tries = 0
-        self._geometry_timer = None
-        if not self._refresh_geometry():
-            self.get_logger().info(
-                'геометрия арены: значения по описанию, /api/geometry '
-                'пока недоступен, будет повтор')
-            self._geometry_timer = self.create_timer(10.0, self._retry_geometry)
         self.journal = Journal(
             JournalConfig(exchanges_path=param('exchanges_path')),
             logger=self.get_logger(),
@@ -81,28 +69,28 @@ class LLMPlanner(Node):
                 max_calls_total=param('max_calls_total', int),
                 min_interval_sec=param('min_interval_sec', float),
                 timeout_sec=param('timeout_sec', float),
+                max_retries=param('max_retries', int),
             ),
             journal=self.journal,
             logger=self.get_logger(),
-        )
-        self.planner = Planner(
-            self.link,
-            self.client,
-            PlannerConfig(
-                mission=param('mission'),
-                min_subgoals=param('min_subgoals', int),
-                max_subgoals=param('max_subgoals', int),
-                replan_period_sec=param('replan_period_sec', float),
-                repair_attempts=param('repair_attempts', int),
-                autonomous_fallback=param('autonomous_fallback', bool),
-            ),
-        )
+        ) if selection_policy == 'llm' else None
+        self.planner = MathPlanner(self.link, self.client, selection_policy=selection_policy)
+        self._metrics_path = param('metrics_path')
 
         self.create_timer(param('tick_period_sec', float), self._tick)
-        self.get_logger().info(
-            f'LLM-планировщик готов: model={self.client.cfg.model}, '
-            f'key={"set" if self.client.cfg.configured else "missing"}'
-        )
+        if self._metrics_path:
+            self.write_metrics()
+            self.create_timer(5.0, self.write_metrics)
+        if self.client is None:
+            self.get_logger().info(
+                f'Планировщик готов: mode={mode}, selection_policy=budget, model=disabled'
+            )
+        else:
+            self.get_logger().info(
+                f'LLM-планировщик готов: mode={mode}, selection_policy=llm, '
+                f'model={self.client.cfg.model}, '
+                f'key={"set" if self.client.cfg.configured else "missing"}'
+            )
 
     def _tick(self) -> None:
         try:
@@ -110,27 +98,19 @@ class LLMPlanner(Node):
         except Exception as error:  # noqa: BLE001 - the loop must not die
             self.get_logger().error(f'planning tick failed: {error}')
 
-    def _refresh_geometry(self) -> bool:
-        if load_geometry(self._api_url):
-            self.get_logger().info('геометрия арены взята из сцены Gazebo')
-            return True
-        return False
-
-    def _retry_geometry(self) -> None:
-        """Keep asking until the agent's geometry shows up, then stop.
-
-        After a few minutes the documented constants are as good as anything
-        available, and the fallback message has already been said.
-        """
-        self._geometry_tries += 1
-        if self._refresh_geometry() or self._geometry_tries >= 12:
-            if not ARENA.from_scene:
-                self.get_logger().info(
-                    'геометрия арены остаётся по описанию: /api/geometry '
-                    'не ответил, проверка использует константы')
-            if self._geometry_timer is not None:
-                self._geometry_timer.cancel()
-                self._geometry_timer = None
+    def write_metrics(self) -> None:
+        """Write counters atomically, including while operator control is stopped."""
+        if not self._metrics_path:
+            return
+        path = Path(self._metrics_path)
+        temporary = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps(self.planner.metrics(), allow_nan=False) + '\n',
+                                 encoding='utf-8')
+            temporary.replace(path)
+        except OSError:
+            self.get_logger().warning('Could not write planner metrics.')
 
 
 def main(args=None) -> None:
@@ -141,6 +121,7 @@ def main(args=None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        node.write_metrics()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

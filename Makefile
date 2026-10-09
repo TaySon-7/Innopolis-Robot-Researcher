@@ -137,3 +137,21 @@ test:
 # The same tests on a host with Python, numpy, pyyaml and pytest.
 test-fast:
 	cd ros2_ws/src && python3 -m pytest -q did_judge/test did_agent/test did_llm/test
+
+# Isolated experiment: rebuild current source, then no network/keys/ROS launch.
+.PHONY: planner-prototype test-planner-prototype planner-prototype-image
+planner-prototype-image:
+	docker compose build sim
+
+planner-prototype: planner-prototype-image
+	docker run --rm --network none \
+		--workdir /opt/did_ws/src --entrypoint /usr/bin/env did/robot-researcher:jazzy \
+		PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/did_ws/src/did_agent:/opt/did_ws/src/did_judge:/opt/did_ws/src/did_llm \
+		python3 -m did_llm.experimental_demo
+
+test-planner-prototype: planner-prototype-image
+	docker run --rm --network none \
+		--workdir /opt/did_ws/src --entrypoint /usr/bin/env did/robot-researcher:jazzy \
+		PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/did_ws/src/did_agent:/opt/did_ws/src/did_judge:/opt/did_ws/src/did_llm \
+		python3 -m pytest -q -p no:cacheprovider \
+		did_agent/test/test_experimental_goals.py did_llm/test/test_experimental_selector.py
