@@ -37,7 +37,7 @@ test('interpolates yaw through the pi boundary instead of rotating backwards', (
   close(Math.abs(pose.yaw), Math.PI)
 })
 
-test('waits for odometry newer than the scan', () => {
+test('waits for a world pose newer than the scan', () => {
   assert.equal(interpolateTimedPose([
     { stamp: 3, x: 0, y: 0, yaw: 0 },
   ], 3.1), null)
@@ -50,7 +50,7 @@ test('does not project a scan from an earlier simulation epoch', () => {
   ], 0.2), null)
 })
 
-test('drops stale odometry when simulation time resets', () => {
+test('drops stale world poses when simulation time resets', () => {
   assert.equal(rosClockReset(100, 0.2), true)
   const history = appendTimedPose([
     { stamp: 100, x: 2, y: 2, yaw: 1 },
@@ -67,17 +67,13 @@ test('projects the scan from the physical lidar frame in world coordinates', () 
   close(hit.y, 1.968)
 })
 
-test('uses Gazebo world pose when wheel odometry has drifted', () => {
-  const odometry = [
-    { stamp: 10, x: -2.1, y: -0.64, yaw: -0.58 },
-    { stamp: 11, x: -2.1, y: -0.64, yaw: -0.58 },
-  ]
+test('uses the normalized Gazebo world pose for lidar', () => {
   const world = [
     { stamp: 10, x: -1.58, y: -0.39, yaw: 1.08 },
     { stamp: 11, x: -1.57, y: -0.38, yaw: 1.10 },
   ]
 
-  const pose = synchronizedLidarPose(world, odometry, 10.5)
+  const pose = synchronizedLidarPose(world, 10.5)
 
   assert.ok(pose)
   close(pose.x, -1.575)
@@ -85,14 +81,11 @@ test('uses Gazebo world pose when wheel odometry has drifted', () => {
   close(pose.yaw, 1.09)
 })
 
-test('waits for a newer Gazebo pose instead of mixing coordinate frames', () => {
-  const odometry = [
-    { stamp: 10, x: -2, y: -0.5, yaw: 0 },
-    { stamp: 11, x: -1.8, y: -0.5, yaw: 0 },
-  ]
+test('waits for a newer Gazebo pose instead of using another coordinate frame', () => {
   const world = [{ stamp: 10, x: -1.5, y: -0.4, yaw: 1 }]
 
-  assert.equal(synchronizedLidarPose(world, odometry, 10.1), null)
+  assert.equal(synchronizedLidarPose(world, 10.1), null)
+  assert.equal(synchronizedLidarPose([], 10.1), null)
 })
 
 test('extracts planar yaw from the Gazebo model quaternion', () => {

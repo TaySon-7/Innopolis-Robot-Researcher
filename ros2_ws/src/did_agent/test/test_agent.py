@@ -4,13 +4,16 @@ from pathlib import Path
 import pytest
 
 from did_agent.autonomous import AutonomousAgent
+from did_agent.autonomous import local_search_radius
 from did_agent.bench import run_scenario
 from did_agent.executor import PlanExecutor
 from did_agent.plan import parse_plan
+from did_agent.robot import Reading
 from did_agent.search import COLLECTION_SIGNAL_THRESHOLD
 from did_agent.search import SampleSearch
 from did_agent.sim_robot import SimRobot
 from did_agent.skills import Skills
+from did_judge.scenario import ScenarioSample
 from did_judge.scenario import load_scenario
 
 SCENARIOS = Path(__file__).resolve().parents[2] / 'did_judge' / 'scenarios'
@@ -18,6 +21,13 @@ SCENARIOS = Path(__file__).resolve().parents[2] / 'did_judge' / 'scenarios'
 
 def robot_for(name='easy', **kwargs):
     return SimRobot(load_scenario(SCENARIOS / f'{name}.yaml'), **kwargs)
+
+
+def test_local_search_radius_covers_weak_signal_and_shrinks_near_a_sample():
+    assert local_search_radius(Reading(0.08, 0.0)) == 1.2
+    assert local_search_radius(Reading(0.40, 0.0)) == 0.75
+    assert local_search_radius(Reading(0.85, 0.0)) == 0.45
+    assert local_search_radius(Reading(0.40, 0.10)) > local_search_radius(Reading(0.40, 0.0))
 
 
 def test_search_climbs_the_signal_to_a_sample():
@@ -28,6 +38,22 @@ def test_search_climbs_the_signal_to_a_sample():
     assert result.peak > 0.8
     # the sample s1 is at (-0.55, -0.55)
     assert hypot(result.x + 0.55, result.y + 0.55) < 0.35
+    assert robot.judge.collisions == 0
+
+
+def test_search_has_no_blind_sector_when_the_sample_is_behind():
+    scenario = load_scenario(SCENARIOS / 'easy.yaml')
+    scenario.base_x, scenario.base_y = 0.0, -0.5
+    scenario.samples = [ScenarioSample('behind', -1.0, -0.5)]
+    scenario.soil_zones = []
+    scenario.events = []
+    scenario.sensor_noise_stddev = 0.0
+    robot = SimRobot(scenario)
+
+    result = SampleSearch(robot).run(0.0, -0.5, 1.0)
+
+    assert result.found
+    assert result.x < -0.7
     assert robot.judge.collisions == 0
 
 

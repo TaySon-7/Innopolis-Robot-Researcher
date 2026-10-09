@@ -22,9 +22,18 @@ class PlanExecutor:
         self.skills = skills
         self.publish_status = publish_status
 
-    def _execute(self, subgoal: Subgoal) -> SkillResult:
+    def _execute(self, subgoal: Subgoal, *, guarded: bool = False) -> SkillResult:
         if subgoal.type == 'goto':
-            return self.skills.goto(subgoal.x, subgoal.y)
+            # Backend-compiled plans are allowed to yield a broad exploration
+            # target when fresh sensor evidence appears on the way.  The next
+            # offer is then rebuilt at the physical pose instead of driving past
+            # a sample merely because an older target was already selected.
+            return self.skills.goto(
+                subgoal.x,
+                subgoal.y,
+                guarded=guarded,
+                stop_on_signal=guarded,
+            )
         if subgoal.type == 'search_around':
             return self.skills.search_around(subgoal.x, subgoal.y, subgoal.radius)
         if subgoal.type == 'collect':
@@ -49,18 +58,21 @@ class PlanExecutor:
             'state': state,
             'reason': reason,
             'data': details,
+            'subgoal_count': len(plan.subgoals),
+            'plan_complete': state in ('failed', 'preempted', 'idle') or (
+                state == 'done' and index == len(plan.subgoals) - 1),
         }
         self.publish_status(status)
         return status
 
-    def run(self, plan: Plan) -> dict[str, Any]:
+    def run(self, plan: Plan, *, guarded: bool = False) -> dict[str, Any]:
         """Run the whole plan; return the last status that was published."""
         if not plan.subgoals:
             return self._status(plan, 0, 'idle', 'empty plan')
         last: dict[str, Any] = {}
         for index, subgoal in enumerate(plan.subgoals):
             self._status(plan, index, 'running')
-            result = self._execute(subgoal)
+            result = self._execute(subgoal, guarded=guarded)
             if self.skills.robot.preempted():
                 return self._status(plan, index, 'preempted', 'replaced by a new plan')
             if not result.ok:

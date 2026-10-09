@@ -22,7 +22,8 @@ from did_agent.plan import PlanError
 from did_agent.plan import parse_plan
 
 WEB_DIR_SOURCE = Path(__file__).resolve().parent.parent / 'web'
-COMMANDS = ('auto', 'stop')
+COMMANDS = ('auto', 'stop', 'llm')
+NAVIGATION_BACKENDS = ('custom', 'nav2')
 SCENARIOS = ('easy', 'medium', 'hard')
 MAX_SCENARIO_SEED = 2_147_483_647
 SCENARIO_NAME = re.compile(r'^(easy|medium|hard)@(0|[1-9][0-9]{0,9})$')
@@ -389,6 +390,7 @@ class DashboardData:
         if search and all(isinstance(search.get(key), (int, float))
                           for key in ('x', 'y', 'radius')):
             action = ('Выбран район поиска' if kind == 'llm'
+                      else 'Резервный выбор района' if source == 'fallback'
                       else 'Автоматический локальный поиск')
             title = (
                 f'{action} '
@@ -396,7 +398,10 @@ class DashboardData:
                 f'радиус {float(search["radius"]):.2f}'
             )
         else:
-            title = f'Выбран план {data.get("plan_id", "")}'.strip()
+            action = ('Резервный план' if source == 'fallback'
+                      else 'План по запасу энергии' if source == 'budget'
+                      else 'Выбран план')
+            title = f'{action} {data.get("plan_id", "")}'.strip()
         steps = ' → '.join(
             str(item.get('type')) for item in items
             if isinstance(item, dict) and item.get('type')
@@ -518,6 +523,7 @@ class DashboardServer:
         send_scenario: Callable[[str], None] | None = None,
         preview_scenario: Callable[[str], dict[str, Any]] | None = None,
         *,
+        set_navigation_backend: Callable[[str], None] | None = None,
         port: int = 8080,
         host: str = '0.0.0.0',
         log: Callable[[str], None] = lambda message: None,
@@ -528,6 +534,7 @@ class DashboardServer:
         self.send_command = send_command
         self.send_scenario = send_scenario
         self.preview_scenario = preview_scenario
+        self.set_navigation_backend = set_navigation_backend
         self.log = log
         owner = self
 
@@ -589,6 +596,25 @@ class DashboardServer:
                         return
                     owner.send_command(command)
                     self._json({'ok': True})
+                    return
+                elif path == '/api/navigation':
+                    backend = body.get('backend')
+                    if not isinstance(backend, str) or backend not in NAVIGATION_BACKENDS:
+                        self._json({
+                            'ok': False,
+                            'error': 'navigation backend must be custom or nav2',
+                        }, 400)
+                        return
+                    if owner.set_navigation_backend is None:
+                        self._json({'ok': False, 'error': 'navigation control unavailable'}, 503)
+                        return
+                    try:
+                        owner.set_navigation_backend(backend)
+                    except (OSError, RuntimeError, ValueError) as error:
+                        self._json({'ok': False, 'error': str(error)}, 503)
+                        return
+                    # Only /agent/state confirms which backend is now active.
+                    self._json({'ok': True, 'requested_backend': backend, 'pending': True}, 202)
                     return
                 elif path == '/api/scenario':
                     scenario = body.get('scenario')

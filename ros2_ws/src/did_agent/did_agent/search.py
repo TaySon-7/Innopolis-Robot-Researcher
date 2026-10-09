@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from math import cos
 from math import hypot
+from math import pi
 from math import sin
 from math import sqrt
 from typing import Callable
@@ -24,6 +25,7 @@ SAMPLE_COLLECTION_RADIUS = 0.30
 # The judge uses signal = 1 - distance / range.  A search must not report
 # success outside the radius in which the following collect call is legal.
 COLLECTION_SIGNAL_THRESHOLD = 1.0 - SAMPLE_COLLECTION_RADIUS / SAMPLE_SENSOR_RANGE
+MAX_LOCAL_SEARCH_TRAVEL = 4.5
 
 
 class Preempted(Exception):
@@ -58,6 +60,7 @@ class SampleSearch:
         step: float = 0.4,
         min_step: float = 0.1,
         max_refine: int = 18,
+        max_travel: float = MAX_LOCAL_SEARCH_TRAVEL,
     ) -> None:
         self.robot = robot
         self.budget_ok = budget_ok
@@ -68,7 +71,9 @@ class SampleSearch:
         self.step = step
         self.min_step = min_step
         self.max_refine = max_refine
+        self.max_travel = max_travel
         self.trace: list[tuple[float, float, float, float]] = []  # x, y, value, noise
+        self.travelled = 0.0
 
     def _free_point(self, x: float, y: float, snap: float) -> tuple[float, float] | None:
         costmap = self.robot.costmap
@@ -77,15 +82,26 @@ class SampleSearch:
 
     def _visit(self, x: float, y: float) -> tuple[float, float, float, float] | None:
         """Drive to a point and read the sensor; None if the point is unreachable."""
+        if self.robot.preempted():
+            raise Preempted('preempted')
+        if self.travelled >= self.max_travel:
+            raise Preempted('local search travel budget reached')
         if not self.budget_ok():
             raise Preempted('battery reserve reached')
+        before = self.robot.pose()
         result = self.robot.goto(x, y, guard=lambda: not self.budget_ok())
         if self.robot.preempted():
             raise Preempted('preempted')
         if not result.ok:
             return None
         reading: Reading = self.robot.read_sensor(self._readings())
+        if self.robot.preempted():
+            raise Preempted('preempted')
         pose = self.robot.pose()
+        if pose is None:
+            raise Preempted('physical world pose unavailable')
+        if before is not None:
+            self.travelled += hypot(pose.x - before.x, pose.y - before.y)
         entry = (pose.x, pose.y, reading.value, reading.noise)
         self.trace.append(entry)
         return entry
@@ -151,6 +167,7 @@ class SampleSearch:
     def run(self, cx: float, cy: float, radius: float) -> SearchResult:
         """Search around a point; the robot ends at the strongest spot found."""
         self.trace = []
+        self.travelled = 0.0
         try:
             return self._run(cx, cy, radius)
         except Preempted as stop:
@@ -161,14 +178,20 @@ class SampleSearch:
                     self._plain(), self._gradient(best),
                 )
             pose = self.robot.pose()
-            return SearchResult(False, 0.0, pose.x, pose.y, str(stop))
+            return SearchResult(False, 0.0, pose.x if pose else cx, pose.y if pose else cy, str(stop))
 
     def _plain(self) -> list[tuple[float, float, float]]:
         return [(x, y, v) for x, y, v, _ in self.trace]
 
     def _run(self, cx: float, cy: float, radius: float) -> SearchResult:
+        if self.robot.preempted():
+            raise Preempted('preempted')
         pose = self.robot.pose()
+        if pose is None:
+            raise Preempted('physical world pose unavailable')
         first = self.robot.read_sensor(self._readings())
+        if self.robot.preempted():
+            raise Preempted('preempted')
         self.trace.append((pose.x, pose.y, first.value, first.noise))
 
         for x, y in self._spiral(cx, cy, radius):
@@ -184,9 +207,15 @@ class SampleSearch:
         step, probes = self.step, 0
         while step >= self.min_step and probes < self.max_refine and best[2] < self.target:
             improved = False
-            # Along the gradient first, then sideways: the gradient estimate from
-            # a handful of noisy readings can be off.
-            for turn in (0.0, 1.2, -1.2):
+            # Probe the full circle.  In particular, the very first reading has
+            # no gradient yet; the former forward-only fan could shrink the step
+            # forever while a valid sample sat behind the robot.  Keeping the
+            # +/-60 degree probes early also lets the search skirt a pillar
+            # without paying for the whole ring in the common case.
+            for turn in (
+                0.0, pi / 3.0, -pi / 3.0,
+                2.0 * pi / 3.0, -2.0 * pi / 3.0, pi,
+            ):
                 point = self._candidate(best, step, turn)
                 if point is None:
                     continue
@@ -195,7 +224,21 @@ class SampleSearch:
                 if entry is not None and entry[2] > best[2] + max(
                     0.02, 2.0 * max(entry[3], best[3])
                 ):
-                    best, step, improved = entry, min(step * 1.3, 0.6), True
+                    best = entry
+                    # The public sensor model is linear within 1.5 m.  Growing
+                    # every successful step to 0.6 m made the robot repeatedly
+                    # overshoot a sample after it was already only ~0.3 m away.
+                    # Keep fast progress in weak signal, then shrink smoothly
+                    # as the estimated remaining distance falls.
+                    estimated_distance = SAMPLE_SENSOR_RANGE * (
+                        1.0 - max(0.0, min(1.0, best[2]))
+                    )
+                    step = min(
+                        step * 1.3,
+                        0.6,
+                        max(self.min_step, 0.8 * estimated_distance),
+                    )
+                    improved = True
                     break
                 if probes >= self.max_refine:
                     break

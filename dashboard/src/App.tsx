@@ -14,12 +14,12 @@ import {
   Waypoints,
   Zap,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AgentHypothesisPanel, AgentJournal, AgentPanel, AgentPlanPanel } from './AgentPanels'
 import { ArenaCanvas } from './ArenaCanvas'
 import type { MapMode, PlannerLayer } from './ArenaCanvas'
 import { useAgentApi } from './agentApi'
-import type { AgentScenarioPreview, Difficulty, NavigationMode } from './agentApi'
+import type { AgentScenarioPreview, Difficulty, NavigationBackend, NavigationMode } from './agentApi'
 import { useRosbridge } from './rosbridge'
 import { ScenarioSetup } from './ScenarioSetup'
 import type { ScenarioMode } from './ScenarioSetup'
@@ -60,6 +60,7 @@ function App() {
     sendGoto,
     sendCommand,
     sendPlan,
+    selectNavigationBackend,
     selectScenario,
     previewScenario,
   } = useAgentApi()
@@ -76,8 +77,10 @@ function App() {
   const [linearSpeed, setLinearSpeed] = useState(0.12)
   const [angularSpeed, setAngularSpeed] = useState(0.6)
   const [motion, setMotion] = useState<Motion>(null)
+  const manualContextRef = useRef<{ backend?: NavigationBackend; episodeId?: number }>({})
   const [serviceBusy, setServiceBusy] = useState(false)
   const [agentBusy, setAgentBusy] = useState(false)
+  const [pendingNavigationBackend, setPendingNavigationBackend] = useState<NavigationBackend | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [showTrail, setShowTrail] = useState(true)
   const [showPath, setShowPath] = useState(true)
@@ -129,6 +132,27 @@ function App() {
   }, [sendCommand, stop])
 
   useEffect(() => {
+    const backend = agentSnapshot.state.navigation?.backend
+    const episodeId = agentSnapshot.state.episode_id
+    const previous = manualContextRef.current
+    const changed = (backend !== undefined && previous.backend !== undefined && backend !== previous.backend)
+      || (episodeId !== undefined && previous.episodeId !== undefined && episodeId !== previous.episodeId)
+    // Retain the last confirmed values across an empty reset snapshot.
+    manualContextRef.current = {
+      backend: backend ?? previous.backend,
+      episodeId: episodeId ?? previous.episodeId,
+    }
+    if (changed && motion !== null) stop()
+  }, [agentSnapshot.state.navigation?.backend, agentSnapshot.state.episode_id, motion, stop])
+
+  useEffect(() => {
+    if (agentBusy || agentConnection !== 'connected' || pendingNavigationBackend === null
+      || agentSnapshot.state.navigation?.backend !== pendingNavigationBackend) return
+    setNotice(`Агент подтвердил навигацию ${pendingNavigationBackend === 'nav2' ? 'Nav2' : 'Наша (A*)'}`)
+    setPendingNavigationBackend(null)
+  }, [agentBusy, agentConnection, agentSnapshot.state.navigation?.backend, pendingNavigationBackend])
+
+  useEffect(() => {
     if (view !== 'dashboard' || !connected || !motion) return
     publishVelocity(command.linear, command.angular)
     const timer = window.setInterval(
@@ -144,7 +168,8 @@ function App() {
   useEffect(() => {
     const keyDown = (event: KeyboardEvent) => {
       if (view !== 'dashboard') return
-      if (event.target instanceof HTMLInputElement || event.metaKey || event.ctrlKey) return
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement
+        || event.target instanceof HTMLTextAreaElement || event.metaKey || event.ctrlKey) return
       const key = event.key.toLowerCase()
       if (key === 's' || key === ' ') {
         event.preventDefault()
@@ -154,7 +179,8 @@ function App() {
       const next = MOTION_KEYS[key]
       if (next && connected) {
         event.preventDefault()
-        startMotion(next)
+        // Revoked holds require a new press; repeated arrow keys must not scroll either.
+        if (!event.repeat) startMotion(next)
       }
     }
     const keyUp = (event: KeyboardEvent) => {
@@ -332,13 +358,13 @@ function App() {
   const visibleSamples = useMemo(() => {
     if (mapMode !== 'truth') return snapshot.samples.filter((sample) => sample.collected)
     if (!agentTruth?.samples?.length) return snapshot.samples
-    return agentTruth.samples.map((sample) => ({
-      ...sample,
-      collected: agentSnapshot.collected_at.some(
-        ([x, y]) => Math.hypot(x - sample.x, y - sample.y) < 0.45,
-      ),
-    }))
-  }, [agentSnapshot.collected_at, agentTruth, mapMode, snapshot.samples])
+    return agentTruth.samples.map((sample) => {
+      const judged = snapshot.samples.find(
+        (item) => Math.hypot(item.x - sample.x, item.y - sample.y) < 0.01,
+      )
+      return { ...sample, collected: judged?.collected ?? false }
+    })
+  }, [agentTruth, mapMode, snapshot.samples])
   const scanReturns = snapshot.scan
     ? snapshot.scan.ranges.reduce(
         (count, range) =>
@@ -584,6 +610,9 @@ function App() {
           <AgentPlanPanel
             raw={agentSnapshot.plan}
             runningPlanId={agentSnapshot.state?.current?.plan_id ?? ''}
+            controlMode={agentSnapshot.state.control_mode}
+            runState={agentSnapshot.status.state}
+            finished={agentSnapshot.state.finished}
           />
 
           <AgentPanel
@@ -591,7 +620,16 @@ function App() {
             connection={agentConnection}
             error={agentError}
             busy={agentBusy}
+            onNavigationBackend={(backend) => void runAgentAction(
+              async () => {
+                setPendingNavigationBackend(null)
+                await selectNavigationBackend(backend)
+                setPendingNavigationBackend(backend)
+              },
+              `Запрошена навигация ${backend === 'nav2' ? 'Nav2' : 'Наша (A*)'} — ждём подтверждения агента`,
+            )}
             onAuto={() => void runAgentAction(() => sendCommand('auto'), 'Автономный режим запущен')}
+            onLLM={() => void runAgentAction(() => sendCommand('llm'), 'Управление передано LLM-планировщику')}
             onStop={() => void runAgentAction(() => sendCommand('stop'), 'Агент остановлен')}
             onCollect={() => void runAgentAction(
               () => sendPlan([{ type: 'collect' }]),

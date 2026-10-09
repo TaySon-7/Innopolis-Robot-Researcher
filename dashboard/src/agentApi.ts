@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 export type AgentConnection = 'connecting' | 'connected' | 'disconnected'
+export type AgentControlMode = 'llm' | 'fallback' | 'autonomous' | 'manual' | 'stopped'
 export type NavigationMode = 'goto' | 'search'
+export type NavigationBackend = 'custom' | 'nav2'
 export type Difficulty = 'easy' | 'medium' | 'hard'
 export type CostRun = [number, number, number, number]
 export type MaskRun = [number, number, number]
@@ -44,6 +46,10 @@ export interface JudgeEvent {
 }
 
 export interface AgentNavigation {
+  backend?: NavigationBackend
+  available_backends?: NavigationBackend[]
+  ready?: boolean
+  reason?: string
   status?: string
   replans?: number
   waypoints?: Array<[number, number]>
@@ -54,8 +60,15 @@ export interface AgentRuntimeState {
   episode_id?: number
   battery?: number
   score?: number
+  finished?: boolean
+  control_mode?: AgentControlMode
+  decision_source?: string
+  goal_offer?: AgentGoalOffer | null
   sensor?: { value?: number; noise_estimate?: number }
-  current?: { plan_id?: string; index?: number; type?: string; state?: string }
+  current?: {
+    plan_id?: string; index?: number; type?: string; state?: string
+    plan_complete?: boolean; subgoal_count?: number
+  }
   return_cost_estimate?: number
   anomaly?: {
     battery_deviation?: boolean
@@ -70,6 +83,8 @@ export interface AgentRunStatus {
   subgoal?: string
   reason?: string
   data?: Record<string, unknown>
+  plan_complete?: boolean
+  subgoal_count?: number
 }
 
 export interface AgentScore {
@@ -84,6 +99,10 @@ export interface AgentScore {
   hazard_hits?: number
   score?: number
   finished?: boolean
+  world_pose?: { x?: number; y?: number }
+  world_pose_valid?: boolean
+  pose_source?: 'gazebo' | 'unavailable' | string
+  samples?: Array<{ x: number; y: number; collected: boolean }>
 }
 
 export interface AgentPlanSubgoal {
@@ -93,11 +112,68 @@ export interface AgentPlanSubgoal {
   radius?: number
 }
 
+export interface AgentGoalCandidate {
+  goal_id: string
+  kind: 'search' | 'return' | 'collect'
+  evidence?: 'observed_signal' | 'exploration' | 'return'
+  x: number
+  y: number
+  radius: number
+  reachable: boolean
+  feasible: boolean
+  reason: string
+  energy_to_goal: number | null
+  energy_search: number | null
+  energy_home: number | null
+  required_battery: number | null
+  expected_score: null
+  subgoals?: AgentPlanSubgoal[]
+  emergency?: boolean
+}
+
+export interface AgentGoalOffer {
+  snapshot_id: string
+  episode_id: string
+  revision: number
+  battery: number
+  objective: {
+    formula: string
+    weights: Record<string, number>
+    expected_score: null
+    note: string
+  }
+  budget: {
+    energy_per_meter: number
+    search_distance: number
+    return_factor: number
+    reserve: number
+    pessimism: number
+    note: string
+  }
+  candidates: AgentGoalCandidate[]
+  observations?: {
+    pose: { x: number; y: number; yaw?: number } | [number, number]
+    sensor: { value: number; noise_estimate: number }
+    collected: number
+    samples_total: number
+    attempted_goal_ids: string[]
+  }
+}
+
 export interface AgentPlan {
   plan_id?: string
-  source?: 'llm' | 'signal' | 'auto_collect' | 'budget' | string
+  source?: 'llm' | 'fallback' | 'signal' | 'auto_collect' | 'budget' | 'manual' | string
   explanation?: string
   subgoals?: AgentPlanSubgoal[]
+  goal_selection?: { snapshot_id: string; goal_id: string }
+  decision?: {
+    goal_id: string
+    required_battery: number | null
+    battery: number
+    energy_to_goal: number | null
+    energy_search: number | null
+    energy_home: number | null
+  }
 }
 
 export interface AgentSnapshot {
@@ -116,7 +192,7 @@ export interface AgentSnapshot {
   scenario: string | null
 }
 
-/** The plan the LLM published, or null when nothing valid has been sent. */
+/** The last published plan, or null when nothing valid has been sent. */
 export function parsePlan(raw: string): AgentPlan | null {
   if (!raw) return null
   try {
@@ -324,12 +400,16 @@ export function useAgentApi() {
     [request],
   )
   const sendCommand = useCallback(
-    (cmd: 'auto' | 'stop') => request('/api/command', { cmd }),
+    (cmd: 'auto' | 'stop' | 'llm') => request('/api/command', { cmd }),
     [request],
   )
   const sendPlan = useCallback(
     (subgoals: Array<Record<string, unknown>>) =>
       request('/api/plan', { plan_id: 'react-ui', subgoals }),
+    [request],
+  )
+  const selectNavigationBackend = useCallback(
+    (backend: NavigationBackend) => request('/api/navigation', { backend }),
     [request],
   )
   const selectScenario = useCallback(
@@ -363,6 +443,7 @@ export function useAgentApi() {
     sendGoto,
     sendCommand,
     sendPlan,
+    selectNavigationBackend,
     selectScenario,
     previewScenario,
   }

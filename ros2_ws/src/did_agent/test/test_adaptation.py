@@ -212,6 +212,16 @@ def test_anomalies_make_the_agent_go_home_earlier():
     assert not skills.battery_allows_more()
 
 
+def test_sensor_noise_does_not_consume_the_return_energy_margin():
+    robot = SimRobot(scenario('hard'))
+    skills = Skills(robot)
+    skills.goto(1.7, -0.45)
+    cost = skills.return_cost_estimate()
+    robot.judge.battery = cost * skills.return_factor + skills.reserve + 0.5
+    robot.anomaly = lambda: {'sensor_noise_up': True}
+    assert skills.battery_allows_more()
+
+
 # Prices stay inside the range the generator can produce (after a silent soil change
 # the dearest floor is x5 x1.3). Far beyond it, an unvisited changed floor can eat the reserve.
 @pytest.mark.parametrize(('battery', 'multiplier'), [(45, 1.3), (35, 1.3), (28, 1.0)])

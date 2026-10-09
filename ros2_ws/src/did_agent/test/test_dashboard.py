@@ -187,6 +187,20 @@ def test_automatic_signal_plan_is_labelled_as_robot_not_llm():
     assert entry['title'].startswith('Автоматический локальный поиск')
 
 
+def test_fallback_goal_choice_is_explicitly_labelled_in_journal():
+    data = DashboardData()
+    data.on_plan(json.dumps({
+        'plan_id': 'math-1', 'source': 'fallback',
+        'explanation': 'Модель недоступна; выбран допустимый район с минимальным бюджетом.',
+        'goal_selection': {'snapshot_id': 'offer-1', 'goal_id': 'sweep-1'},
+        'subgoals': [{'type': 'search_around', 'x': -1.5, 'y': -0.5, 'radius': 0.6}],
+    }))
+    entry = data.snapshot()['journal'][0]
+    assert entry['kind'] == 'robot'
+    assert entry['title'].startswith('Резервный выбор района')
+    assert json.loads(data.snapshot()['plan'])['goal_selection']['goal_id'] == 'sweep-1'
+
+
 def test_truth_overlay_describes_the_scenario():
     truth = truth_from_scenario(load_scenario(scenario_path('hard')))
     assert len(truth['samples']) == 7 and len(truth['soil_zones']) == 4
@@ -216,7 +230,7 @@ def test_setup_preview_includes_future_dynamic_hazard_details():
 
 @pytest.fixture()
 def server(geometry):
-    sent = {'plans': [], 'commands': [], 'scenarios': [], 'previews': []}
+    sent = {'plans': [], 'commands': [], 'scenarios': [], 'previews': [], 'navigation': []}
 
     def preview(name):
         sent['previews'].append(name)
@@ -226,6 +240,7 @@ def server(geometry):
         DashboardData(), geometry,
         sent['plans'].append, sent['commands'].append, sent['scenarios'].append,
         preview,
+        set_navigation_backend=sent['navigation'].append,
         port=0, host='127.0.0.1',
     )
     srv.start()
@@ -255,6 +270,39 @@ def test_server_serves_page_map_and_state(server):
     state = json.loads(call(srv, '/api/state')[1])
     assert {'pose', 'state', 'status', 'score', 'trail', 'events', 'journal', 'costmap'} <= set(state)
     assert call(srv, '/nope')[0] == 404
+
+
+def test_math_offer_and_current_controller_reach_http_snapshot(server):
+    srv, _ = server
+    state = {
+        'finished': False, 'control_mode': 'fallback', 'decision_source': 'fallback',
+        'goal_offer': {
+            'snapshot_id': 'offer-1', 'episode_id': '4', 'revision': 2, 'battery': 50,
+            'objective': {'formula': '10*N + 5*R - 2*C - F - 3*H',
+                          'weights': {'N': 10, 'R': 5, 'C': -2, 'F': -1, 'H': -3},
+                          'expected_score': None, 'note': 'Yield is unknown.'},
+            'budget': {'energy_per_meter': 1, 'search_distance': 3, 'return_factor': 1.4,
+                       'reserve': 8, 'pessimism': 0.5, 'note': 'Estimated budget.'},
+            'candidates': [{'goal_id': 'home', 'kind': 'return', 'x': -2, 'y': -0.5,
+                            'radius': 0, 'reachable': True, 'feasible': True,
+                            'reason': 'within budget', 'energy_to_goal': 2,
+                            'energy_search': 0, 'energy_home': 0,
+                            'required_battery': 10.8, 'expected_score': None}],
+            'observations': {'pose': {'x': -1, 'y': -0.5},
+                             'sensor': {'value': 0.1, 'noise_estimate': 0.02},
+                             'collected': 1, 'samples_total': 3,
+                             'attempted_goal_ids': ['sweep-1']},
+        },
+    }
+    srv.data.on_state(state)
+    status, payload, _ = call(srv, '/api/state')
+    assert status == 200
+    assert json.loads(payload)['state'] == state
+    # Stop/reset clears the offer rather than retaining an earlier LLM claim.
+    srv.data.on_state({'finished': False, 'control_mode': 'stopped', 'goal_offer': None})
+    assert json.loads(call(srv, '/api/state')[1])['state'] == {
+        'finished': False, 'control_mode': 'stopped', 'goal_offer': None,
+    }
 
 
 def test_click_sends_a_goto_plan(server):
@@ -298,8 +346,73 @@ def test_commands_are_whitelisted(server):
     srv, sent = server
     assert call(srv, '/api/command', {'cmd': 'auto'})[0] == 200
     assert call(srv, '/api/command', {'cmd': 'stop'})[0] == 200
+    assert call(srv, '/api/command', {'cmd': 'llm'})[0] == 200
     assert call(srv, '/api/command', {'cmd': 'rm -rf'})[0] == 400
-    assert sent['commands'] == ['auto', 'stop']
+    assert sent['commands'] == ['auto', 'stop', 'llm']
+
+
+@pytest.mark.parametrize('backend', ['custom', 'nav2'])
+def test_navigation_selection_is_pending_until_agent_confirms(server, backend):
+    srv, sent = server
+    state = {'navigation': {
+        'backend': 'custom', 'available_backends': ['custom', 'nav2'],
+        'ready': True, 'reason': '', 'status': 'idle', 'waypoints': [],
+    }}
+    srv.data.on_state(state)
+    srv.data.on_score({'scenario': 'hard@7'})
+    status, payload, _ = call(srv, '/api/navigation', {'backend': backend})
+    assert status == 202
+    assert json.loads(payload) == {'ok': True, 'requested_backend': backend, 'pending': True}
+    assert sent['navigation'] == [backend]
+    assert sent['scenarios'] == []
+    snapshot = json.loads(call(srv, '/api/state')[1])
+    assert snapshot['scenario'] == 'hard@7'
+    assert snapshot['state'] == state
+    # A ROS snapshot is authoritative, including unavailable-backend reasons.
+    state = {'navigation': {
+        'backend': backend, 'available_backends': ['custom', 'nav2'],
+        'ready': False, 'reason': 'Nav2 action server unavailable',
+    }}
+    srv.data.on_state(state)
+    assert json.loads(call(srv, '/api/state')[1])['state'] == state
+
+
+@pytest.mark.parametrize('body', [
+    {}, {'backend': 'NAV2'}, {'backend': 'nav2 '}, {'backend': 'arbitrary'},
+    {'backend': '../nav2'}, {'backend': None}, {'backend': 1},
+    {'backend': True}, {'backend': ['nav2']}, {'backend': {'name': 'nav2'}},
+])
+def test_navigation_selection_rejects_invalid_backends(server, body):
+    srv, sent = server
+    status, payload, _ = call(srv, '/api/navigation', body)
+    assert status == 400
+    assert not json.loads(payload)['ok']
+    assert json.loads(payload)['error'] == 'navigation backend must be custom or nav2'
+    assert sent['navigation'] == []
+    assert sent['plans'] == []
+    assert sent['commands'] == []
+
+
+def test_navigation_selection_reports_unavailable_control(server):
+    srv, sent = server
+    srv.set_navigation_backend = None
+    status, payload, _ = call(srv, '/api/navigation', {'backend': 'nav2'})
+    assert status == 503
+    assert json.loads(payload) == {'ok': False, 'error': 'navigation control unavailable'}
+    assert sent['navigation'] == []
+
+
+def test_navigation_selection_reports_bridge_failure(server):
+    srv, sent = server
+
+    def fail(_backend):
+        raise RuntimeError('navigation publisher unavailable')
+
+    srv.set_navigation_backend = fail
+    status, payload, _ = call(srv, '/api/navigation', {'backend': 'nav2'})
+    assert status == 503
+    assert json.loads(payload) == {'ok': False, 'error': 'navigation publisher unavailable'}
+    assert sent['navigation'] == []
 
 
 def test_scenario_selection_is_whitelisted(server):

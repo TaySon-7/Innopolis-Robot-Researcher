@@ -25,6 +25,20 @@ RUN apt-get update \
 COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
 
+# Keep Nav2 separate from the existing ROS/Gazebo and Python layers. Only the
+# navigation servers/plugins used by did_agent are installed (no AMCL/SLAM).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ros-jazzy-nav2-behaviors \
+        ros-jazzy-nav2-bt-navigator \
+        ros-jazzy-nav2-controller \
+        ros-jazzy-nav2-lifecycle-manager \
+        ros-jazzy-nav2-navfn-planner \
+        ros-jazzy-nav2-planner \
+        ros-jazzy-nav2-regulated-pure-pursuit-controller \
+        ros-jazzy-tf2-ros-py \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV ROS_DOMAIN_ID=30 \
     RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
     TURTLEBOT3_MODEL=burger \

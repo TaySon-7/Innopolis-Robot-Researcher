@@ -41,6 +41,80 @@ def test_odometry_uses_world_offset_and_drains_battery():
     assert model.battery == 59.5
 
 
+def test_external_world_pose_is_not_overwritten_by_drifting_odometry():
+    model = make_model()
+    model.update_odometry(0.0, 0.0)
+    model.update_world_pose(-1.5, -0.5)
+
+    # Wheel odometry is now 0.40 m away from the physical Gazebo pose.
+    model.update_odometry(0.9, 0.0)
+
+    assert (model.world_x, model.world_y) == (-1.5, -0.5)
+    assert model.distance_travelled == pytest.approx(0.9)
+    assert model.battery == pytest.approx(58.2)
+
+
+def test_required_world_pose_does_not_fall_back_to_odometry_before_first_frame():
+    model = make_model()
+    model.require_external_world_pose()
+
+    model.update_odometry(0.9, 0.4)
+
+    assert not model.world_pose_valid
+    assert (model.world_x, model.world_y) == (-2.0, -0.5)
+
+
+def test_first_world_pose_resets_a_queued_odometry_baseline():
+    model = make_model()
+    model.require_external_world_pose()
+
+    # This can belong to the Burger instance that was just removed.
+    model.update_odometry(4.0, 3.0)
+    model.update_world_pose(-2.0, -0.5)
+    # The first odometry frame for the replacement establishes a new baseline.
+    model.update_odometry(0.0, 0.0)
+
+    assert model.distance_travelled == 0.0
+    assert model.battery == 60.0
+
+    model.update_odometry(0.2, 0.0)
+    assert model.distance_travelled == pytest.approx(0.2)
+    assert model.battery == pytest.approx(59.6)
+
+
+def test_sensor_collection_and_base_use_external_world_pose_despite_odom_drift():
+    model = make_model()
+    model.update_odometry(0.0, 0.0)
+
+    # Physically the sample is directly under the robot, while odometry is
+    # more than the 0.30 m collection radius away from it.
+    model.update_world_pose(-1.5, -0.5)
+    model.update_odometry(0.9, 0.0)
+    assert model.sample_sensor() == pytest.approx(1.0)
+    assert model.collect()[0]
+    assert not model.at_base()
+
+    # Returning physically to the base succeeds even when wheel odometry says
+    # the robot is elsewhere.
+    model.update_world_pose(-2.0, -0.5)
+    model.update_odometry(1.4, 0.0)
+    assert model.at_base()
+    assert model.finish()
+
+
+def test_hazards_use_external_world_pose_instead_of_odometry():
+    hazard = {'id': 'h1', 'shape': 'circle', 'x': -1.5, 'y': -0.5, 'radius': 0.2,
+              'penalty': 5.0}
+    model = make_model(hazard_zones=[hazard])
+    model.update_odometry(0.0, 0.0)
+
+    assert model.update_world_pose(-1.5, -0.5) == [
+        {'event': 'hazard_hit', 'zone': 'h1'},
+    ]
+    assert model.update_odometry(1.5, 0.0) == []
+    assert model.hazard_hits == 1
+
+
 def test_soil_zone_multiplies_battery_use():
     zone = {'id': 'z1', 'shape': 'circle', 'x': -1.5, 'y': -0.5, 'radius': 0.2,
             'cost_multiplier': 3.0}

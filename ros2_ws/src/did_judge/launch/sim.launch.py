@@ -73,6 +73,21 @@ def generate_launch_description():
             ),
             launch_arguments={'use_sim_time': 'true'}.items(),
         ),
+        # Wheel odometry is intentionally used only for travelled distance and
+        # battery consumption.  Spatial rules consume Burger's physical pose.
+        Node(
+            package='ros_gz_bridge',
+            executable='parameter_bridge',
+            name='gazebo_pose_bridge',
+            output='screen',
+            arguments=[
+                '/world/default/dynamic_pose/info@'
+                'geometry_msgs/msg/PoseArray[gz.msgs.Pose_V',
+            ],
+            remappings=[
+                ('/world/default/dynamic_pose/info', '/gazebo/dynamic_pose'),
+            ],
+        ),
         Node(
             package='did_judge',
             executable='judge',
@@ -84,4 +99,3 @@ def generate_launch_description():
             }],
         ),
     ])
-

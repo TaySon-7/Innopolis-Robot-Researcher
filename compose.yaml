@@ -22,6 +22,7 @@ services:
       - demo.launch.py
       - scenario:=${SCENARIO:-easy}
       - scenario_file:=${SCENARIO_FILE:-none}
+      - navigation:=${NAVIGATION:-custom}
       # The LLM is the primary high-level planner. Set LLM=false explicitly
       # for an offline run that only uses the deterministic agent policy.
       - llm:=${LLM:-true}

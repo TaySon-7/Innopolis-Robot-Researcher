@@ -26,6 +26,7 @@ from did_agent.navigator_core import FAILED
 from did_agent.navigator_core import NavigatorCore
 from did_agent.robot import NavResult
 from did_agent.robot import Reading
+from did_agent.robot import sample_signal_near
 
 TICK = 0.05
 
@@ -124,6 +125,7 @@ class SimRobot:
         y: float,
         timeout: float = 180.0,
         guard: Callable[[], bool] | None = None,
+        stop_on_signal: bool = False,
     ) -> NavResult:
         if not self.nav.set_goal((x, y), self.pose(), self.sim.t):
             return NavResult(FAILED, self.nav.reason)
@@ -133,11 +135,16 @@ class SimRobot:
             self._tick(command.linear, command.angular)
             if self.nav.status in (DONE, FAILED):
                 break
-            if guard is not None and self.sim.t >= next_guard:
+            if (guard is not None or stop_on_signal) and self.sim.t >= next_guard:
                 next_guard = self.sim.t + 1.0
-                if guard():
+                if guard is not None and guard():
                     self.nav.cancel()
                     return NavResult(FAILED, 'battery reserve reached')
+                if stop_on_signal and sample_signal_near(
+                    self._sensor_value, self.adaptation.monitor.noise_estimate,
+                ):
+                    self.nav.cancel()
+                    return NavResult(FAILED, 'sample signal nearby')
         else:
             self.nav.cancel()
             return NavResult(FAILED, 'preempted' if self.preempt else 'timeout')

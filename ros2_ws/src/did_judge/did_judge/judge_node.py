@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+from math import isfinite
 from pathlib import Path
 import re
 from typing import Any
 
+from geometry_msgs.msg import PoseArray
+from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.node import Node
@@ -25,6 +28,42 @@ from did_judge.scenario import scenario_path
 SCENARIOS = ('easy', 'medium', 'hard')
 SEEDED_SCENARIO = re.compile(r'^(easy|medium|hard)@(0|[1-9][0-9]{0,9})$')
 GENERATED_SCENARIO_DIR = Path('/tmp/scenarios')
+WORLD_POSE_TIMEOUT_NS = 750_000_000
+WORLD_POSE_FUTURE_TOLERANCE_NS = 100_000_000
+
+
+def message_stamp_ns(message: PoseArray | Odometry) -> int:
+    """Return the simulation timestamp carried by a stamped ROS message."""
+    return message.header.stamp.sec * 1_000_000_000 + message.header.stamp.nanosec
+
+
+def stamped_message_after(message: PoseArray | Odometry, after_ns: int) -> bool:
+    """Reject messages queued before the current Burger instance existed."""
+    return message_stamp_ns(message) > after_ns
+
+
+def physical_pose_fresh(last_stamp_ns: int | None, now_ns: int) -> bool:
+    """Reject a missing, stale or implausibly future physical pose."""
+    if last_stamp_ns is None:
+        return False
+    age_ns = now_ns - last_stamp_ns
+    return -WORLD_POSE_FUTURE_TOLERANCE_NS <= age_ns <= WORLD_POSE_TIMEOUT_NS
+
+
+def physical_model_pose(message: PoseArray, after_ns: int):
+    """Return a fresh finite Burger pose, or ``None`` while it is unavailable."""
+    if not message.poses:
+        return None
+    if not stamped_message_after(message, after_ns):
+        return None
+    pose = message.poses[0]
+    quaternion = pose.orientation
+    if not all(isfinite(value) for value in (
+        pose.position.x, pose.position.y,
+        quaternion.x, quaternion.y, quaternion.z, quaternion.w,
+    )):
+        return None
+    return pose
 
 
 def scenario_request(text: str) -> tuple[str, Path]:
@@ -78,8 +117,11 @@ class JudgeNode(Node):
             collision_clearance=self._collision_clearance,
             collision_cooldown=self._collision_cooldown,
         )
+        self._model.require_external_world_pose()
         self._start_time: float | None = None
         self._logged_environment = 0
+        self._world_pose_after_ns = self.get_clock().now().nanoseconds
+        self._last_world_pose_ns: int | None = None
 
         self._battery_publisher = self.create_publisher(Float32, '/did/battery', 10)
         self._sensor_publisher = self.create_publisher(
@@ -89,7 +131,18 @@ class JudgeNode(Node):
         )
         self._score_publisher = self.create_publisher(String, '/did/score', 10)
         self._events_publisher = self.create_publisher(String, '/did/events', 10)
+        self._world_pose_publisher = self.create_publisher(
+            PoseStamped,
+            '/did/world_pose',
+            10,
+        )
         self.create_subscription(Odometry, '/odom', self._on_odometry, 10)
+        self.create_subscription(
+            PoseArray,
+            '/gazebo/dynamic_pose',
+            self._on_world_pose,
+            qos_profile_sensor_data,
+        )
         self.create_subscription(String, '/did/scenario/select', self._on_scenario_select, 10)
         self.create_subscription(
             LaserScan,
@@ -124,8 +177,14 @@ class JudgeNode(Node):
             collision_clearance=self._collision_clearance,
             collision_cooldown=self._collision_cooldown,
         )
+        self._model.require_external_world_pose()
         self._start_time = None
         self._logged_environment = 0
+        # The dashboard recreates Burger before publishing scenario_select.
+        # Ignore any queued pose from the removed model and wait for a newer
+        # frame belonging to the replacement.
+        self._world_pose_after_ns = self.get_clock().now().nanoseconds
+        self._last_world_pose_ns = None
         self._publish_event('scenario_selected', scenario=name)
         self.get_logger().info(
             f'Judge reset: scenario={scenario.name}, '
@@ -147,12 +206,40 @@ class JudgeNode(Node):
         self._logged_environment = len(self._model.environment_log)
 
     def _on_odometry(self, message: Odometry) -> None:
+        if not stamped_message_after(message, self._world_pose_after_ns):
+            return
         if self._start_time is None:
             self._start_time = self.get_clock().now().nanoseconds * 1e-9
         self._tick()
         position = message.pose.pose.position
         for event in self._model.update_odometry(position.x, position.y):
             self._publish_event(**event)
+
+    def _on_world_pose(self, message: PoseArray) -> None:
+        """Use Burger's physical Gazebo pose for every spatial judge rule."""
+        pose = physical_model_pose(message, self._world_pose_after_ns)
+        if pose is None:
+            return
+        x, y = float(pose.position.x), float(pose.position.y)
+        self._last_world_pose_ns = message_stamp_ns(message)
+        # Burger is the only dynamic model in the task world.  The remaining
+        # PoseArray entries are its links relative to that model.
+        self._tick()
+        for event in self._model.update_world_pose(x, y):
+            self._publish_event(**event)
+
+        normalized = PoseStamped()
+        normalized.header = message.header
+        normalized.header.frame_id = 'odom'
+        normalized.pose = pose
+        self._world_pose_publisher.publish(normalized)
+
+    def _physical_pose_available(self) -> bool:
+        """Return whether spatial rules have a recent Gazebo pose."""
+        return self._model.world_pose_valid and physical_pose_fresh(
+            self._last_world_pose_ns,
+            self.get_clock().now().nanoseconds,
+        )
 
     def _on_scan(self, message: LaserScan) -> None:
         angles = [
@@ -174,13 +261,14 @@ class JudgeNode(Node):
         self._battery_publisher.publish(battery)
 
         sensor = Float32()
-        sensor.data = float(self._model.sample_sensor())
+        physical_pose_available = self._physical_pose_available()
+        sensor.data = float(self._model.sample_sensor() if physical_pose_available else 0.0)
         self._sensor_publisher.publish(sensor)
 
         model = self._model
         score = String()
         score.data = json.dumps(
-            score_payload(model, self._scenario_file),
+score_payload(model, self._scenario_file),
             sort_keys=True,
         )
         self._score_publisher.publish(score)
@@ -194,6 +282,10 @@ class JudgeNode(Node):
         self._events_publisher.publish(message)
 
     def _on_collect(self, _request: Trigger.Request, response: Trigger.Response):
+        if not self._physical_pose_available():
+            response.success = False
+            response.message = 'physical Gazebo pose is unavailable or stale'
+            return response
         success, event = self._model.collect()
         response.success = success
         response.message = (
@@ -204,6 +296,10 @@ class JudgeNode(Node):
         return response
 
     def _on_finish(self, _request: Trigger.Request, response: Trigger.Response):
+        if not self._physical_pose_available():
+            response.success = False
+            response.message = 'physical Gazebo pose is unavailable or stale'
+            return response
         response.success = self._model.finish()
         response.message = (
             'run finished at base' if response.success else 'robot is not at base'
