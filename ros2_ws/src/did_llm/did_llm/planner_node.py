@@ -157,8 +157,10 @@ SKILL_HYSTERESIS = 0.05
 #: not one per tick while the reading settles.
 SKILL_COOLDOWN_SEC = 20.0
 #: How long the robot may stand still waiting for the model's answer before the
-#: planner answers the case itself.
-SKILL_WATCHDOG_SEC = 15.0
+#: planner answers the case itself. Long enough that a normal reply is never
+#: cut off — the median is 3.2 s — and short enough that a lost call does not
+#: cost a minute of episode.
+SKILL_WATCHDOG_SEC = 25.0
 
 #: How many readings are kept, the fewest a plane can be fitted through, how far
 #: apart they have to be for their differences to mean anything, and how strong
@@ -335,7 +337,10 @@ class Planner:
         #: A model call in flight, and its result once it lands.
         self.busy = False
         self.busy_since = 0.0
-        self.pending: tuple[str, Any, str, dict[str, float]] | None = None
+        #: The tuple is (kind, payload, prompt, budget, attempt); ``attempt``
+        #: says whether the answer is the model's first or a repair of a
+        #: rejected one.
+        self.pending: tuple[str, Any, str, dict[str, float], int] | None = None
         #: Counts planning rounds. It rotates the strategy directive, which is
         #: what keeps the endpoint's prompt cache from replaying an old answer.
         self.round_number = 0
@@ -551,16 +556,16 @@ class Planner:
                 answer = self.client.complete_json(self.system_prompt, prompt,
                                                    tag='plan',
                                                    response_format=self.response_format)
-                self.pending = ('plan', answer, prompt, budget)
+                self.pending = ('plan', answer, prompt, budget, 0)
             except LLMUnavailable as error:
-                self.pending = ('error', error, prompt, budget)
+                self.pending = ('error', error, prompt, budget, 0)
             except Exception as error:  # noqa: BLE001 - a thread must not die
-                self.pending = ('error', LLMUnavailable(str(error)), prompt, budget)
+                self.pending = ('error', LLMUnavailable(str(error)), prompt, budget, 0)
 
         threading.Thread(target=work, daemon=True).start()
 
     def _collect_result(self) -> None:
-        kind, payload, prompt, budget = self.pending
+        kind, payload, prompt, budget, attempt = self.pending
         self.pending = None
         self.busy = False
 
@@ -569,96 +574,113 @@ class Planner:
             if error.reason == 'rate_limited':
                 return
             self.failures += 1
+            step = ' на исправление' if attempt else ''
             if self.failures < self.cfg.handover_after_failures:
                 self.link.log.warn(
-                    f'модель не ответила ({self.failures}/'
+                    f'модель не ответила{step} ({self.failures}/'
                     f'{self.cfg.handover_after_failures}): {error}')
                 return
             self._go_autonomous(
-                f'модель недоступна {self.failures} раз подряд: {error}')
+                f'модель недоступна{step} {self.failures} раз подряд: {error}')
             return
         self.failures = 0
-        self._accept_answer(payload, prompt, budget)
+        self._accept_answer(payload, prompt, budget, attempt)
 
     def _accept_answer(self, answer: Any, prompt: str,
-                       budget: dict[str, float]) -> None:
-        for attempt in range(self.cfg.repair_attempts + 1):
-            try:
-                plan = parse_model_plan(
-                    answer, self._next_id(),
-                    max_subgoals=self.cfg.max_subgoals,
-                )
-                # Whatever I can fix without asking the model is fixed first,
-                # before validation. Running the checks on a plan I am about to
-                # change reports problems that are no longer there, and every
-                # one of them costs a repair round with the robot standing
-                # still. Trimming afterwards meant the premature-return_to_base
-                # cut — the rule I added for that — never got the chance: the
-                # plan was already rejected by the time _trim saw it.
-                self._trim(plan, budget)
-                problems = check_plan(
-                    plan, self.link.expensive_ground(),
-                    min_battery=budget.get('search_budget'),
-                    samples_remaining=self.link.remaining_samples(),
-                    signal_high=self.link.signal(),
-                    sensor_noise=self.link.noise(),
-                    pose=self.link.pose(),
-                    battery=budget.get('battery'),
-                    hits=self.recent_hits(),
-                    plan_history=self.plan_history,
-                    blocked_points=self.blocked_points(),
-                )
-                if problems:
-                    # Well-formed but unusable: a point on a pillar, the same
-                    # spot twice, a search with no collect. The model can fix
-                    # all of these in one go if it is told about all of them.
-                    raise PlanRejected('; '.join(problems))
-            except PlanRejected as reason:
-                self.rejections.append(str(reason))
-                # To the log as well as the journal: a rejected plan is the
-                # one thing that needs watching during a live run, and the
-                # journal only reaches the dashboard.
-                self.link.log.warn(f'план отклонён: {reason}')
-                self.link.journal(
-                    'result',
-                    f'План отклонён проверкой: {reason}',
-                    status='rejected',
-                    source='llm_planner',
-                )
-                if attempt >= self.cfg.repair_attempts:
-                    # Out of repairs, but the endpoint is alive: the model
-                    # answered, it just answered badly. Rather than wait for
-                    # another answer — the robot may be standing in the way of
-                    # its own goal — send a plan of our own and move.
-                    self.feedback = f'Прошлый план отклонён: {reason}. Исправь.'
-                    escape = self.escape_plan('сам выбраться из застревания')
-                    if escape is not None:
-                        self._publish(escape, source='escape')
-                        return
-                    self.last_plan_at = self.link.now()
-                    return
-                try:
-                    answer = self.client.complete_json(
-                        self.system_prompt,
-                        f'{prompt}\n\nТвой прошлый ответ отклонён: {reason}\n'
-                        'Исправь и верни полный JSON заново.',
-                        tag='repair',
-                        response_format=self.response_format,
-                    )
-                except LLMUnavailable as error:
-                    if error.reason == 'rate_limited':
-                        return
-                    self.failures += 1
-                    if self.failures >= self.cfg.handover_after_failures:
-                        self._go_autonomous(
-                            f'модель не ответила на исправление {self.failures} '
-                            'раз подряд')
-                    return
-                self.failures = 0
-                continue
-
-            self._publish(plan, source='llm')
+                       budget: dict[str, float], attempt: int = 0) -> None:
+        """Check one answer and publish it, or hand it to the repair round."""
+        try:
+            plan = parse_model_plan(
+                answer, self._next_id(),
+                max_subgoals=self.cfg.max_subgoals,
+            )
+            # Whatever I can fix without asking the model is fixed first,
+            # before validation. Running the checks on a plan I am about to
+            # change reports problems that are no longer there, and every
+            # one of them costs a repair round with the robot standing
+            # still. Trimming afterwards meant the premature-return_to_base
+            # cut — the rule I added for that — never got the chance: the
+            # plan was already rejected by the time _trim saw it.
+            self._trim(plan, budget)
+            problems = check_plan(
+                plan, self.link.expensive_ground(),
+                min_battery=budget.get('search_budget'),
+                samples_remaining=self.link.remaining_samples(),
+                signal_high=self.link.signal(),
+                sensor_noise=self.link.noise(),
+                pose=self.link.pose(),
+                battery=budget.get('battery'),
+                hits=self.recent_hits(),
+                plan_history=self.plan_history,
+                blocked_points=self.blocked_points(),
+            )
+            if problems:
+                # Well-formed but unusable: a point on a pillar, the same
+                # spot twice, a search with no collect. The model can fix
+                # all of these in one go if it is told about all of them.
+                raise PlanRejected('; '.join(problems))
+        except PlanRejected as reason:
+            self._reject(reason, prompt, budget, attempt)
             return
+
+        self._publish(plan, source='llm')
+
+    def _reject(self, reason: PlanRejected, prompt: str,
+                budget: dict[str, float], attempt: int) -> None:
+        """Record a rejected answer and ask the model for a better one.
+
+        The repair call runs on its own thread, like the first one: it takes
+        tens of seconds, and blocking the tick with it kept the robot from
+        reacting to a signal, an event or an anomaly for the whole duration.
+        """
+        self.rejections.append(str(reason))
+        # To the log as well as the journal: a rejected plan is the
+        # one thing that needs watching during a live run, and the
+        # journal only reaches the dashboard.
+        self.link.log.warn(f'план отклонён: {reason}')
+        self.link.journal(
+            'result',
+            f'План отклонён проверкой: {reason}',
+            status='rejected',
+            source='llm_planner',
+        )
+        if attempt >= self.cfg.repair_attempts:
+            # Out of repairs, but the endpoint is alive: the model
+            # answered, it just answered badly. Rather than wait for
+            # another answer — the robot may be standing in the way of
+            # its own goal — send a plan of our own and move.
+            self.feedback = f'Прошлый план отклонён: {reason}. Исправь.'
+            escape = self.escape_plan('сам выбраться из застревания')
+            if escape is not None:
+                self._publish(escape, source='escape')
+                return
+            self.last_plan_at = self.link.now()
+            return
+        self._repair(reason, prompt, budget, attempt + 1)
+
+    def _repair(self, reason: PlanRejected, prompt: str,
+                budget: dict[str, float], attempt: int) -> None:
+        """Ask the model to rewrite a rejected plan, without blocking the tick."""
+        self.busy = True
+        self.busy_since = self.link.now()
+
+        def work() -> None:
+            try:
+                answer = self.client.complete_json(
+                    self.system_prompt,
+                    f'{prompt}\n\nТвой прошлый ответ отклонён: {reason}\n'
+                    'Исправь и верни полный JSON заново.',
+                    tag='repair',
+                    response_format=self.response_format,
+                )
+                self.pending = ('repair', answer, prompt, budget, attempt)
+            except LLMUnavailable as error:
+                self.pending = ('error', error, prompt, budget, attempt)
+            except Exception as error:  # noqa: BLE001 - a thread must not die
+                self.pending = ('error', LLMUnavailable(str(error)),
+                                prompt, budget, attempt)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _trim(self, plan: Plan, budget: dict[str, float]) -> None:
         """Make the plan executable, then cut it down to a workable size.
@@ -1018,8 +1040,26 @@ class Planner:
         """
         if self.pending_skill is not None:
             # The robot has already been stopped for this skill and is waiting
-            # for the model. Nothing else to do here; the question below cannot
-            # be asked again while this one is outstanding.
+            # for the model's answer, which is the point. But waiting is only
+            # right while something is actually on its way: on a `hard` run a
+            # call went out at t=249 and never came back, and the robot stood at
+            # (-0.90; 0.61) for 94 seconds with two samples still on the floor.
+            # The call had a three-minute timeout against a measured median
+            # response of 3.2 s, so nothing else would have noticed.
+            if (self.link.now() - self.last_skill_at > SKILL_WATCHDOG_SEC
+                    and not self.busy and self.pending is None):
+                skill, _why = self.pending_skill
+                self.link.log.warn(
+                    f'модель не ответила на скил «{skill}» за '
+                    f'{SKILL_WATCHDOG_SEC:.0f} с — отвечаю сам, робот стоял')
+                self.pending_skill = None
+                escape = self.escape_plan('скил без ответа модели')
+                if escape is not None:
+                    self._publish(escape, source='skill-watchdog')
+                else:
+                    # Nothing around the robot is clear: standing still is the
+                    # lesser evil here, and the next tick can try again.
+                    self.link.log.warn('скил без ответа модели: выхода нет, жду')
             return False
         margin = signal_margin(self.link.signal(), self.link.noise())
         band, is_new = self._signal_skill(margin)

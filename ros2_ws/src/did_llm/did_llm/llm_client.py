@@ -54,7 +54,12 @@ class LLMConfig:
     base_url: str = ''
     api_key: str = ''
     model: str = ''
-    timeout_sec: float = 180.0
+    #: How long to wait for one answer. Measured on this endpoint the median
+    #: response is 3.2 s and the slowest seen was 5.7 s, so a long timeout buys
+    #: nothing and costs the whole episode when a call hangs: a planner that
+    #: stops the robot and then waits three minutes for the answer stood still
+    #: for 94 seconds on a `hard` run before anything noticed.
+    timeout_sec: float = 45.0
     max_retries: int = 2
     temperature: float = 0.2
     #: Reasoning effort. The endpoint's DeepSeek is a reasoning model: left
@@ -84,7 +89,7 @@ class LLMConfig:
             base_url=os.environ.get(f'{prefix}BASE_URL', ''),
             api_key=os.environ.get(f'{prefix}API_KEY', ''),
             model=os.environ.get(f'{prefix}MODEL', ''),
-            timeout_sec=float(os.environ.get(f'{prefix}TIMEOUT', '180')),
+            timeout_sec=float(os.environ.get(f'{prefix}TIMEOUT', '45')),
             min_interval_sec=float(os.environ.get(f'{prefix}MIN_INTERVAL', '4')),
             max_calls_per_minute=int(os.environ.get(f'{prefix}RPM', '12')),
         )
