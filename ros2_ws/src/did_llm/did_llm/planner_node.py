@@ -1571,6 +1571,12 @@ class Planner:
         subgoal = self._current_subgoal()
         if subgoal is not None and subgoal.type not in ('goto', 'search_around'):
             return False
+        # Early interruption: if the robot is driving to a goto point and the
+        # signal says a sample is near, stop and search here. The robot used
+        # to drive past samples because the interruption only fired when the
+        # signal was already very strong.
+        if subgoal is not None and subgoal.type == 'goto' and margin >= SIGNAL_NEAR:
+            return True
         # A subgoal of None means nothing of ours is running: the last plan has
         # ended and the robot is standing still. It used to mean "nothing to
         # interrupt", which left the robot idle for the whole 30 s replan
