@@ -93,6 +93,8 @@ class JudgeModel:
         self.environment_log: list[dict[str, Any]] = []
 
         self._last_odom: tuple[float, float] | None = None
+        self._external_world_pose_required = False
+        self._world_pose_valid = False
         self._inside_hazards: set[str] = set()
         self._last_collision_time = -float('inf')
         self._random = random.Random(scenario.seed)
@@ -147,29 +149,77 @@ class JudgeModel:
         return value
 
     def update_odometry(self, odom_x: float, odom_y: float) -> list[dict[str, Any]]:
-        """Update position and charge from odometry anchored at the start pose.
+        """Update travelled distance and charge from wheel odometry.
 
-        Returns the penalty events produced by this step.
+        A live judge supplies the physical robot position separately through
+        :meth:`update_world_pose`.  Until that first world pose arrives, the
+        odometry offset is also used as a legacy position source so callers of
+        the ROS-independent model keep their previous behaviour.
+
+        In external-world-pose mode this method never overwrites
+        :attr:`world_x` or :attr:`world_y`; odometry drift therefore cannot
+        affect the sample sensor, collection, hazards or the base check.
         """
         events: list[dict[str, Any]] = []
-        new_x = self.base_x + odom_x
-        new_y = self.base_y + odom_y
+        if self._external_world_pose_required and not self._world_pose_valid:
+            # A queued odometry sample from the removed Burger may arrive while
+            # a replacement is spawning.  Keep only the latest baseline and do
+            # not charge a discontinuity before its physical pose is known.
+            self._last_odom = (odom_x, odom_y)
+            return events
         if self._last_odom is not None:
             step = hypot(odom_x - self._last_odom[0], odom_y - self._last_odom[1])
-            middle = ((self.world_x + new_x) / 2.0, (self.world_y + new_y) / 2.0)
+            if self._external_world_pose_required:
+                # The distance comes from wheel odometry, while terrain is a
+                # property of the physical point occupied by the robot.
+                terrain_x, terrain_y = self.world_x, self.world_y
+            else:
+                new_x = self.base_x + odom_x
+                new_y = self.base_y + odom_y
+                terrain_x = (self.world_x + new_x) / 2.0
+                terrain_y = (self.world_y + new_y) / 2.0
             self.distance_travelled += step
             self.battery = max(
                 0.0,
                 self.battery
                 - step
                 * self.scenario.battery_cost_per_meter
-                * self.terrain_multiplier(*middle),
+                * self.terrain_multiplier(terrain_x, terrain_y),
             )
         self._last_odom = (odom_x, odom_y)
-        self.world_x = new_x
-        self.world_y = new_y
-        events.extend(self._check_hazards())
+        if not self._external_world_pose_required:
+            self.world_x = self.base_x + odom_x
+            self.world_y = self.base_y + odom_y
+            events.extend(self._check_hazards())
         return events
+
+    @property
+    def world_pose_valid(self) -> bool:
+        """Whether spatial rules have a valid position source."""
+        return not self._external_world_pose_required or self._world_pose_valid
+
+    def require_external_world_pose(self) -> None:
+        """Make wheel odometry distance-only until a physical pose arrives."""
+        self._external_world_pose_required = True
+        self._world_pose_valid = False
+
+    def update_world_pose(self, world_x: float, world_y: float) -> list[dict[str, Any]]:
+        """Update the physical Gazebo position used for all spatial rules.
+
+        The first call permanently switches the model away from the legacy
+        odometry-derived position.  Returns any hazard-entry events caused by
+        the new physical pose.
+        """
+        first_required_pose = self._external_world_pose_required and not self._world_pose_valid
+        self._external_world_pose_required = True
+        self._world_pose_valid = True
+        if first_required_pose:
+            # Start distance accounting from the first odometry frame that
+            # follows this physical model, not from a queued predecessor.
+            self._last_odom = None
+        self.world_x = world_x
+        self.world_y = world_y
+        return self._check_hazards()
 
     def _check_hazards(self) -> list[dict[str, Any]]:
         events = []

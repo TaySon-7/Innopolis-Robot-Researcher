@@ -332,13 +332,13 @@ function App() {
   const visibleSamples = useMemo(() => {
     if (mapMode !== 'truth') return snapshot.samples.filter((sample) => sample.collected)
     if (!agentTruth?.samples?.length) return snapshot.samples
-    return agentTruth.samples.map((sample) => ({
-      ...sample,
-      collected: agentSnapshot.collected_at.some(
-        ([x, y]) => Math.hypot(x - sample.x, y - sample.y) < 0.45,
-      ),
-    }))
-  }, [agentSnapshot.collected_at, agentTruth, mapMode, snapshot.samples])
+    return agentTruth.samples.map((sample) => {
+      const judged = snapshot.samples.find(
+        (item) => Math.hypot(item.x - sample.x, item.y - sample.y) < 0.01,
+      )
+      return { ...sample, collected: judged?.collected ?? false }
+    })
+  }, [agentTruth, mapMode, snapshot.samples])
   const scanReturns = snapshot.scan
     ? snapshot.scan.ranges.reduce(
         (count, range) =>

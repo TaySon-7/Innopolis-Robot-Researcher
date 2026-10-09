@@ -73,23 +73,6 @@ def generate_launch_description():
                 '/world/default/create/blocking@ros_gz_interfaces/srv/SpawnEntity',
             ],
         ),
-        # Wheel odometry drifts when Burger slips or touches an obstacle.  The
-        # lidar, however, scans from the physical Gazebo pose.  Bridge that
-        # pose with its simulation timestamp so the dashboard can render the
-        # scan in the same world frame as the arena.
-        Node(
-            package='ros_gz_bridge',
-            executable='parameter_bridge',
-            name='gazebo_pose_bridge',
-            output='screen',
-            arguments=[
-                '/world/default/dynamic_pose/info@'
-                'geometry_msgs/msg/PoseArray[gz.msgs.Pose_V',
-            ],
-            remappings=[
-                ('/world/default/dynamic_pose/info', '/gazebo/dynamic_pose'),
-            ],
-        ),
         Node(package='did_agent', executable='agent', name='agent', output='screen'),
         Node(package='did_agent', executable='dashboard', name='dashboard', output='screen'),
         Node(

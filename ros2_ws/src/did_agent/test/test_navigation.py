@@ -1,6 +1,8 @@
 from math import hypot
 from pathlib import Path
+from types import SimpleNamespace
 
+from geometry_msgs.msg import PoseStamped
 import pytest
 
 from did_agent.costmap import CostMap
@@ -11,10 +13,56 @@ from did_agent.kinematic_sim import drive
 from did_agent.navigator_core import DONE
 from did_agent.navigator_core import FAILED
 from did_agent.navigator_core import NavigatorCore
+from did_agent.nav_node import Navigator
+from did_agent.nav_node import pose_from_world_message
+from did_agent.nav_node import world_pose_fresh
 from did_agent.planner import plan_cells
 from did_agent.planner import plan_waypoints
 
 GOALS = [(-0.55, -0.55), (0.55, 0.55), (1.7, -0.5), (0.0, 1.9), (0.9, -1.7)]
+
+
+def test_navigation_pose_is_the_physical_world_pose_without_odom_offset():
+    message = PoseStamped()
+    message.pose.position.x = 0.75
+    message.pose.position.y = -1.25
+    message.pose.orientation.z = 0.0
+    message.pose.orientation.w = 1.0
+
+    pose = pose_from_world_message(message)
+
+    assert (pose.x, pose.y, pose.yaw) == pytest.approx((0.75, -1.25, 0.0))
+
+
+def test_robot_reset_discards_the_previous_world_pose_and_scan():
+    inputs = SimpleNamespace(world_pose=object(), scan=object())
+
+    Navigator.clear_world_pose(inputs)
+
+    assert inputs.world_pose is None
+    assert inputs.scan is None
+
+
+def test_navigation_rejects_a_stale_or_implausibly_future_world_pose():
+    message = PoseStamped()
+    message.header.stamp.sec = 10
+
+    assert world_pose_fresh(message, 10.75)
+    assert not world_pose_fresh(message, 10.751)
+    assert not world_pose_fresh(message, 9.899)
+
+
+def test_navigation_callback_does_not_store_an_invalid_world_pose():
+    stale = PoseStamped()
+    stale.header.stamp.sec = 10
+    inputs = SimpleNamespace(world_pose=None, now=lambda: 10.751)
+
+    assert not Navigator._on_world_pose(inputs, stale)
+    assert inputs.world_pose is None
+
+    inputs.now = lambda: 10.75
+    assert Navigator._on_world_pose(inputs, stale)
+    assert inputs.world_pose is stale
 
 
 @pytest.fixture(scope='module')

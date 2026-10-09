@@ -10,8 +10,8 @@ import sys
 import time
 
 import numpy as np
+from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import TwistStamped
-from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -30,6 +30,29 @@ from did_agent.navigator_core import Scan
 BASE_X = -2.0
 BASE_Y = -0.5
 LOOP_PERIOD = 0.05
+WORLD_POSE_TIMEOUT = 0.75
+WORLD_POSE_FUTURE_TOLERANCE = 0.1
+
+
+def world_pose_fresh(
+    message: PoseStamped | None,
+    now: float,
+    timeout: float = WORLD_POSE_TIMEOUT,
+) -> bool:
+    """Return whether ``message`` is recent enough for safe motion."""
+    if message is None:
+        return False
+    stamp = message.header.stamp.sec + message.header.stamp.nanosec * 1e-9
+    age = now - stamp
+    return -WORLD_POSE_FUTURE_TOLERANCE <= age <= timeout
+
+
+def pose_from_world_message(message: PoseStamped) -> Pose:
+    """Convert the normalized physical world pose to the navigation type."""
+    position = message.pose.position
+    q = message.pose.orientation
+    yaw = atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+    return Pose(position.x, position.y, yaw)
 
 
 class Navigator(Node):
@@ -46,10 +69,10 @@ class Navigator(Node):
         self.base_y = float(self.get_parameter('base_y').value)
         self.costmap = CostMap()
         self.core = NavigatorCore(self.costmap)
-        self.odom: Odometry | None = None
+        self.world_pose: PoseStamped | None = None
         self.scan: Scan | None = None
         self._velocity = self.create_publisher(TwistStamped, '/cmd_vel', 10)
-        self.create_subscription(Odometry, '/odom', self._on_odom, 10)
+        self.create_subscription(PoseStamped, '/did/world_pose', self._on_world_pose, 10)
         self.create_subscription(
             LaserScan,
             '/scan',
@@ -57,8 +80,16 @@ class Navigator(Node):
             qos_profile_sensor_data,
         )
 
-    def _on_odom(self, message: Odometry) -> None:
-        self.odom = message
+    def _on_world_pose(self, message: PoseStamped) -> bool:
+        if not world_pose_fresh(message, self.now()):
+            return False
+        self.world_pose = message
+        return True
+
+    def clear_world_pose(self) -> None:
+        """Discard a pose belonging to the previous Burger instance."""
+        self.world_pose = None
+        self.scan = None
 
     def _on_scan(self, message: LaserScan) -> None:
         self.scan = Scan(
@@ -73,13 +104,10 @@ class Navigator(Node):
         return self.get_clock().now().nanoseconds * 1e-9
 
     def pose(self) -> Pose | None:
-        """Return the robot pose in world coordinates (start pose + odometry)."""
-        if self.odom is None:
+        """Return Burger's physical Gazebo pose in world coordinates."""
+        if not world_pose_fresh(self.world_pose, self.now()):
             return None
-        position = self.odom.pose.pose.position
-        q = self.odom.pose.pose.orientation
-        yaw = atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-        return Pose(self.base_x + position.x, self.base_y + position.y, yaw)
+        return pose_from_world_message(self.world_pose)
 
     def publish(self, command: Command) -> None:
         """Publish a velocity command."""
@@ -99,10 +127,10 @@ class Navigator(Node):
 
     def ready(self) -> bool:
         """Return whether all the inputs this node needs have arrived."""
-        return self.odom is not None and self.scan is not None
+        return world_pose_fresh(self.world_pose, self.now()) and self.scan is not None
 
     def wait_for_sensors(self, timeout: float = 60.0) -> bool:
-        """Spin until odometry and a scan have arrived."""
+        """Spin until the physical world pose and a scan have arrived."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.ready():
@@ -119,23 +147,36 @@ class Navigator(Node):
     ) -> dict[str, object]:
         """Drive to a world point; block until done, failed or timed out."""
         if not self.wait_for_sensors():
-            return {'status': FAILED, 'reason': 'no odometry or scan'}
+            self.stop()
+            return {'status': FAILED, 'reason': 'no physical world pose or scan'}
         pose = self.pose()
+        if pose is None:
+            self.stop()
+            return {'status': FAILED, 'reason': 'physical world pose unavailable'}
         if not self.core.set_goal((x, y), pose, self.now()):
+            self.stop()
             return self._result(pose)
         started = self.now()
         next_guard = started + 1.0
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=LOOP_PERIOD)
-            pose = self.pose()
-            command = self.core.update(pose, self.scan, self.now())
-            self.publish(command)
-            if self.core.status in (DONE, FAILED):
-                break
+            # A reset/stop may run in spin_once. Never publish another movement
+            # before honoring it, and retain the last valid pose for the result.
             if self.preempted():
                 self.core.cancel()
                 self.stop()
                 return {**self._result(pose), 'status': FAILED, 'reason': 'preempted'}
+            current_pose = self.pose()
+            if current_pose is None:
+                self.core.cancel()
+                self.stop()
+                return {**self._result(pose), 'status': FAILED,
+                        'reason': 'physical world pose unavailable'}
+            pose = current_pose
+            command = self.core.update(pose, self.scan, self.now())
+            self.publish(command)
+            if self.core.status in (DONE, FAILED):
+                break
             if guard is not None and self.now() >= next_guard:
                 next_guard = self.now() + 1.0
                 if guard():

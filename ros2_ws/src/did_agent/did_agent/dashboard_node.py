@@ -10,7 +10,7 @@ from time import monotonic
 from time import sleep
 import json
 
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped
 import rclpy
 from rclpy.node import Node
 from ros_gz_interfaces.srv import DeleteEntity
@@ -81,7 +81,7 @@ class DashboardNode(Node):
         if geometry.get('source') != 'gazebo_scene':
             self._geometry_timer = self.create_timer(2.0, self._refresh_geometry)
 
-        self.create_subscription(Odometry, '/odom', self._on_odom, 10)
+        self.create_subscription(PoseStamped, '/did/world_pose', self._on_world_pose, 10)
         self._json_topic('/agent/state', self.data.on_state)
         self._json_topic('/agent/status', self.data.on_status)
         self._json_topic('/agent/costmap', self.data.on_costmap)
@@ -109,11 +109,11 @@ class DashboardNode(Node):
                 pass
         self.create_subscription(String, topic, callback, depth)
 
-    def _on_odom(self, message: Odometry) -> None:
-        position = message.pose.pose.position
-        q = message.pose.pose.orientation
+    def _on_world_pose(self, message: PoseStamped) -> None:
+        position = message.pose.position
+        q = message.pose.orientation
         yaw = atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
-        self.data.on_pose(self.data.base[0] + position.x, self.data.base[1] + position.y, yaw)
+        self.data.on_pose(position.x, position.y, yaw)
 
     def _on_score(self, score: dict) -> None:
         self.data.on_score(score)

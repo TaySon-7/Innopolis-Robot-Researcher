@@ -85,9 +85,12 @@ class AgentNode(Navigator):
 
     # --- callbacks ---------------------------------------------------------------------
 
-    def _on_odom(self, message) -> None:
-        super()._on_odom(message)
+    def _on_world_pose(self, message) -> None:
+        if not super()._on_world_pose(message):
+            return
         pose = self.pose()
+        if pose is None:
+            return
         segment = self.adaptation.on_pose(self.now(), pose.x, pose.y)
         if segment is not None:
             self._telemetry_pub.publish(String(data=json.dumps(segment)))
@@ -169,6 +172,9 @@ class AgentNode(Navigator):
 
     def _reset_for_scenario(self, name: str) -> None:
         """Forget knowledge from the previous episode after execution has stopped."""
+        # Keep the last valid pose until the interrupted skill has unwound.
+        # Its terminal status and return-budget checks may still read it.
+        self.clear_world_pose()
         self._episode_id += 1
         self.costmap = CostMap()
         self.core = NavigatorCore(self.costmap)

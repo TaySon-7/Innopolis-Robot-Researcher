@@ -23,7 +23,7 @@ function angleDelta(from: number, to: number): number {
   return Math.atan2(Math.sin(to - from), Math.cos(to - from))
 }
 
-/** Keep a short, ordered odometry history and discard it on a ROS clock reset. */
+/** Keep a short, ordered world-pose history and discard it on a ROS clock reset. */
 export function appendTimedPose(
   history: TimedLidarPose[],
   sample: TimedLidarPose,
@@ -44,7 +44,7 @@ export function appendTimedPose(
   return next.filter((item) => item.stamp >= newest - maxAgeSeconds).slice(-160)
 }
 
-/** Pose at the scan timestamp. Null means a newer odometry sample is still needed. */
+/** Pose at the scan timestamp. Null means a newer world-pose sample is still needed. */
 export function interpolateTimedPose(
   history: TimedLidarPose[],
   stamp: number,
@@ -80,21 +80,14 @@ export function interpolateTimedPose(
 }
 
 /**
- * Resolve a scan against Gazebo ground truth when it is available.
- *
- * Once the world-pose stream has started, do not silently fall back to wheel
- * odometry while waiting for its next sample: the two frames can differ after
- * slip, and mixing them is what makes one scan jump across the arena.
+ * Resolve a scan only against the normalized physical Gazebo world pose.
+ * Wheel odometry is deliberately not accepted as a spatial fallback.
  */
 export function synchronizedLidarPose(
   worldHistory: TimedLidarPose[],
-  odometryHistory: TimedLidarPose[],
   stamp: number,
 ): LidarPose | null {
-  return interpolateTimedPose(
-    worldHistory.length ? worldHistory : odometryHistory,
-    stamp,
-  )
+  return interpolateTimedPose(worldHistory, stamp)
 }
 
 export function lidarOrigin(pose: LidarPose, xOffset: number): LidarPose {

@@ -117,10 +117,14 @@ function messageStamp(message: JsonObject): number | null {
   return Number.isFinite(value) ? value : null
 }
 
-function eventText(data: JsonObject): string {
+function angleDelta(from: number, to: number): number {
+  return Math.atan2(Math.sin(to - from), Math.cos(to - from))
+}
+
+function eventText(data: JsonObject, samplesTotal: number): string {
   switch (data.event) {
     case 'sample_collected':
-      return `Образец собран · ${number(data.collected)} из 3`
+      return `Образец собран · ${number(data.collected)} из ${samplesTotal}`
     case 'false_collect':
       return 'Рядом нет образца: подведите робота ближе'
     case 'scenario_selected':
@@ -138,8 +142,7 @@ class RosbridgeClient {
   private reconnectAttempt = 0
   private stopped = false
   private sequence = 0
-  private odometryHistory: TimedLidarPose[] = []
-  private gazeboPoseHistory: TimedLidarPose[] = []
+  private worldPoseHistory: TimedLidarPose[] = []
   private pendingScan: PendingScan | null = null
   private serviceCalls = new Map<
     string,
@@ -265,8 +268,7 @@ class RosbridgeClient {
 
   private addSubscriptions(): void {
     const subscriptions = [
-      ['/odom', 'nav_msgs/msg/Odometry', 50],
-      ['/gazebo/dynamic_pose', 'geometry_msgs/msg/PoseArray', 20],
+      ['/did/world_pose', 'geometry_msgs/msg/PoseStamped', 20],
       ['/scan', 'sensor_msgs/msg/LaserScan', 100],
       ['/did/battery', 'std_msgs/msg/Float32', 100],
       ['/did/sample_sensor', 'std_msgs/msg/Float32', 100],
@@ -305,11 +307,8 @@ class RosbridgeClient {
     const message = object(data.msg)
 
     switch (data.topic) {
-      case '/odom':
-        this.handleOdometry(message)
-        break
-      case '/gazebo/dynamic_pose':
-        this.handleGazeboPose(message)
+      case '/did/world_pose':
+        this.handleWorldPose(message)
         break
       case '/scan':
         this.handleScan(message)
@@ -330,8 +329,7 @@ class RosbridgeClient {
         const clock = object(message.clock)
         const simTimeSeconds = number(clock.sec) + number(clock.nanosec) / 1e9
         if (rosClockReset(this.snapshot.simTimeSeconds ?? undefined, simTimeSeconds)) {
-          this.odometryHistory = []
-          this.gazeboPoseHistory = []
+          this.worldPoseHistory = []
           this.pendingScan = null
           this.setSnapshot({
             ...this.snapshot,
@@ -353,62 +351,10 @@ class RosbridgeClient {
     }
   }
 
-  private handleOdometry(message: JsonObject): void {
-    const poseRoot = object(object(message.pose).pose)
+  private handleWorldPose(message: JsonObject): void {
+    const poseRoot = object(message.pose)
     const position = object(poseRoot.position)
     const orientation = object(poseRoot.orientation)
-    const twist = object(object(message.twist).twist)
-    const linear = object(twist.linear)
-    const angular = object(twist.angular)
-    const qx = number(orientation.x)
-    const qy = number(orientation.y)
-    const qz = number(orientation.z)
-    const qw = number(orientation.w, 1)
-    const yaw = quaternionYaw(qx, qy, qz, qw)
-    const pose = {
-      x: BASE.x + number(position.x),
-      y: BASE.y + number(position.y),
-      yaw,
-    }
-    const stamp = messageStamp(message)
-    if (stamp !== null) {
-      const previousStamp = this.odometryHistory.at(-1)?.stamp
-      if (rosClockReset(previousStamp, stamp)) {
-        this.pendingScan = null
-      }
-      this.odometryHistory = appendTimedPose(this.odometryHistory, { ...pose, stamp })
-    }
-    // Before the Gazebo pose bridge answers, odometry is a useful startup
-    // fallback. Once ground truth is present, it owns pose and trail: wheel
-    // odometry can drift while the physical lidar remains attached to Burger.
-    const useOdometryPose = this.gazeboPoseHistory.length === 0
-    const previous = this.snapshot.trail.at(-1)
-    const moved = useOdometryPose && (
-      !previous || Math.hypot(pose.x - previous.x, pose.y - previous.y) >= 0.025
-    )
-    const trail = moved
-      ? [...this.snapshot.trail, { x: pose.x, y: pose.y }].slice(-500)
-      : this.snapshot.trail
-
-    this.setSnapshot({
-      ...this.snapshot,
-      pose: useOdometryPose ? pose : this.snapshot.pose,
-      trail,
-      linearVelocity: number(linear.x),
-      angularVelocity: number(angular.z),
-    })
-    this.flushPendingScan()
-  }
-
-  private handleGazeboPose(message: JsonObject): void {
-    const poses = Array.isArray(message.poses) ? message.poses : []
-    if (!poses.length) return
-
-    // The dynamic pose tree is rooted at the only dynamic model in this
-    // world: Burger. Its following entries are link poses relative to it.
-    const model = object(poses[0])
-    const position = object(model.position)
-    const orientation = object(model.orientation)
     const pose = {
       x: number(position.x),
       y: number(position.y),
@@ -422,12 +368,22 @@ class RosbridgeClient {
     const stamp = messageStamp(message)
     if (stamp === null) return
 
-    const previousStamp = this.gazeboPoseHistory.at(-1)?.stamp
+    const previousTimed = this.worldPoseHistory.at(-1)
+    const previousStamp = previousTimed?.stamp
     if (rosClockReset(previousStamp, stamp)) this.pendingScan = null
-    this.gazeboPoseHistory = appendTimedPose(
-      this.gazeboPoseHistory,
+    this.worldPoseHistory = appendTimedPose(
+      this.worldPoseHistory,
       { ...pose, stamp },
     )
+
+    const elapsed = previousTimed ? stamp - previousTimed.stamp : 0
+    const velocitySampleValid = elapsed > 1e-3 && elapsed < 0.5
+    const linearVelocity = velocitySampleValid
+      ? Math.hypot(pose.x - previousTimed!.x, pose.y - previousTimed!.y) / elapsed
+      : 0
+    const angularVelocity = velocitySampleValid
+      ? angleDelta(previousTimed!.yaw, pose.yaw) / elapsed
+      : 0
 
     const previous = this.snapshot.trail.at(-1)
     const moved =
@@ -435,7 +391,13 @@ class RosbridgeClient {
     const trail = moved
       ? [...this.snapshot.trail, { x: pose.x, y: pose.y }].slice(-500)
       : this.snapshot.trail
-    this.setSnapshot({ ...this.snapshot, pose, trail })
+    this.setSnapshot({
+      ...this.snapshot,
+      pose,
+      trail,
+      linearVelocity,
+      angularVelocity,
+    })
     this.flushPendingScan()
   }
 
@@ -461,12 +423,8 @@ class RosbridgeClient {
 
   private publishSynchronizedScan(scan: PendingScan): boolean {
     const pose = scan.stamp === null
-      ? this.snapshot.pose
-      : synchronizedLidarPose(
-          this.gazeboPoseHistory,
-          this.odometryHistory,
-          scan.stamp,
-        )
+      ? null
+      : synchronizedLidarPose(this.worldPoseHistory, scan.stamp)
     if (!pose) return false
     const measurement = {
       angleMin: scan.angleMin,
@@ -523,8 +481,7 @@ class RosbridgeClient {
     try {
       const event = object(JSON.parse(message.data))
       if (event.event === 'scenario_selected') {
-        this.odometryHistory = []
-        this.gazeboPoseHistory = []
+        this.worldPoseHistory = []
         this.pendingScan = null
         this.setSnapshot({
           ...this.snapshot,
@@ -533,13 +490,13 @@ class RosbridgeClient {
           angularVelocity: 0,
           scan: null,
           trail: [{ x: BASE.x, y: BASE.y }],
-          lastEvent: eventText(event),
+          lastEvent: eventText(event, this.snapshot.score.samplesTotal),
         })
         return
       }
       this.setSnapshot({
         ...this.snapshot,
-        lastEvent: eventText(event),
+        lastEvent: eventText(event, this.snapshot.score.samplesTotal),
       })
     } catch {
       this.setSnapshot({ ...this.snapshot, lastEvent: message.data })

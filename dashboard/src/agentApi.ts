@@ -71,6 +71,10 @@ export interface AgentScore {
   hazard_hits?: number
   score?: number
   finished?: boolean
+  world_pose?: { x?: number; y?: number }
+  world_pose_valid?: boolean
+  pose_source?: 'gazebo' | 'unavailable' | string
+  samples?: Array<{ x: number; y: number; collected: boolean }>
 }
 
 export interface AgentPlanSubgoal {
