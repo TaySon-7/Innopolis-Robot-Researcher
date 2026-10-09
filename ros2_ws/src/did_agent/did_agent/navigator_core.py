@@ -242,7 +242,7 @@ class NavigatorCore:
             if not ahead.any() or not usable[ahead].all():
                 return self._fail('lidar scan has missing forward coverage')
             kind, points = self.obstacles_ahead(pose, scan)
-if kind is not None:
+            if kind is not None:
                 # Remember the measured surface even if the static map knows
                 # it: the executed trajectory has exhausted its clearance.
                 # ``now`` lets the block expire: a false positive must not
