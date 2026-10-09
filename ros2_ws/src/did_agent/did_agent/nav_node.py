@@ -30,6 +30,8 @@ from did_agent.navigator_core import Scan
 BASE_X = -2.0
 BASE_Y = -0.5
 LOOP_PERIOD = 0.05
+# hls_lfcd_lds sensor pose in TurtleBot3 Burger's Gazebo model.sdf.
+LIDAR_X_OFFSET = -0.032
 WORLD_POSE_TIMEOUT = 0.75
 WORLD_POSE_FUTURE_TOLERANCE = 0.1
 
@@ -97,6 +99,8 @@ class Navigator(Node):
             angle_increment=message.angle_increment,
             ranges=np.asarray(message.ranges, dtype=float),
             range_min=message.range_min,
+            stamp=message.header.stamp.sec + message.header.stamp.nanosec * 1e-9,
+            x_offset=LIDAR_X_OFFSET,
         )
 
     def now(self) -> float:
