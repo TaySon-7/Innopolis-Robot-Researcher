@@ -350,7 +350,15 @@ SIGNAL_CLOSE = 0.6
 #: 0.7, which is 0.45 m — so a plan that searches and then collects walks the
 #: robot around the sample and hands it a ``false_collect`` instead. Above this
 #: reading the only useful action is to collect where it stands.
-SIGNAL_TAKE = 0.8
+#: Reading above which a collect is issued on its own.
+#:
+#: The collect radius is 0.30 m and the sensor reads ``1 - d/1.5``, so a reading
+#: of exactly 0.80 means a sample 0.300 m away: the boundary, with no room at
+#: all. Anything the robot does between the reading and the collect — and the
+#: collect service does not stop the robot first — spends that room. This is
+#: 0.815, which is 0.278 m and leaves two centimetres; the previous 0.80 cost two
+#: missed collects in one medium run.
+SIGNAL_TAKE = 0.815
 
 #: Compatibility name used by the prompt: both values describe the judge's
 #: exact 0.30 m collection boundary.

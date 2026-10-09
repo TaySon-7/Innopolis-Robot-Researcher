@@ -1793,8 +1793,21 @@ class Planner:
         # far, so the spiral would walk away from a sample the robot could have
         # taken standing still.
         if margin >= SIGNAL_TAKE:
-            subgoals = [Subgoal(type='collect')]
-            why = 'сигнал выше 0.80 — образец в пределах сбора, беру сразу'
+            # Routed through the same stop-and-ask as a threshold crossing,
+            # rather than publishing a bare collect here. The agent's collect
+            # calls the service without stopping first, so a bare collect issued
+            # from this path runs while the robot is still driving — it preempts
+            # a running plan rather than replacing a stopped one. On the last
+            # medium run that cost two misses in 485 seconds, both reported as
+            # "no sample within 0.30 m": the reading had said the sample was in
+            # range and the robot had moved a few centimetres in the seconds
+            # before the collect landed.
+            self.pending_skill = None
+            self._skill_band = 'take'
+            return self._ask_model_for_skill(
+                'take',
+                f'сигнал {signal:.2f} при шуме {(self.link.noise() or 0.0):.2f} '
+                f'(запас {margin:.2f})')
         else:
             radius = wanted
             subgoals = [Subgoal(type='search_around',

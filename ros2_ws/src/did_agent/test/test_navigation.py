@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from did_agent.costmap import CostMap
+from did_agent.costmap import OBSTACLE_TTL
 from did_agent.grid import load_map
 from did_agent.kinematic_sim import BASE
 from did_agent.kinematic_sim import KinematicSim
@@ -11,6 +12,7 @@ from did_agent.kinematic_sim import drive
 from did_agent.navigator_core import DONE
 from did_agent.navigator_core import FAILED
 from did_agent.navigator_core import NavigatorCore
+from did_agent.navigator_core import RUNNING
 from did_agent.planner import plan_cells
 from did_agent.planner import plan_waypoints
 
@@ -104,6 +106,66 @@ def test_update_reports_changes_and_bumps_version(costmap):
         costmap.update({'blob': 1}, 2.0)
     with pytest.raises(ValueError):
         costmap.update({'circle': {'x': 0, 'y': 0, 'r': 1}}, 0.0)
+
+
+def test_lidar_obstacle_blocks_expire_after_the_ttl(costmap):
+    row, col = costmap.world_to_cell(0.0, -1.5)
+    costmap.add_obstacles([(0.0, -1.5)], now=100.0)
+    assert not costmap.is_free(row, col)
+    version = costmap.version
+
+    assert costmap.expire_dynamic(100.0 + OBSTACLE_TTL - 1.0) == 0
+    assert not costmap.is_free(row, col)
+    assert costmap.version == version  # nothing freed: no re-plan is demanded
+
+    assert costmap.expire_dynamic(100.0 + OBSTACLE_TTL + 1.0) > 0
+    assert costmap.is_free(row, col)
+    assert costmap.version == version + 1  # the freed space triggers a re-plan
+
+
+def test_a_reconfirmed_obstacle_keeps_its_block(costmap):
+    row, col = costmap.world_to_cell(0.0, -1.5)
+    costmap.add_obstacles([(0.0, -1.5)], now=0.0)
+    costmap.add_obstacles([(0.0, -1.5)], now=OBSTACLE_TTL - 5.0)  # the lidar saw it again
+    assert costmap.expire_dynamic(OBSTACLE_TTL) == 0  # the fresh sighting holds it
+    assert not costmap.is_free(row, col)
+    assert costmap.expire_dynamic(OBSTACLE_TTL + 30.0) > 0  # now it is long gone
+    assert costmap.is_free(row, col)
+
+
+def test_hazard_disks_and_untimed_evidence_never_expire(costmap):
+    hazard = costmap.world_to_cell(0.0, -1.5)
+    lidar = costmap.world_to_cell(-2.0, -0.5)
+    assert costmap.is_free(*lidar)  # the cell the robot spawns on
+    costmap.block_disk(0.0, -1.5, 0.5)
+    costmap.add_obstacles([(-2.0, -0.5)])            # no sighting time: kept
+    costmap.add_obstacles([(0.0, -1.5)], now=0.0)    # re-sighting cannot set a deadline on a hazard
+    version = costmap.version
+    assert costmap.expire_dynamic(1e9) == 0
+    assert costmap.version == version
+    assert not costmap.is_free(*hazard)
+    assert not costmap.is_free(*lidar)
+
+
+def test_expire_dynamic_can_be_switched_off(costmap):
+    row, col = costmap.world_to_cell(0.0, -1.5)
+    costmap.add_obstacles([(0.0, -1.5)], now=0.0)
+    assert costmap.expire_dynamic(1e9, ttl=0.0) == 0
+    assert costmap.expire_dynamic(1e9, ttl=-5.0) == 0
+    assert not costmap.is_free(row, col)
+
+
+def test_navigation_forgets_an_obstacle_that_never_came_back(grid, costmap):
+    sim = KinematicSim(grid)
+    nav = NavigatorCore(costmap)
+    row, col = costmap.world_to_cell(0.0, -1.5)
+    costmap.add_obstacles([(0.0, -1.5)], now=0.0)
+    assert nav.set_goal((1.7, -0.5), sim.pose, sim.t)
+    assert not costmap.is_free(row, col)
+
+    nav.update(sim.pose, None, OBSTACLE_TTL + 5.0)  # a tick long after the sighting
+    assert costmap.is_free(row, col)
+    assert nav.status == RUNNING  # freed cells caused a re-plan, not a failure
 
 
 @pytest.mark.parametrize('goal', GOALS)

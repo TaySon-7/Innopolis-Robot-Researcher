@@ -13,10 +13,7 @@ from did_agent.grid import load_map
 
 # How long a lidar-seen obstacle stays blocked without a fresh sighting: a
 # false positive or a moved object must not poison the map forever.
-OBSTACLE_TTL = 60.0
-# A disk blocked because it hurt the robot is knowledge about the world, not a
-# transient reading, so it outlives obstacle evidence by a factor of three.
-HAZARD_TTL = 180.0
+OBSTACLE_TTL = 30.0
 
 
 def _disk_offsets(radius_cells: float) -> list[tuple[int, int, float]]:
@@ -88,9 +85,9 @@ class CostMap:
         self.terrain = np.ones(self.grid.shape, dtype=np.float32)
         self.last_seen = np.full(self.grid.shape, -1e9, dtype=np.float32)  # when evidence last arrived
         self._dynamic = np.zeros(self.grid.shape, dtype=bool)
-        # When the dynamic block on a cell runs out; -inf for "just blocked",
-        # +inf for evidence given without a timestamp (never expires).
-        self._dynamic_until = np.full(self.grid.shape, -np.inf, dtype=np.float32)
+        # When a dynamic block was last confirmed: -inf for an unused cell,
+        # +inf for a block given without an evidence time (never expires).
+        self._dynamic_stamp = np.full(self.grid.shape, -np.inf, dtype=np.float32)
         self.blocked = self.static_blocked.copy()
         self.version = 0
 
@@ -201,23 +198,59 @@ class CostMap:
 
     # --- obstacles seen by the lidar -------------------------------------------
 
-    def add_obstacles(self, points: list[tuple[float, float]], radius: float = 0.03) -> None:
-        """Block the area around world points that the lidar saw as obstacles."""
+    def add_obstacles(
+        self,
+        points: list[tuple[float, float]],
+        radius: float = 0.03,
+        now: float | None = None,
+    ) -> None:
+        """Block the area around world points that the lidar saw as obstacles.
+
+        ``now`` is the sighting time read by :meth:`expire_dynamic`; without it
+        the block is kept until something else clears the cell.
+        """
         offsets = _disk_offsets((radius + self.robot_radius) / self.resolution)
+        stamp = float('inf') if now is None else float(now)
         for x, y in points:
             row, col = self.world_to_cell(x, y)
             for dr, dc, _ in offsets:
                 if self.grid.in_bounds(row + dr, col + dc):
                     self._dynamic[row + dr, col + dc] = True
+                    seen = float(self._dynamic_stamp[row + dr, col + dc])
+                    self._dynamic_stamp[row + dr, col + dc] = max(seen, stamp)
         self.blocked = self.static_blocked | self._dynamic
         self.version += 1
 
     def block_disk(self, x: float, y: float, radius: float) -> None:
-        """Forbid a round area for planning (a place that hurt the robot)."""
+        """Forbid a round area for planning (a place that hurt the robot).
+
+        Hazard knowledge does not expire: the judge never removes a hazard, so
+        neither does the agent's map of one.
+        """
         mask = self.cells_in_region({'circle': {'x': x, 'y': y, 'r': radius}})
         self._dynamic |= mask
+        self._dynamic_stamp[mask] = np.inf
         self.blocked = self.static_blocked | self._dynamic
         self.version += 1
+
+    def expire_dynamic(self, now: float, ttl: float = OBSTACLE_TTL) -> int:
+        """Free lidar blocks that were not re-confirmed for ``ttl`` seconds.
+
+        Blocks stamped without an evidence time (``block_disk``,
+        ``add_obstacles`` without ``now``) never expire, and ``ttl <= 0``
+        switches expiry off entirely.  Bumps the version when cells were freed
+        so the navigator re-plans with the recovered space.  Returns the number
+        of cells freed.
+        """
+        if ttl <= 0.0:
+            return 0
+        stale = self._dynamic & (self._dynamic_stamp < now - ttl)
+        freed = int(np.count_nonzero(stale))
+        if freed:
+            self._dynamic[stale] = False
+            self.blocked = self.static_blocked | self._dynamic
+            self.version += 1
+        return freed
 
     # --- path metrics ---------------------------------------------------------------
 

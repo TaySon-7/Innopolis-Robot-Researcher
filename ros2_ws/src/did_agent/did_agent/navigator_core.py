@@ -63,6 +63,7 @@ class NavigatorCore:
         self.imminent_side = imminent_side
         self._last_imminent_replan = -float('inf')
         self._last_cost_replan = -float('inf')
+        self._last_expiry = -float('inf')
         self.max_replans = max_replans
         self.stuck_window = stuck_window
         self.stuck_progress = stuck_progress
@@ -165,6 +166,12 @@ class NavigatorCore:
 
     def update(self, pose: Pose, scan: Scan | None, t: float) -> Command:
         """Return the velocity command for the current state."""
+        if t - self._last_expiry >= 1.0:
+            # Lidar sightings go stale: without this a false positive would
+            # poison the map forever.  About once a second is enough; freeing
+            # cells bumps the version, which can trigger a re-plan below.
+            self._last_expiry = t
+            self.costmap.expire_dynamic(t)
         if self.status != RUNNING or self._follower is None:
             return Command()
 
@@ -196,7 +203,7 @@ class NavigatorCore:
         if scan is not None and command.linear > 0.0:
             kind, points = self.obstacles_ahead(pose, scan)
             if kind == 'unknown':
-                self.costmap.add_obstacles(points)
+                self.costmap.add_obstacles(points, now=t)
                 self._backoff_until = t + self.backoff_time
                 return Command()
             if kind == 'imminent':
