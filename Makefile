@@ -59,7 +59,7 @@ collect:
 finish:
 	docker compose exec sim /did-entrypoint.sh ros2 service call /did/finish std_srvs/srv/Trigger
 
-# Autonomous agent without an LLM: one whole episode, prints a summary at the end.
+# Explicitly hand the current run to the deterministic agent policy.
 auto:
 	docker compose exec sim /did-entrypoint.sh ros2 run did_agent command auto --wait
 
@@ -67,9 +67,9 @@ stop:
 	docker compose exec sim /did-entrypoint.sh ros2 run did_agent command stop
 
 # --- LLM planner (Николай) -------------------------------------------------
-# Starts the whole stack with the planner on: the LLM publishes /agent/plan and
-# the agent executes it. Without a key in .env the planner notices, says so and
-# hands the episode to the agent's own behaviour, so the demo still runs.
+# The normal stack already starts with the planner on. This target remains a
+# convenient explicit alias. Without a key in .env the planner reports that and
+# hands the episode to the deterministic policy, so the demo still runs.
 
 # Usage: make llm SCENARIO=hard@7
 llm:

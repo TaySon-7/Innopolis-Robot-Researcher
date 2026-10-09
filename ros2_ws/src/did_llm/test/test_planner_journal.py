@@ -1,5 +1,9 @@
 """Readable journal entries and deterministic sensor reactions."""
 
+import json
+from types import SimpleNamespace
+
+from did_llm.agent_link import AgentLink
 from did_llm.agent_plan import Subgoal
 from did_llm.planner_node import Planner
 
@@ -25,6 +29,7 @@ class _Link:
         self.signal_value = 0.0
         self.noise_value = 0.0
         self.pose_value = (-0.5, -0.55)
+        self.episode_generation = 0
 
     def take_event(self):
         return self.events.pop(0) if self.events else None
@@ -130,3 +135,63 @@ def test_rising_signal_does_not_restart_an_active_search():
 
     assert planner._interrupt_for_sample() is False
     assert link.published == []
+
+
+def test_agent_episode_id_discards_previous_run_observations():
+    link = AgentLink.__new__(AgentLink)
+    link.state = None
+    link.state_at = None
+    link.status = None
+    link.seen_plans = set()
+    link._logged_status = set()
+    link.episode_finished = False
+    link.episode_generation = 0
+    link._agent_episode_id = None
+    link.expensive = []
+    link.pending_events = []
+    link.collected_hint = None
+    link.now = lambda: 12.0
+
+    link._on_state(SimpleNamespace(data=json.dumps({
+        'episode_id': 4,
+        'scenario': 'easy',
+    })))
+    assert link.episode_generation == 0
+
+    link.status = {'plan_id': 'old'}
+    link.seen_plans.add('old')
+    link._logged_status.add(('old', 0, 'done'))
+    link.pending_events.append({'event': 'old'})
+    link.collected_hint = 2
+    link.expensive.append((1.0, 1.0, 0.1, 4.5))
+    link.episode_finished = True
+
+    link._on_state(SimpleNamespace(data=json.dumps({
+        'episode_id': 5,
+        'scenario': 'easy',
+    })))
+
+    assert link.episode_generation == 1
+    assert link.state == {'episode_id': 5, 'scenario': 'easy'}
+    assert link.state_at == 12.0
+    assert link.status is None
+    assert link.seen_plans == set()
+    assert link._logged_status == set()
+    assert link.pending_events == []
+    assert link.collected_hint is None
+    assert link.expensive == []
+    assert link.episode_finished is False
+
+
+def test_new_episode_reactivates_llm_after_operator_stop():
+    link = _Link()
+    planner = Planner(link, object())
+    planner.quiet = True
+    planner.force_replan = False
+
+    link.episode_generation += 1
+
+    assert planner._new_episode() is True
+    planner._reset_for_new_episode()
+    assert planner.quiet is False
+    assert planner.force_replan is True

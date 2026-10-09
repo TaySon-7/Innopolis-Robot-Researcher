@@ -258,9 +258,9 @@ class Planner:
         self.quiet = False
         #: The judge's clock, watched only to notice it jumping back to zero.
         self.last_sim_t = 0.0
-        #: Public judge-score generation observed through AgentLink. This is
-        #: the primary restart signal because a safe Burger respawn does not
-        #: rewind the global Gazebo clock.
+        #: Explicit /agent/state episode generation observed through AgentLink.
+        #: This is the primary restart signal because a safe Burger respawn
+        #: does not rewind the global Gazebo clock.
         self.last_episode_generation = int(
             getattr(self.link, 'episode_generation', 0))
         #: Whether the last plan we sent was "go home".
@@ -591,10 +591,10 @@ class Planner:
     def _new_episode(self) -> bool:
         """Whether the judge has started a different run.
 
-        AgentLink watches the public ``/did/score.t`` value, which resets even
-        when the dashboard safely respawns Burger without rewinding Gazebo's
-        global clock. The clock fallback keeps fake/integration links and older
-        transports compatible.
+        AgentLink watches the explicit ``/agent/state.episode_id`` value. It
+        changes even when the dashboard restarts the same scenario without
+        rewinding Gazebo's global clock. The clock fallback keeps fake links
+        and older transports compatible.
         """
         generation = getattr(self.link, 'episode_generation', None)
         if isinstance(generation, int) and generation != self.last_episode_generation:

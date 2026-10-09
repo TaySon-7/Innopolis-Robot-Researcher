@@ -15,6 +15,10 @@ export function rosClockReset(previous: number | undefined, next: number): boole
   return previous !== undefined && next < previous - CLOCK_RESET_TOLERANCE
 }
 
+export function quaternionYaw(x: number, y: number, z: number, w: number): number {
+  return Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+}
+
 function angleDelta(from: number, to: number): number {
   return Math.atan2(Math.sin(to - from), Math.cos(to - from))
 }
@@ -73,6 +77,24 @@ export function interpolateTimedPose(
     }
   }
   return null
+}
+
+/**
+ * Resolve a scan against Gazebo ground truth when it is available.
+ *
+ * Once the world-pose stream has started, do not silently fall back to wheel
+ * odometry while waiting for its next sample: the two frames can differ after
+ * slip, and mixing them is what makes one scan jump across the arena.
+ */
+export function synchronizedLidarPose(
+  worldHistory: TimedLidarPose[],
+  odometryHistory: TimedLidarPose[],
+  stamp: number,
+): LidarPose | null {
+  return interpolateTimedPose(
+    worldHistory.length ? worldHistory : odometryHistory,
+    stamp,
+  )
 }
 
 export function lidarOrigin(pose: LidarPose, xOffset: number): LidarPose {

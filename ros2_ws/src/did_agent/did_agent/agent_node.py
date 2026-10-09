@@ -52,6 +52,10 @@ class AgentNode(Navigator):
         self.cost_log: list[dict[str, Any]] = []
         self._command: str | None = None
         self._scenario_reset: str | None = None
+        # Monotonic within this node's lifetime. The LLM uses it to distinguish
+        # a fresh run from another state update, including a restart of the
+        # same scenario while Gazebo's global clock keeps advancing.
+        self._episode_id = 0
         self._published_cost_signature: tuple[int, int] | None = None
 
         self.adaptation = Adaptation(
@@ -165,6 +169,7 @@ class AgentNode(Navigator):
 
     def _reset_for_scenario(self, name: str) -> None:
         """Forget knowledge from the previous episode after execution has stopped."""
+        self._episode_id += 1
         self.costmap = CostMap()
         self.core = NavigatorCore(self.costmap)
         self.cost_log.clear()
@@ -463,6 +468,7 @@ class AgentNode(Navigator):
             return_cost = float('nan')
         state = {
             't': round(t, 2),
+            'episode_id': self._episode_id,
             'scenario': self._score.get('scenario'),
             'pose': {'x': round(pose.x, 3), 'y': round(pose.y, 3), 'yaw': round(pose.yaw, 3)},
             'battery': round(self._battery, 3),

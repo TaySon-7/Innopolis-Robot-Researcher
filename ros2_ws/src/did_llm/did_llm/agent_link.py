@@ -72,13 +72,11 @@ class AgentLink:
         self._logged_status: set[tuple[str, Any, str]] = set()
         #: From the judge: whether the episode is over.
         self.episode_finished = False
-        #: Monotonic local counter incremented whenever the public judge time
-        #: moves back to zero or the scenario name changes. Unlike ROS /clock,
-        #: judge time resets for a dashboard restart that safely respawns only
-        #: Burger and leaves the Gazebo world clock running.
+        #: Monotonic local counter incremented whenever /agent/state announces
+        #: a new episode. The explicit id also catches a restart of the same
+        #: scenario while the global Gazebo clock keeps advancing.
         self.episode_generation = 0
-        self._score_t: float | None = None
-        self._score_scenario: str | None = None
+        self._agent_episode_id: int | None = None
         #: Expensive ground from the agent's cost map: (x, y, reach, cost).
         self.expensive: list[tuple[float, float, float, float]] = []
         #: Penalty events waiting to be acted on.
@@ -120,6 +118,29 @@ class AgentLink:
             return
         if not isinstance(payload, dict):
             return
+
+        raw_episode_id = payload.get('episode_id')
+        episode_id = (
+            raw_episode_id
+            if isinstance(raw_episode_id, int) and not isinstance(raw_episode_id, bool)
+            else None
+        )
+        if episode_id is not None:
+            if (
+                self._agent_episode_id is not None
+                and episode_id != self._agent_episode_id
+            ):
+                self.episode_generation += 1
+                # Discard only previous-run observations. Keep the state below:
+                # it is already the first clean snapshot of the new episode.
+                self.status = None
+                self.seen_plans.clear()
+                self._logged_status.clear()
+                self.pending_events.clear()
+                self.collected_hint = None
+                self.expensive.clear()
+                self.episode_finished = False
+            self._agent_episode_id = episode_id
         self.state = payload
         self.state_at = self.now()
 
@@ -192,7 +213,7 @@ class AgentLink:
         self.collected_hint = value
 
     def _on_score(self, message: String) -> None:
-        """Track public episode status and detect a fresh judge run."""
+        """Track the judge's public episode completion flag."""
         try:
             payload = json.loads(message.data)
         except (TypeError, ValueError):
@@ -200,35 +221,6 @@ class AgentLink:
         if not isinstance(payload, dict):
             return
 
-        raw_t = payload.get('t')
-        score_t = float(raw_t) if isinstance(raw_t, (int, float)) else None
-        raw_scenario = payload.get('scenario')
-        scenario = raw_scenario if isinstance(raw_scenario, str) else None
-        restarted = (
-            self._score_t is not None
-            and score_t is not None
-            and score_t < self._score_t - 1.0
-        ) or (
-            self._score_scenario is not None
-            and scenario is not None
-            and scenario != self._score_scenario
-        )
-        if restarted:
-            self.episode_generation += 1
-            # Do not let the planner act on the previous episode while the
-            # agent is still publishing its newly reset state.
-            self.state = None
-            self.state_at = None
-            self.status = None
-            self.seen_plans.clear()
-            self._logged_status.clear()
-            self.pending_events.clear()
-            self.collected_hint = None
-
-        if score_t is not None:
-            self._score_t = score_t
-        if scenario is not None:
-            self._score_scenario = scenario
         self.episode_finished = bool(payload.get('finished', False))
 
     def _on_costmap(self, message: String) -> None:

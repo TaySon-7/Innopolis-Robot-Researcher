@@ -51,16 +51,16 @@ def _simulation(context):
 def generate_launch_description():
     """Create the demo launch description.
 
-    The LLM planner is off by default, so the plain demo is still the
-    autonomous agent and needs no API key. Turn it on with ``llm:=true``: the
-    planner then publishes plans to /agent/plan instead of the agent running
-    its own policy, and falls back to that policy if the model is unreachable.
+    The LLM planner is the default high-level controller and publishes plans
+    to /agent/plan. It falls back to the agent's deterministic policy if the
+    model is not configured or is unreachable. Pass ``llm:=false`` for a
+    deliberately offline run without the planner node.
     """
     return LaunchDescription([
         DeclareLaunchArgument('scenario', default_value='easy'),
         DeclareLaunchArgument('scenario_file', default_value=''),
         DeclareLaunchArgument(
-            'llm', default_value='false',
+            'llm', default_value='true',
             description='Start the LLM planner alongside the agent.'),
         OpaqueFunction(function=_simulation),
         Node(
@@ -71,6 +71,23 @@ def generate_launch_description():
             arguments=[
                 '/world/default/remove/blocking@ros_gz_interfaces/srv/DeleteEntity',
                 '/world/default/create/blocking@ros_gz_interfaces/srv/SpawnEntity',
+            ],
+        ),
+        # Wheel odometry drifts when Burger slips or touches an obstacle.  The
+        # lidar, however, scans from the physical Gazebo pose.  Bridge that
+        # pose with its simulation timestamp so the dashboard can render the
+        # scan in the same world frame as the arena.
+        Node(
+            package='ros_gz_bridge',
+            executable='parameter_bridge',
+            name='gazebo_pose_bridge',
+            output='screen',
+            arguments=[
+                '/world/default/dynamic_pose/info@'
+                'geometry_msgs/msg/PoseArray[gz.msgs.Pose_V',
+            ],
+            remappings=[
+                ('/world/default/dynamic_pose/info', '/gazebo/dynamic_pose'),
             ],
         ),
         Node(package='did_agent', executable='agent', name='agent', output='screen'),

@@ -6,7 +6,9 @@ import {
   interpolateTimedPose,
   lidarOrigin,
   projectLidarHit,
+  quaternionYaw,
   rosClockReset,
+  synchronizedLidarPose,
 } from '../src/lidarSync.ts'
 
 const close = (actual, expected, tolerance = 1e-9) => {
@@ -63,4 +65,36 @@ test('projects the scan from the physical lidar frame in world coordinates', () 
   const hit = projectLidarHit(origin, -Math.PI / 2, 2)
   close(hit.x, 3)
   close(hit.y, 1.968)
+})
+
+test('uses Gazebo world pose when wheel odometry has drifted', () => {
+  const odometry = [
+    { stamp: 10, x: -2.1, y: -0.64, yaw: -0.58 },
+    { stamp: 11, x: -2.1, y: -0.64, yaw: -0.58 },
+  ]
+  const world = [
+    { stamp: 10, x: -1.58, y: -0.39, yaw: 1.08 },
+    { stamp: 11, x: -1.57, y: -0.38, yaw: 1.10 },
+  ]
+
+  const pose = synchronizedLidarPose(world, odometry, 10.5)
+
+  assert.ok(pose)
+  close(pose.x, -1.575)
+  close(pose.y, -0.385)
+  close(pose.yaw, 1.09)
+})
+
+test('waits for a newer Gazebo pose instead of mixing coordinate frames', () => {
+  const odometry = [
+    { stamp: 10, x: -2, y: -0.5, yaw: 0 },
+    { stamp: 11, x: -1.8, y: -0.5, yaw: 0 },
+  ]
+  const world = [{ stamp: 10, x: -1.5, y: -0.4, yaw: 1 }]
+
+  assert.equal(synchronizedLidarPose(world, odometry, 10.1), null)
+})
+
+test('extracts planar yaw from the Gazebo model quaternion', () => {
+  close(quaternionYaw(0, 0, Math.sin(Math.PI / 6), Math.cos(Math.PI / 6)), Math.PI / 3)
 })

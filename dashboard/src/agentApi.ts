@@ -38,6 +38,7 @@ export interface AgentNavigation {
 
 export interface AgentRuntimeState {
   t?: number
+  episode_id?: number
   battery?: number
   score?: number
   sensor?: { value?: number; noise_estimate?: number }
